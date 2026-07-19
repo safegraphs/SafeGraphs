@@ -50,3 +50,13 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# Rust build artifacts (Cargo.lock is committed, matching the sibling crates)
+target/
+debug/
+
+# rustfmt backups
+**/*.rs.bk
+
+# cargo mutants
+**/mutants.out*/

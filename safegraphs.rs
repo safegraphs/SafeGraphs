@@ -21,7 +21,7 @@ use memmap2::Mmap;
 use allocator_api2::alloc::{Allocator, Global};
 use allocator_api2::vec::Vec as AVec;
 
-use jsontape::{parse_in, JsonError, JsonView, Span};
+use jsontape::{parse_in, Json, JsonError};
 
 /// The 8-byte magic at offset 0 of every `.safegraphs` file.
 pub const MAGIC: [u8; 8] = *b"SAFEGRPH";
@@ -60,7 +60,7 @@ impl StorageDType {
     }
 }
 
-/// Width of a row index or prefix-sum entry. Unsigned, since offsets and row
+/// Width of a node index or prefix-sum entry. Unsigned, since offsets and node
 /// ids are non-negative and no column is nullable.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OffsetDType {
@@ -96,20 +96,16 @@ pub enum ColumnLayout {
 }
 
 /// One column: an element type, a layout, and its values buffer. `E` is the
-/// element type: `StorageDType` for payload columns whose bytes the reader does not
-/// interpret, `OffsetDType` for the neighbor graph whose values are row indices.
+/// element type: `StorageDType` for payload columns whose bytes the reader does
+/// not interpret, `OffsetDType` for the neighbor graph whose values are node
+/// indices. The dtype string lives in the header document, reachable through
+/// [`Table::dtype_name`].
 #[derive(Clone, Copy)]
 pub struct Column<E> {
     pub dtype: E,
-    /// The original dtype string from the header, a span kept so the compute
-    /// layer can reinterpret the opaque values buffer.
-    pub name: Span,
     pub layout: ColumnLayout,
     pub values: ByteRange,
 }
-
-/// The `__metadata__` document, kept verbatim as a free-form JSON tape.
-pub struct Metadata<A: Allocator = Global>(pub JsonView<A>);
 
 /// The bytes behind a file: a memory map, or an owned in-memory buffer. Both are
 /// just memory from an allocator — the OS mmap allocator, or `A`.
@@ -121,7 +117,7 @@ enum Backing<A: Allocator = Global> {
 impl<A: Allocator> Backing<A> {
     fn as_bytes(&self) -> &[u8] {
         match self {
-            Backing::Mapped(m) => &m[..],
+            Backing::Mapped(mmap) => &mmap[..],
             Backing::Owned(v) => &v[..],
         }
     }
@@ -133,7 +129,7 @@ impl<A: Allocator> Backing<A> {
 /// copyable descriptors that point into it by offset, so buffers are handed out
 /// as zero-copy slices. Only the free-form `metadata` document allocates,
 /// through `A`.
-pub struct SafeGraphsFile<A: Allocator = Global> {
+pub struct Table<A: Allocator = Global> {
     /// The bytes behind every buffer, kept alive for the whole handle so borrowed
     /// slices stay valid.
     backing: Backing<A>,
@@ -142,8 +138,9 @@ pub struct SafeGraphsFile<A: Allocator = Global> {
     /// Every column's `ByteRange` is relative to this.
     data_start: usize,
 
-    /// The `__metadata__` document, free-form and owned in `A`.
-    metadata: Metadata<A>,
+    /// The parsed header document, owned in `A`: the free-form `__metadata__`
+    /// plus each column's descriptor and dtype string.
+    header: Json<A>,
 
     /// Node identity: a scalar key, or an irregular column of string keys.
     key: Column<StorageDType>,
@@ -151,7 +148,7 @@ pub struct SafeGraphsFile<A: Allocator = Global> {
     /// Node payload: an embedding vector or a string, its bytes left opaque.
     value: Column<StorageDType>,
 
-    /// Outgoing edges of each node, as row indices into this same file.
+    /// Outgoing edges of each node, as node indices into this same file.
     neighbors: Column<OffsetDType>,
 }
 
@@ -195,13 +192,13 @@ impl From<JsonError> for Error {
 /// An element type parsed from a header dtype string. `StorageDType` collapses the
 /// semantic string to a storage width; `OffsetDType` keeps the two index widths.
 pub trait ElementType: Copy {
-    fn from_str(s: &[u8]) -> Result<Self, Error>;
+    fn from_dtype(text: &[u8]) -> Result<Self, Error>;
     fn size(self) -> usize;
 }
 
 impl ElementType for StorageDType {
-    fn from_str(s: &[u8]) -> Result<Self, Error> {
-        Ok(match s {
+    fn from_dtype(text: &[u8]) -> Result<Self, Error> {
+        Ok(match text {
             b"u8" | b"i8" | b"e4m3" | b"e5m2" | b"utf8" => StorageDType::Bin8,
             b"u16" | b"i16" | b"f16" | b"bf16" => StorageDType::Bin16,
             b"u32" | b"i32" | b"f32" => StorageDType::Bin32,
@@ -217,8 +214,8 @@ impl ElementType for StorageDType {
 }
 
 impl ElementType for OffsetDType {
-    fn from_str(s: &[u8]) -> Result<Self, Error> {
-        Ok(match s {
+    fn from_dtype(text: &[u8]) -> Result<Self, Error> {
+        Ok(match text {
             b"u32" => OffsetDType::U32,
             b"u64" => OffsetDType::U64,
             _ => return Err(Error::UnknownDType),
@@ -234,44 +231,41 @@ fn to_usize(v: u64) -> Result<usize, Error> {
     usize::try_from(v).map_err(|_| Error::TooLarge)
 }
 
-fn field_usize<A: Allocator>(
-    header: &[u8],
-    obj: &JsonView<A>,
-    key: &'static str,
-) -> Result<usize, Error> {
-    let v = obj.get(header, key).ok_or(Error::MissingField(key))?;
+fn field_usize<A: Allocator>(obj: &Json<A>, key: &'static str) -> Result<usize, Error> {
+    let v = obj.get(key).ok_or(Error::MissingField(key))?;
     to_usize(v.as_u64().ok_or(Error::WrongType)?)
 }
 
 impl<E: ElementType> Column<E> {
-    fn from_json<A: Allocator>(header: &[u8], obj: &JsonView<A>) -> Result<Self, Error> {
-        let name = match obj.get(header, "dtype") {
-            Some(JsonView::String(s)) => *s,
-            Some(_) => return Err(Error::WrongType),
-            None => return Err(Error::MissingField("dtype")),
-        };
-        let dtype = E::from_str(name.resolve(header).ok_or(Error::WrongType)?.as_bytes())?;
+    fn from_json<A: Allocator>(obj: &Json<A>) -> Result<Self, Error> {
+        let dtype = E::from_dtype(
+            obj.get("dtype")
+                .ok_or(Error::MissingField("dtype"))?
+                .as_str()
+                .ok_or(Error::WrongType)?
+                .as_bytes(),
+        )?;
 
         let values = ByteRange {
-            start: field_usize(header, obj, "values_start")?,
-            len: field_usize(header, obj, "values_length")?,
+            start: field_usize(obj, "values_start")?,
+            len: field_usize(obj, "values_length")?,
         };
 
-        let layout = match obj.get(header, "offsets_dtype") {
-            Some(od) => {
-                let od = od.as_str(header).ok_or(Error::WrongType)?;
+        let layout = match obj.get("offsets_dtype") {
+            Some(offset_dtype) => {
+                let offset_dtype = offset_dtype.as_str().ok_or(Error::WrongType)?;
                 ColumnLayout::Irregular {
                     offsets: IrregularOffsets {
-                        dtype: OffsetDType::from_str(od.as_bytes())?,
+                        dtype: OffsetDType::from_dtype(offset_dtype.as_bytes())?,
                         range: ByteRange {
-                            start: field_usize(header, obj, "offsets_start")?,
-                            len: field_usize(header, obj, "offsets_length")?,
+                            start: field_usize(obj, "offsets_start")?,
+                            len: field_usize(obj, "offsets_length")?,
                         },
                     },
                 }
             }
             None => {
-                let width = match obj.get(header, "shape") {
+                let width = match obj.get("shape") {
                     Some(v) => to_usize(v.as_u64().ok_or(Error::WrongType)?)?,
                     None => 1,
                 };
@@ -281,7 +275,6 @@ impl<E: ElementType> Column<E> {
 
         Ok(Column {
             dtype,
-            name,
             layout,
             values,
         })
@@ -289,48 +282,40 @@ impl<E: ElementType> Column<E> {
 }
 
 fn column_field<E: ElementType, A: Allocator>(
-    header: &[u8],
-    doc: &JsonView<A>,
+    doc: &Json<A>,
     name: &'static str,
 ) -> Result<Column<E>, Error> {
-    let obj = doc.get(header, name).ok_or(Error::MissingField(name))?;
-    Column::<E>::from_json(header, obj)
+    let obj = doc.get(name).ok_or(Error::MissingField(name))?;
+    Column::<E>::from_json(obj)
 }
 
-/// Move the `__metadata__` subtree out of the header document, or an empty
-/// object if absent.
-fn take_metadata<A: Allocator>(header: &[u8], doc: JsonView<A>, alloc: A) -> Metadata<A> {
-    if let JsonView::Object(mut items) = doc {
-        if let Some(i) = items
-            .iter()
-            .position(|(k, _)| k.resolve(header) == Some("__metadata__"))
-        {
-            let (_, v) = items.swap_remove(i);
-            return Metadata(v);
-        }
-    }
-    Metadata(JsonView::Object(AVec::new_in(alloc)))
-}
-
-impl SafeGraphsFile<Global> {
-    /// Open and map a file read-only, allocating metadata in the global heap.
+impl Table<Global> {
+    /// Memory-map a file read-only; pages fault in lazily. Metadata allocates in
+    /// the global heap.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         Self::open_in(path, Global)
     }
 
-    /// Parse a file already in memory, copying `bytes` into an owned buffer.
-    pub fn from_slice(bytes: &[u8]) -> Result<Self, Error> {
+    /// Own the whole blob in memory, copying `bytes` in. Metadata allocates in the
+    /// global heap.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let mut buffer: AVec<u8, Global> = AVec::new_in(Global);
         buffer
             .try_reserve_exact(bytes.len())
             .map_err(|_| Error::Alloc)?;
         buffer.extend_from_slice(bytes);
-        Self::from_bytes_in(buffer, Global)
+        Self::from_owned(buffer, Global)
+    }
+
+    /// Materialize a graph into the columnar form, in the global heap. The
+    /// metadata object may come from any allocator.
+    pub fn build<G: GraphLike>(graph: &G, metadata: Option<&Json<Global>>) -> Result<Self, Error> {
+        Self::build_in(graph, metadata, Global)
     }
 }
 
-impl<A: Allocator + Clone> SafeGraphsFile<A> {
-    /// Open and map a file read-only, allocating the metadata document in `alloc`.
+impl<A: Allocator + Clone> Table<A> {
+    /// Memory-map a file read-only, allocating the metadata document in `alloc`.
     pub fn open_in<P: AsRef<Path>>(path: P, alloc: A) -> Result<Self, Error> {
         let file = File::open(path)?;
         // SAFETY: the mapping is read-only; the file must not be mutated
@@ -339,42 +324,53 @@ impl<A: Allocator + Clone> SafeGraphsFile<A> {
         Self::from_backing(Backing::Mapped(map), alloc)
     }
 
-    /// Parse a file from an owned in-memory buffer, allocating metadata in `alloc`.
-    pub fn from_bytes_in(buffer: AVec<u8, A>, alloc: A) -> Result<Self, Error> {
+    /// Take ownership of an in-memory blob, allocating metadata in `alloc`.
+    pub fn from_owned(buffer: AVec<u8, A>, alloc: A) -> Result<Self, Error> {
         Self::from_backing(Backing::Owned(buffer), alloc)
+    }
+
+    /// Materialize a graph into the columnar form, allocating in `alloc`. The
+    /// metadata object may come from any allocator `M`; it is serialized into the
+    /// header.
+    pub fn build_in<G: GraphLike, M: Allocator>(
+        graph: &G,
+        metadata: Option<&Json<M>>,
+        alloc: A,
+    ) -> Result<Self, Error> {
+        let blob = materialize(graph, metadata, alloc.clone())?;
+        Self::from_backing(Backing::Owned(blob), alloc)
     }
 
     /// Shared parse over any backing: frame it, parse the header, extract the
     /// columns and metadata, then validate.
     fn from_backing(backing: Backing<A>, alloc: A) -> Result<Self, Error> {
-        let (data_start, metadata, key, value, neighbors) = {
+        let (data_start, header, key, value, neighbors) = {
             let bytes = backing.as_bytes();
             if bytes.get(..8) != Some(&MAGIC[..]) {
                 return Err(Error::BadMagic);
             }
             let len_bytes = bytes.get(8..16).ok_or(Error::Truncated)?;
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(len_bytes);
-            let header_len = to_usize(u64::from_le_bytes(buf))?;
+            let mut length_bytes = [0u8; 8];
+            length_bytes.copy_from_slice(len_bytes);
+            let header_len = to_usize(u64::from_le_bytes(length_bytes))?;
             let data_start = 16usize.checked_add(header_len).ok_or(Error::Truncated)?;
             if bytes.len() < data_start {
                 return Err(Error::Truncated);
             }
 
-            // Parse the header. String spans in the document are relative to it.
+            // Parse the header into an owned document.
             let header = &bytes[16..data_start];
-            let doc = parse_in(header, alloc.clone())?;
-            let key = column_field::<StorageDType, A>(header, &doc, "key")?;
-            let value = column_field::<StorageDType, A>(header, &doc, "value")?;
-            let neighbors = column_field::<OffsetDType, A>(header, &doc, "neighbors")?;
-            let metadata = take_metadata(header, doc, alloc);
-            (data_start, metadata, key, value, neighbors)
+            let doc = parse_in(header, alloc)?;
+            let key = column_field::<StorageDType, A>(&doc, "key")?;
+            let value = column_field::<StorageDType, A>(&doc, "value")?;
+            let neighbors = column_field::<OffsetDType, A>(&doc, "neighbors")?;
+            (data_start, doc, key, value, neighbors)
         };
 
-        let file = SafeGraphsFile {
+        let file = Table {
             backing,
             data_start,
-            metadata,
+            header,
             key,
             value,
             neighbors,
@@ -384,23 +380,19 @@ impl<A: Allocator + Clone> SafeGraphsFile<A> {
     }
 }
 
-impl<A: Allocator> SafeGraphsFile<A> {
+impl<A: Allocator> Table<A> {
     /// The bytes behind the file, mapped or in-memory.
     fn bytes(&self) -> &[u8] {
         self.backing.as_bytes()
     }
 
-    /// The header bytes, against which header spans resolve.
-    fn header(&self) -> &[u8] {
-        &self.bytes()[16..self.data_start]
+    /// The free-form `__metadata__` object, if present.
+    pub fn metadata(&self) -> Option<&Json<A>> {
+        self.header.get("__metadata__")
     }
 
-    pub fn metadata(&self) -> &Metadata<A> {
-        &self.metadata
-    }
-
-    pub fn metadata_get(&self, key: &str) -> Option<&JsonView<A>> {
-        self.metadata.0.get(self.header(), key)
+    pub fn metadata_get(&self, key: &str) -> Option<&Json<A>> {
+        self.metadata()?.get(key)
     }
 
     /// Declared buffer alignment, defaulting to 4096 and floored at 64.
@@ -412,23 +404,18 @@ impl<A: Allocator> SafeGraphsFile<A> {
             .max(64)
     }
 
-    pub fn nodes(&self) -> Option<u64> {
-        self.metadata_get("nodes").and_then(|v| v.as_u64())
-    }
-
     pub fn expansion(&self) -> Option<u64> {
         self.metadata_get("expansion").and_then(|v| v.as_u64())
     }
 
     pub fn metric(&self) -> Option<&str> {
-        self.metadata_get("metric")
-            .and_then(|v| v.as_str(self.header()))
+        self.metadata_get("metric").and_then(|v| v.as_str())
     }
 
-    /// The original dtype string of a column, for the compute layer to
-    /// reinterpret its opaque values buffer.
-    pub fn dtype_name(&self, name: Span) -> Option<&str> {
-        name.resolve(self.header())
+    /// The original dtype string of a column, "key" / "value" / "neighbors", for
+    /// the compute layer to reinterpret its opaque values buffer.
+    pub fn dtype_name(&self, column: &str) -> Option<&str> {
+        self.header.get(column)?.get("dtype")?.as_str()
     }
 
     pub fn key_column(&self) -> &Column<StorageDType> {
@@ -445,8 +432,8 @@ impl<A: Allocator> SafeGraphsFile<A> {
 }
 
 impl<E: ElementType> Column<E> {
-    /// Number of rows the column describes, derived from its own buffers.
-    pub fn rows(&self) -> usize {
+    /// Number of nodes the column describes, derived from its own buffers.
+    pub fn len(&self) -> usize {
         match self.layout {
             ColumnLayout::Regular { width } => {
                 let per = width * self.dtype.size();
@@ -457,14 +444,18 @@ impl<E: ElementType> Column<E> {
                 }
             }
             ColumnLayout::Irregular { offsets } => {
-                let s = offsets.dtype.size();
-                if s == 0 {
+                let element_size = offsets.dtype.size();
+                if element_size == 0 {
                     0
                 } else {
-                    (offsets.range.len / s).saturating_sub(1)
+                    (offsets.range.len / element_size).saturating_sub(1)
                 }
             }
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -482,7 +473,7 @@ pub fn cast<T: Copy>(bytes: &[u8]) -> Option<&[T]> {
     Some(unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / size) })
 }
 
-/// A node's outgoing edges: row indices in this file, as `u32` or `u64`.
+/// A node's outgoing edges: node indices in this file, as `u32` or `u64`.
 pub struct NeighborList<'a> {
     bytes: &'a [u8],
     dtype: OffsetDType,
@@ -497,10 +488,12 @@ impl<'a> NeighborList<'a> {
         self.len() == 0
     }
 
-    /// The `i`th neighbor's row index, widened to `u64`.
+    /// The `i`th neighbor's node index, widened to `u64`.
     pub fn get(&self, i: usize) -> Option<u64> {
-        let s = self.dtype.size();
-        let slot = self.bytes.get(i * s..i * s + s)?;
+        let element_size = self.dtype.size();
+        let slot = self
+            .bytes
+            .get(i * element_size..i * element_size + element_size)?;
         Some(match self.dtype {
             OffsetDType::U32 => u32::from_le_bytes(slot.try_into().ok()?) as u64,
             OffsetDType::U64 => u64::from_le_bytes(slot.try_into().ok()?),
@@ -512,57 +505,24 @@ impl<'a> NeighborList<'a> {
     }
 }
 
-impl<A: Allocator> SafeGraphsFile<A> {
-    /// Node count. Validated equal across all three columns at open.
-    pub fn rows(&self) -> usize {
-        self.key.rows()
-    }
-
-    /// Raw bytes of a row's key.
-    pub fn key_bytes(&self, row: usize) -> Option<&[u8]> {
-        self.row_bytes(&self.key, row)
-    }
-
-    /// Raw bytes of a row's value, for the compute layer to reinterpret using
-    /// its dtype name.
-    pub fn value_bytes(&self, row: usize) -> Option<&[u8]> {
-        self.row_bytes(&self.value, row)
-    }
-
+impl<A: Allocator> Table<A> {
     /// The whole value buffer, contiguous, for a batch scan. Only meaningful for
-    /// a regular value column; pair with [`Self::value_dim`].
+    /// a regular value column; pair with [`GraphLike::value_shape`].
     pub fn value_buffer(&self) -> &[u8] {
         self.buffer(self.value.values)
     }
 
-    /// Fixed vector dimensionality of the value column, or `None` if irregular.
-    pub fn value_dim(&self) -> Option<usize> {
-        match self.value.layout {
-            ColumnLayout::Regular { width } => Some(width),
-            ColumnLayout::Irregular { .. } => None,
-        }
-    }
-
-    /// A row's outgoing neighbors.
-    pub fn neighbors(&self, row: usize) -> Option<NeighborList<'_>> {
-        let bytes = self.row_bytes(&self.neighbors, row)?;
-        Some(NeighborList {
-            bytes,
-            dtype: self.neighbors.dtype,
-        })
-    }
-
-    /// The row whose key equals `key` byte-for-byte, by linear scan.
+    /// The node whose key equals `key` byte-for-byte, by linear scan.
     pub fn find_key(&self, key: &[u8]) -> Option<usize> {
-        (0..self.rows()).find(|&r| self.row_bytes(&self.key, r) == Some(key))
+        (0..self.len()).find(|&node| self.node_bytes(&self.key, node) == Some(key))
     }
 
     /// Slice a validated buffer out of the data segment. Relies on the open-time
     /// invariant that every stored `ByteRange` lies within the map, and degrades
     /// to an empty slice rather than panicking if that were ever violated.
-    fn buffer(&self, r: ByteRange) -> &[u8] {
-        let start = self.data_start.wrapping_add(r.start);
-        let end = start.wrapping_add(r.len);
+    fn buffer(&self, range: ByteRange) -> &[u8] {
+        let start = self.data_start.wrapping_add(range.start);
+        let end = start.wrapping_add(range.len);
         self.bytes().get(start..end).unwrap_or(&[])
     }
 
@@ -578,20 +538,23 @@ impl<A: Allocator> SafeGraphsFile<A> {
         }))
     }
 
-    /// The `[begin, end)` element indices of row `row` in an irregular column,
+    /// The `[begin, end)` element indices of node `node` in an irregular column,
     /// read from its prefix-sum buffer and checked monotonic.
-    fn row_span(&self, offsets: IrregularOffsets, row: usize) -> Option<(usize, usize)> {
-        let s = offsets.dtype.size();
-        let obytes = self.buffer(offsets.range);
+    fn node_span(&self, offsets: IrregularOffsets, node: usize) -> Option<(usize, usize)> {
+        let element_size = offsets.dtype.size();
+        let offset_bytes = self.buffer(offsets.range);
         let read = |i: usize| -> Option<usize> {
-            let slot = obytes.get(i.checked_mul(s)?..i.checked_mul(s)?.checked_add(s)?)?;
+            let slot = offset_bytes.get(
+                i.checked_mul(element_size)?
+                    ..i.checked_mul(element_size)?.checked_add(element_size)?,
+            )?;
             match offsets.dtype {
                 OffsetDType::U32 => Some(u32::from_le_bytes(slot.try_into().ok()?) as usize),
                 OffsetDType::U64 => to_usize(u64::from_le_bytes(slot.try_into().ok()?)).ok(),
             }
         };
-        let begin = read(row)?;
-        let end = read(row.checked_add(1)?)?;
+        let begin = read(node)?;
+        let end = read(node.checked_add(1)?)?;
         if begin > end {
             None
         } else {
@@ -599,71 +562,567 @@ impl<A: Allocator> SafeGraphsFile<A> {
         }
     }
 
-    /// Raw bytes of row `row` in any column, regular or irregular.
-    fn row_bytes<E: ElementType>(&self, c: &Column<E>, row: usize) -> Option<&[u8]> {
-        match c.layout {
+    /// Raw bytes of node `node` in any column, regular or irregular.
+    fn node_bytes<E: ElementType>(&self, column: &Column<E>, node: usize) -> Option<&[u8]> {
+        match column.layout {
             ColumnLayout::Regular { width } => {
-                let per = width.checked_mul(c.dtype.size())?;
-                self.subslice(c.values, row.checked_mul(per)?, per)
+                let per = width.checked_mul(column.dtype.size())?;
+                self.subslice(column.values, node.checked_mul(per)?, per)
             }
             ColumnLayout::Irregular { offsets } => {
-                let esz = c.dtype.size();
-                let (begin, end) = self.row_span(offsets, row)?;
-                let offset = begin.checked_mul(esz)?;
-                let len = end.checked_sub(begin)?.checked_mul(esz)?;
-                self.subslice(c.values, offset, len)
+                let element_size = column.dtype.size();
+                let (begin, end) = self.node_span(offsets, node)?;
+                let offset = begin.checked_mul(element_size)?;
+                let len = end.checked_sub(begin)?.checked_mul(element_size)?;
+                self.subslice(column.values, offset, len)
             }
         }
     }
 
     /// Check every buffer lies within the map and the columns agree on shape.
     fn validate(&self) -> Result<(), Error> {
-        let rows = self.key.rows();
-        self.check_layout(&self.key, rows)?;
-        self.check_layout(&self.value, rows)?;
-        self.check_layout(&self.neighbors, rows)?;
-        if let Some(declared) = self.nodes() {
-            if usize::try_from(declared).ok() != Some(rows) {
+        let len = self.key.len();
+        self.check_layout(&self.key, len)?;
+        self.check_layout(&self.value, len)?;
+        self.check_layout(&self.neighbors, len)?;
+        if let Some(declared) = self.metadata_get("nodes").and_then(|v| v.as_u64()) {
+            if usize::try_from(declared).ok() != Some(len) {
                 return Err(Error::Inconsistent);
             }
         }
         Ok(())
     }
 
-    /// Confirm one column's buffers fit the map and match `rows` exactly.
-    fn check_layout<E: ElementType>(&self, c: &Column<E>, rows: usize) -> Result<(), Error> {
-        match c.layout {
+    /// Confirm one column's buffers fit the map and match `len` exactly.
+    fn check_layout<E: ElementType>(&self, column: &Column<E>, len: usize) -> Result<(), Error> {
+        match column.layout {
             ColumnLayout::Regular { width } => {
-                let per = width.checked_mul(c.dtype.size()).ok_or(Error::TooLarge)?;
-                if per.checked_mul(rows) != Some(c.values.len) {
+                let per = width
+                    .checked_mul(column.dtype.size())
+                    .ok_or(Error::TooLarge)?;
+                if per.checked_mul(len) != Some(column.values.len) {
                     return Err(Error::Inconsistent);
                 }
             }
             ColumnLayout::Irregular { offsets } => {
                 self.check_buffer(offsets.range)?;
-                let expected = rows
+                let expected = len
                     .checked_add(1)
-                    .and_then(|r| r.checked_mul(offsets.dtype.size()))
+                    .and_then(|count| count.checked_mul(offsets.dtype.size()))
                     .ok_or(Error::TooLarge)?;
                 if offsets.range.len != expected {
                     return Err(Error::Inconsistent);
                 }
             }
         }
-        self.check_buffer(c.values)
+        self.check_buffer(column.values)
     }
 
     /// Confirm a buffer's end falls within the mapped file.
-    fn check_buffer(&self, r: ByteRange) -> Result<(), Error> {
+    fn check_buffer(&self, range: ByteRange) -> Result<(), Error> {
         let end = self
             .data_start
-            .checked_add(r.start)
-            .and_then(|s| s.checked_add(r.len))
+            .checked_add(range.start)
+            .and_then(|start| start.checked_add(range.len))
             .ok_or(Error::TooLarge)?;
         if end <= self.bytes().len() {
             Ok(())
         } else {
             Err(Error::Truncated)
         }
+    }
+}
+
+impl<A: Allocator> GraphLike for Table<A> {
+    fn len(&self) -> usize {
+        self.key.len()
+    }
+
+    fn key_dtype(&self) -> &str {
+        self.dtype_name("key").unwrap_or("")
+    }
+
+    fn value_dtype(&self) -> &str {
+        self.dtype_name("value").unwrap_or("")
+    }
+
+    fn value_shape(&self) -> Option<usize> {
+        match self.value.layout {
+            ColumnLayout::Regular { width } => Some(width),
+            ColumnLayout::Irregular { .. } => None,
+        }
+    }
+
+    fn neighbors_degree(&self) -> Option<usize> {
+        match self.neighbors.layout {
+            ColumnLayout::Regular { width } => Some(width),
+            ColumnLayout::Irregular { .. } => None,
+        }
+    }
+
+    fn key(&self, node: usize) -> &[u8] {
+        self.node_bytes(&self.key, node).unwrap_or(&[])
+    }
+
+    fn value(&self, node: usize) -> &[u8] {
+        self.node_bytes(&self.value, node).unwrap_or(&[])
+    }
+
+    fn neighbors(&self, node: usize) -> NeighborList<'_> {
+        NeighborList {
+            bytes: self.node_bytes(&self.neighbors, node).unwrap_or(&[]),
+            dtype: self.neighbors.dtype,
+        }
+    }
+}
+
+/// One node's three payloads, yielded by [`GraphLike::iter`].
+pub struct Node<'a> {
+    pub key: &'a [u8],
+    pub value: &'a [u8],
+    pub neighbors: NeighborList<'a>,
+}
+
+/// A graph read node by node. Both a producer's graph and a parsed [`Table`]
+/// implement it, so a `Table` can be built from any `GraphLike`, including
+/// another `Table`.
+pub trait GraphLike {
+    /// Number of nodes.
+    fn len(&self) -> usize;
+
+    /// True when there are no nodes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Header dtype strings for the payload columns, e.g. "u64", "f16".
+    fn key_dtype(&self) -> &str;
+    fn value_dtype(&self) -> &str;
+
+    /// The value column's fixed shape, or None for variable-length values.
+    fn value_shape(&self) -> Option<usize>;
+    /// The neighbors column's fixed out-degree, or None if variable.
+    fn neighbors_degree(&self) -> Option<usize>;
+
+    /// Per-node payloads. Keys and values pass through verbatim; neighbors are
+    /// node indices, u32 or u64, read through [`NeighborList`].
+    fn key(&self, node: usize) -> &[u8];
+    fn value(&self, node: usize) -> &[u8];
+    fn neighbors(&self, node: usize) -> NeighborList<'_>;
+
+    /// Iterate nodes, zipping the three columns.
+    fn iter(&self) -> GraphIter<'_, Self>
+    where
+        Self: Sized,
+    {
+        GraphIter {
+            graph: self,
+            node: 0,
+        }
+    }
+}
+
+/// Iterator over a [`GraphLike`]'s nodes.
+pub struct GraphIter<'a, G: GraphLike> {
+    graph: &'a G,
+    node: usize,
+}
+
+impl<'a, G: GraphLike> Iterator for GraphIter<'a, G> {
+    type Item = Node<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.node >= self.graph.len() {
+            return None;
+        }
+        let i = self.node;
+        self.node += 1;
+        Some(Node {
+            key: self.graph.key(i),
+            value: self.graph.value(i),
+            neighbors: self.graph.neighbors(i),
+        })
+    }
+}
+
+fn push_bytes<A: Allocator>(v: &mut AVec<u8, A>, bytes: &[u8]) -> Result<(), Error> {
+    v.try_reserve(bytes.len()).map_err(|_| Error::Alloc)?;
+    v.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn push_offset<A: Allocator>(
+    v: &mut AVec<u8, A>,
+    dtype: OffsetDType,
+    value: u64,
+) -> Result<(), Error> {
+    match dtype {
+        OffsetDType::U32 => {
+            let narrow = u32::try_from(value).map_err(|_| Error::TooLarge)?;
+            push_bytes(v, &narrow.to_le_bytes())
+        }
+        OffsetDType::U64 => push_bytes(v, &value.to_le_bytes()),
+    }
+}
+
+fn align_up(x: usize, alignment: usize) -> Result<usize, Error> {
+    let rem = x % alignment;
+    if rem == 0 {
+        Ok(x)
+    } else {
+        x.checked_add(alignment - rem).ok_or(Error::TooLarge)
+    }
+}
+
+fn reserve_span(cursor: &mut usize, len: usize, alignment: usize) -> Result<usize, Error> {
+    let start = align_up(*cursor, alignment)?;
+    *cursor = start.checked_add(len).ok_or(Error::TooLarge)?;
+    Ok(start)
+}
+
+/// Accumulates one column's on-disk buffers: concatenated values, and u64
+/// prefix-sum offsets when the column is irregular.
+struct ColumnBuilder<A: Allocator> {
+    element_size: usize,
+    width: Option<usize>,
+    values: AVec<u8, A>,
+    offsets: AVec<u8, A>,
+    running: u64,
+}
+
+impl<A: Allocator + Clone> ColumnBuilder<A> {
+    fn new(element_size: usize, width: Option<usize>, alloc: &A) -> Result<Self, Error> {
+        let mut offsets = AVec::new_in(alloc.clone());
+        if width.is_none() {
+            push_bytes(&mut offsets, &0u64.to_le_bytes())?;
+        }
+        Ok(ColumnBuilder {
+            element_size,
+            width,
+            values: AVec::new_in(alloc.clone()),
+            offsets,
+            running: 0,
+        })
+    }
+
+    fn push_row(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.element_size == 0 || bytes.len() % self.element_size != 0 {
+            return Err(Error::Inconsistent);
+        }
+        let count = bytes.len() / self.element_size;
+        if let Some(width) = self.width {
+            if count != width {
+                return Err(Error::Inconsistent);
+            }
+        }
+        push_bytes(&mut self.values, bytes)?;
+        self.running += count as u64;
+        if self.width.is_none() {
+            push_bytes(&mut self.offsets, &self.running.to_le_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn is_irregular(&self) -> bool {
+        self.width.is_none()
+    }
+}
+
+fn reserve_offsets<A: Allocator + Clone>(
+    column: &ColumnBuilder<A>,
+    cursor: &mut usize,
+    alignment: usize,
+) -> Result<Option<usize>, Error> {
+    if column.is_irregular() {
+        Ok(Some(reserve_span(cursor, column.offsets.len(), alignment)?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn write_column<A: Allocator>(
+    header: &mut String,
+    name: &str,
+    dtype: &str,
+    column: &ColumnBuilder<A>,
+    off_start: Option<usize>,
+    val_start: usize,
+) {
+    header.push_str(&format!(",\"{name}\":{{\"dtype\":\"{dtype}\""));
+    match off_start {
+        Some(off) => header.push_str(&format!(
+            ",\"offsets_dtype\":\"u64\",\"offsets_start\":{},\"offsets_length\":{}",
+            off,
+            column.offsets.len()
+        )),
+        None => header.push_str(&format!(",\"shape\":{}", column.width.unwrap_or(1))),
+    }
+    header.push_str(&format!(
+        ",\"values_start\":{},\"values_length\":{}}}",
+        val_start,
+        column.values.len()
+    ));
+}
+
+fn write_buffer<A: Allocator>(
+    file: &mut AVec<u8, A>,
+    data_start: usize,
+    start: usize,
+    bytes: &[u8],
+) {
+    let target = data_start + start;
+    while file.len() < target {
+        file.push(0);
+    }
+    file.extend_from_slice(bytes);
+}
+
+/// Serialize a graph into a complete `.safegraphs` blob in `alloc`.
+fn materialize<G, M, A>(
+    graph: &G,
+    metadata: Option<&Json<M>>,
+    alloc: A,
+) -> Result<AVec<u8, A>, Error>
+where
+    G: GraphLike,
+    M: Allocator,
+    A: Allocator + Clone,
+{
+    let node_count = graph.len();
+    let alignment = metadata
+        .and_then(|object| object.get("alignment"))
+        .and_then(|v| v.as_u64())
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(4096)
+        .max(64);
+
+    let key_dtype = graph.key_dtype();
+    let key_esz = StorageDType::from_dtype(key_dtype.as_bytes())?.size();
+    let key_width = if key_dtype == "utf8" { None } else { Some(1) };
+    let mut key = ColumnBuilder::new(key_esz, key_width, &alloc)?;
+    for i in 0..node_count {
+        key.push_row(graph.key(i))?;
+    }
+
+    let value_dtype = graph.value_dtype();
+    let value_esz = StorageDType::from_dtype(value_dtype.as_bytes())?.size();
+    let mut value = ColumnBuilder::new(value_esz, graph.value_shape(), &alloc)?;
+    for i in 0..node_count {
+        value.push_row(graph.value(i))?;
+    }
+
+    // Widen the neighbor index type to whatever the node count needs.
+    let neighbor_dtype = if node_count > u32::MAX as usize {
+        OffsetDType::U64
+    } else {
+        OffsetDType::U32
+    };
+    let neighbor_dtype_name = match neighbor_dtype {
+        OffsetDType::U32 => "u32",
+        OffsetDType::U64 => "u64",
+    };
+    let mut neighbors =
+        ColumnBuilder::new(neighbor_dtype.size(), graph.neighbors_degree(), &alloc)?;
+    let mut scratch: AVec<u8, A> = AVec::new_in(alloc.clone());
+    for i in 0..node_count {
+        scratch.clear();
+        for edge in graph.neighbors(i).iter() {
+            push_offset(&mut scratch, neighbor_dtype, edge)?;
+        }
+        neighbors.push_row(&scratch)?;
+    }
+
+    let mut cursor = 0usize;
+    let key_offsets_start = reserve_offsets(&key, &mut cursor, alignment)?;
+    let key_values_start = reserve_span(&mut cursor, key.values.len(), alignment)?;
+    let value_offsets_start = reserve_offsets(&value, &mut cursor, alignment)?;
+    let value_values_start = reserve_span(&mut cursor, value.values.len(), alignment)?;
+    let neighbor_offsets_start = reserve_offsets(&neighbors, &mut cursor, alignment)?;
+    let neighbor_values_start = reserve_span(&mut cursor, neighbors.values.len(), alignment)?;
+    let data_len = cursor;
+
+    let mut header = String::new();
+    header.push('{');
+    header.push_str("\"__metadata__\":");
+    match metadata {
+        Some(object) => object.write_json(&mut header).map_err(|_| Error::Alloc)?,
+        None => header.push_str("{}"),
+    }
+    write_column(
+        &mut header,
+        "key",
+        key_dtype,
+        &key,
+        key_offsets_start,
+        key_values_start,
+    );
+    write_column(
+        &mut header,
+        "value",
+        value_dtype,
+        &value,
+        value_offsets_start,
+        value_values_start,
+    );
+    write_column(
+        &mut header,
+        "neighbors",
+        neighbor_dtype_name,
+        &neighbors,
+        neighbor_offsets_start,
+        neighbor_values_start,
+    );
+    header.push('}');
+
+    let unpadded = 16usize.checked_add(header.len()).ok_or(Error::TooLarge)?;
+    let header_pad = (alignment - (unpadded % alignment)) % alignment;
+    let header_len = header.len() + header_pad;
+    let data_start = 16 + header_len;
+    let total = data_start.checked_add(data_len).ok_or(Error::TooLarge)?;
+
+    let mut file: AVec<u8, A> = AVec::new_in(alloc);
+    file.try_reserve_exact(total).map_err(|_| Error::Alloc)?;
+    file.extend_from_slice(&MAGIC);
+    file.extend_from_slice(&(header_len as u64).to_le_bytes());
+    file.extend_from_slice(header.as_bytes());
+    for _ in 0..header_pad {
+        file.push(b' ');
+    }
+    if let Some(off) = key_offsets_start {
+        write_buffer(&mut file, data_start, off, &key.offsets);
+    }
+    write_buffer(&mut file, data_start, key_values_start, &key.values);
+    if let Some(off) = value_offsets_start {
+        write_buffer(&mut file, data_start, off, &value.offsets);
+    }
+    write_buffer(&mut file, data_start, value_values_start, &value.values);
+    if let Some(off) = neighbor_offsets_start {
+        write_buffer(&mut file, data_start, off, &neighbors.offsets);
+    }
+    write_buffer(
+        &mut file,
+        data_start,
+        neighbor_values_start,
+        &neighbors.values,
+    );
+
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Toy {
+        nodes: usize,
+        dim: usize,
+        degree: usize,
+        keys: Vec<u8>,
+        values: Vec<u8>,
+        adjacency: Vec<u8>, // u32 node indices, little-endian
+    }
+
+    impl GraphLike for Toy {
+        fn len(&self) -> usize {
+            self.nodes
+        }
+        fn key_dtype(&self) -> &str {
+            "u64"
+        }
+        fn value_dtype(&self) -> &str {
+            "f32"
+        }
+        fn value_shape(&self) -> Option<usize> {
+            Some(self.dim)
+        }
+        fn neighbors_degree(&self) -> Option<usize> {
+            Some(self.degree)
+        }
+        fn key(&self, i: usize) -> &[u8] {
+            &self.keys[i * 8..i * 8 + 8]
+        }
+        fn value(&self, i: usize) -> &[u8] {
+            let w = self.dim * 4;
+            &self.values[i * w..i * w + w]
+        }
+        fn neighbors(&self, i: usize) -> NeighborList<'_> {
+            let w = self.degree * 4;
+            NeighborList {
+                bytes: &self.adjacency[i * w..i * w + w],
+                dtype: OffsetDType::U32,
+            }
+        }
+    }
+
+    fn toy() -> Toy {
+        let mut keys = Vec::new();
+        for k in [10u64, 20, 30] {
+            keys.extend_from_slice(&k.to_le_bytes());
+        }
+        let mut values = Vec::new();
+        for v in [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0] {
+            values.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut adjacency = Vec::new();
+        for node in [1u32, 2, 2, 0, 0, 1] {
+            adjacency.extend_from_slice(&node.to_le_bytes());
+        }
+        Toy {
+            nodes: 3,
+            dim: 2,
+            degree: 2,
+            keys,
+            values,
+            adjacency,
+        }
+    }
+
+    #[test]
+    fn round_trip_regular() {
+        let table = Table::build(&toy(), None).unwrap();
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.value_shape(), Some(2));
+        assert_eq!(table.key(1), &20u64.to_le_bytes()[..]);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&5.0f32.to_le_bytes());
+        expected.extend_from_slice(&6.0f32.to_le_bytes());
+        assert_eq!(table.value(2), &expected[..]);
+
+        let edges: Vec<u64> = table.neighbors(0).iter().collect();
+        assert_eq!(edges, vec![1, 2]);
+
+        assert_eq!(table.dtype_name("value"), Some("f32"));
+        assert_eq!(table.dtype_name("key"), Some("u64"));
+    }
+
+    #[test]
+    fn round_trip_through_bytes() {
+        let table = Table::build(&toy(), None).unwrap();
+        let bytes = table.bytes().to_vec();
+        let reopened = Table::from_bytes(&bytes).unwrap();
+        assert_eq!(reopened.len(), 3);
+        assert_eq!(reopened.key(2), &30u64.to_le_bytes()[..]);
+    }
+
+    #[test]
+    fn table_is_graphlike() {
+        // A Table implements GraphLike, so it can be re-materialized into another.
+        let table = Table::build(&toy(), None).unwrap();
+        let rebuilt = Table::build(&table, None).unwrap();
+        assert_eq!(rebuilt.len(), 3);
+        assert_eq!(rebuilt.key(0), &10u64.to_le_bytes()[..]);
+        let edges: Vec<u64> = rebuilt.neighbors(1).iter().collect();
+        assert_eq!(edges, vec![2, 0]);
+    }
+
+    #[test]
+    fn graph_iter_zips_columns() {
+        let g = toy();
+        let shapes: Vec<_> = g
+            .iter()
+            .map(|node| (node.key.len(), node.value.len(), node.neighbors.len()))
+            .collect();
+        assert_eq!(shapes, vec![(8, 8, 2), (8, 8, 2), (8, 8, 2)]);
     }
 }

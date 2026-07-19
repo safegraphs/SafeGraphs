@@ -100,7 +100,7 @@ A producer may append extra columns for its own use, and readers that only need 
     "values_length": 0
   },
   "neighbors": {
-    "dtype": "u32",           # outgoing edges as row offsets: u32 or u64
+    "dtype": "u32",           # outgoing edges as node indices: u32 or u64
     "shape": 32,              # fixed degree; drop shape and add offsets_* for variable degree
     "values_start": 0,
     "values_length": 0
@@ -112,24 +112,24 @@ A producer may append extra columns for its own use, and readers that only need 
   It is scalar and carries no `shape`, and a `utf8` key is variable-length and gains the `offsets_*` fields like any other string column.
 - `value` is the payload, either an embedding vector of any float or integer type, or a `utf8` string.
   Give it a `shape` for fixed-size vectors, or the `offsets_*` fields for variable-length values.
-- `neighbors` lists the outgoing edges of each node as row offsets into this same file, never keys and never rows in another file.
+- `neighbors` lists the outgoing edges of each node as node indices into this same file, never keys and never nodes in another file.
   Give it a `shape` for a fixed-degree graph like Cagra, or the `offsets_*` fields for a variable-degree graph.
 
 No column is nullable.
-Every row is present in every column, so there is no validity bitmap and no null count.
+Every node is present in every column, so there is no validity bitmap and no null count.
 A node with no outgoing edges is a zero-length `neighbors` list, which is empty rather than null, and any optional payload must be encoded in-band, never as a null.
 
-### Fixed vs Variable-Length Columns
+### Regular vs Irregular Columns
 
 Each column is a flat set of scalar fields, and the presence of `offsets_dtype` selects the layout.
 
-- __Fixed-size__ has no `offsets_dtype`, so it is an Arrow `FixedSizeList<T, shape>`.
+- __Regular__ has no `offsets_dtype`, so it is an Arrow `FixedSizeList<T, shape>`.
   A single values buffer holds the concatenated rows, located by `values_start` and `values_length`.
-  `shape` is the fixed width and defaults to 1 when omitted, so row `i` occupies `values[i * shape .. (i + 1) * shape]` and the node count is `values_length / (shape * sizeof(dtype))`.
+  `shape` is the fixed width and defaults to 1 when omitted, so node `i` occupies `values[i * shape .. (i + 1) * shape]` and the node count is `values_length / (shape * sizeof(dtype))`.
   Use this for scalar keys, vectors, and fixed-degree graphs.
-- __Variable-length__ has an `offsets_dtype`, so it is an Arrow `List<T>` for `i32` or `LargeList<T>` for `i64`, and carries no `shape`.
-  It has two buffers: the row-pointer buffer at `offsets_start` and `offsets_length` holding `nodes + 1` monotonically increasing prefix sums, plus the values buffer at `values_start` and `values_length`.
-  Reading the prefix sums as `p`, row `i`'s elements are `values[p[i] .. p[i + 1]]`, with `p[0] == 0` and `p[nodes]` equal to the total element count.
+- __Irregular__ has an `offsets_dtype`, so it is an Arrow `List<T>` for `i32` or `LargeList<T>` for `i64`, and carries no `shape`.
+  It has two buffers: the prefix-sum buffer at `offsets_start` and `offsets_length` holding `nodes + 1` monotonically increasing prefix sums, plus the values buffer at `values_start` and `values_length`.
+  Reading the prefix sums as `p`, node `i`'s elements are `values[p[i] .. p[i + 1]]`, with `p[0] == 0` and `p[nodes]` equal to the total element count.
 
 Every buffer is a `<name>_start` byte position and a `<name>_length` byte size relative to the start of the data segment, matching Arrow's own `Buffer` descriptor of an offset and a length.
 Each buffer starts on the declared `alignment` boundary, so a gap may sit between one buffer's end and the next buffer's start.
@@ -142,7 +142,7 @@ A concrete variable-degree `neighbors` column, with 3 nodes of degree 2, 3, and 
   "offsets_dtype": "i32",   # prefix sums [0, 2, 5, 6] — 4 × i32 = 16 bytes
   "offsets_start": 0,
   "offsets_length": 16,
-  "values_start": 16,       # 6 × u32 row offsets = 24 bytes
+  "values_start": 16,       # 6 × u32 node indices = 24 bytes
   "values_length": 24
 }
 ```
@@ -150,7 +150,7 @@ A concrete variable-degree `neighbors` column, with 3 nodes of degree 2, 3, and 
 ### String Columns
 
 A string key or a string value uses `dtype: "utf8"`, an Arrow `Utf8` or `LargeUtf8`.
-This is just the variable-length layout above with byte values.
+This is just the irregular layout above with byte values.
 The `offsets_*` buffer holds `nodes + 1` prefix sums, the `values_*` buffer holds the concatenated UTF-8 bytes, and string `i` is the byte slice between prefix sums `i` and `i + 1`.
 There is no separate ASCII or fixed-width string type.
 All text is Unicode, UTF-8 encoded, so any language, emoji, or byte sequence round-trips without a codepage.
@@ -170,7 +170,7 @@ All text is Unicode, UTF-8 encoded, so any language, emoji, or byte sequence rou
 
 For larger datasets, the nodes are partitioned across many `.safegraphs` shards described by a JSON manifest.
 Each shard is a complete Monolith as above, self-describing and independently readable.
-A shard's `neighbors` reference only rows inside that same shard, so edges never cross files.
+A shard's `neighbors` reference only nodes inside that same shard, so edges never cross files.
 Node identities are local to each shard and may overlap between shards, and the manifest, not the file format, records how they are partitioned.
 
 ```
@@ -226,11 +226,11 @@ It stays thin, carrying routing, integrity, and provenance only, never column sc
 
 The three-column flat model maps cleanly onto the two most common on-GPU graph indexes.
 
-__Cagra__ from cuVS is a fixed-degree flat graph, a dense `[nodes, degree]` matrix of `u32` neighbor row indices over a `[nodes, dim]` dataset.
-It drops in with zero reshaping: `value` is `FixedSizeList<dtype, dim>`, `neighbors` is `FixedSizeList<u32, degree>`, and the neighbor row indices are already SafeGraphs row offsets.
+__Cagra__ from cuVS is a fixed-degree flat graph, a dense `[nodes, degree]` matrix of `u32` neighbor indices over a `[nodes, dim]` dataset.
+It drops in with zero reshaping: `value` is `FixedSizeList<dtype, dim>`, `neighbors` is `FixedSizeList<u32, degree>`, and the neighbor indices are already SafeGraphs node indices.
 
 __FAISS__ maps through `IndexNSG`, its flat navigable graph, rather than the hierarchical `IndexHNSW`.
-Its adjacency is fixed-max-degree neighbor ids that are row offsets, so exporting as a variable-length `neighbors` column drops the unused padding slots and needs no sentinel value.
+Its adjacency is fixed-max-degree neighbor ids that are node indices, so exporting as a variable-length `neighbors` column drops the unused padding slots and needs no sentinel value.
 Vectors come from the paired storage index, and external ids attach through `IndexIDMap`, which become the `key` column.
 FAISS `IndexShards`, independent sub-indexes with their own row spaces merged at query time, is a direct match for the Distributed manifest with overlapping local offsets.
 
