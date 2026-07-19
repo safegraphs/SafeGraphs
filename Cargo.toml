@@ -1,0 +1,60 @@
+[package]
+name = "safegraphs"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "The SafeTensors of graphs: a memory-mappable interchange format for flat search graphs"
+repository = "https://github.com/ashvardanian/SafeGraphs"
+readme = "README.md"
+categories = ["data-structures", "science", "memory-management"]
+keywords = ["ann", "graph", "mmap", "vector-search", "safetensors"]
+
+# The whole reader lives in one file.
+[lib]
+path = "safegraphs.rs"
+
+[dependencies]
+
+# Standard, well-maintained memory mapping. Reading is zero-copy: the mmap'd
+# bytes are reinterpreted as typed slices in place, never copied out.
+memmap2 = "0.9"
+
+# Allocator-aware, fallible containers. Pinned to match jsontape's major so the
+# `Json<A>` header and our columns share one `Allocator` trait.
+allocator-api2 = "0.4"
+
+# Allocator-aware JSON parser for the header, keeping strings as zero-copy spans.
+jsontape = { path = "../JsonTape" }
+
+# Variable-length string and list tapes: offsets + concatenated bytes, matching
+# the on-disk offsets_* / values_* layout of utf8 and variable-degree columns.
+stringtape = { git = "https://github.com/ashvardanian/StringTape" }
+
+# Pulled in only by the `search` feature.
+
+# NumKong scoring kernels: Dot, Spatial, Cosine, Hamming, Jaccard, geospatial,
+# MaxSim for late interaction, and Kabsch/Umeyama for point meshes.
+numkong = { git = "https://github.com/ashvardanian/NumKong", branch = "main-v8-block-scaling", optional = true }
+
+# StringZilla sequence scoring: Levenshtein, Needleman-Wunsch, Smith-Waterman,
+# plus sha256 for manifest integrity.
+stringzilla = { git = "https://github.com/ashvardanian/StringZilla", branch = "main-v5", optional = true }
+
+# ForkUnion structured parallelism, fanning scans across queries and shards.
+forkunion = { git = "https://github.com/ashvardanian/ForkUnion", optional = true }
+
+[features]
+# The default build only reads and unpacks files: mmap, header parse, and
+# zero-copy typed columns. No kernels, no threads.
+default = []
+
+# Scan and A* over the graph, with every scoring kernel: pulls NumKong,
+# StringZilla, and ForkUnion.
+search = ["dep:numkong", "dep:stringzilla", "dep:forkunion"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+# A no-unwind backstop consistent with the never-panic design.
+panic = "abort"
