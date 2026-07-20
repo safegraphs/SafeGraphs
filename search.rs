@@ -165,47 +165,48 @@ impl<A: Allocator + Clone> VisitedSet<A> {
     }
 }
 
-/// A per-thread bundle of reusable search scratch. Hold one per worker thread
-/// and [`reset`](Context::reset) it between queries rather than reallocating.
+/// A per-thread bundle of reusable traversal scratch. Hold one per worker thread
+/// and [`reset`](TraversalContext::reset) it between queries rather than
+/// reallocating.
 ///
 /// Generic over the node-index width `I` (`u32`, `u64`, …) and the metric's
 /// score type `S` (`f32`, `i32`, `f64`, …).
-pub struct Context<A: Allocator = Global, I = u32, S = f32> {
-    /// A* candidate frontier, ordered by the metric's direction.
+pub struct TraversalContext<A: Allocator = Global, I = u32, S = f32> {
+    /// A* candidate frontier, ordered best-first for expansion.
     frontier: MinQueue<Candidate<I, S>, A>,
+    /// A* bounded best-so-far set, ordered worst-first for eviction.
+    results: MinQueue<Candidate<I, S>, A>,
     /// Closed set for A*.
     visited: VisitedSet<A>,
-    /// Backing for the rank-2 cross-product score tile.
+    /// Backing for the rank-2 cross-product score tile used by the scan.
     scores: AVec<S, A>,
-    /// Neighbor values gathered contiguous for one cross-product call.
-    gather: AVec<u8, A>,
 }
 
-impl<A: Allocator + Clone, I, S> Context<A, I, S> {
+impl<A: Allocator + Clone, I, S> TraversalContext<A, I, S> {
     /// A context sized for a graph of `nodes` nodes, allocating in `alloc`.
     pub fn new_in(nodes: usize, alloc: A) -> Result<Self, Error> {
-        Ok(Context {
+        Ok(TraversalContext {
             frontier: MinQueue::new_in(alloc.clone()),
+            results: MinQueue::new_in(alloc.clone()),
             visited: VisitedSet::new_in(nodes, alloc.clone())?,
-            scores: AVec::new_in(alloc.clone()),
-            gather: AVec::new_in(alloc),
+            scores: AVec::new_in(alloc),
         })
     }
 
     /// Clear every buffer for the next query, keeping the allocations.
     pub fn reset(&mut self) {
         self.frontier.clear();
+        self.results.clear();
         self.visited.reset();
         self.scores.clear();
-        self.gather.clear();
     }
 }
 
-impl Context<Global, u32, f32> {
+impl TraversalContext<Global, u32, f32> {
     /// A context sized for `nodes` nodes on the global heap, with `u32` node
     /// indices and `f32` scores.
     pub fn new(nodes: usize) -> Result<Self, Error> {
-        Context::new_in(nodes, Global)
+        TraversalContext::new_in(nodes, Global)
     }
 }
 
@@ -222,134 +223,317 @@ pub mod maxsim;
 pub mod sequence;
 
 #[cfg(feature = "search")]
-pub use dense::Dot;
+pub use dense::ScoringDot;
 
 #[cfg(feature = "search")]
 use crate::{GraphLike, Table};
 #[cfg(feature = "search")]
-use numkong::MatrixSpan;
+use numkong as nk;
 
-/// A scoring kernel: fills a rank-2 score tile `out[i][j] = score(query i,
-/// node j)` in one batched pass, then ranks candidates by [`cmp`].
-///
-/// The value side is always the [`Table`]; only the query representation varies,
-/// so it is an associated [`Query`](ScoringLike::Query) type — a dense matrix for
-/// vector metrics, byte strings for sequence metrics, multi-vectors for MaxSim.
-/// Batching is deliberate: NumKong and StringZilla both prefer whole batches, so
-/// the engine hands the kernel every query and every node at once.
-///
-/// [`cmp`]: ScoringLike::cmp
+/// The SafeGraphs header dtype string for a NumKong scalar. A local trait over
+/// foreign scalars — legal by the orphan rule, leaving the sealed `Dots` set
+/// untouched — so a metric can assert a table's runtime dtype matches the
+/// query's compile-time scalar `T`. The table below is the authoritative dtype
+/// universe search understands; a runtime `&str → T` dispatcher will read from
+/// the same list.
 #[cfg(feature = "search")]
-pub trait ScoringLike {
-    /// How a batch of queries is handed to this metric.
-    type Query<'a>;
-    /// The score the metric produces (`f64`, `i64`, …).
-    type Score: Copy + Default;
-
-    /// The number of queries in `queries` — the engine needs it to size the tile.
-    fn query_count(queries: &Self::Query<'_>) -> usize;
-
-    /// Fill `out[i][j]` with the score of query `i` against node `j`'s value.
-    fn cross<A: Allocator>(
-        &self,
-        table: &Table<A>,
-        queries: Self::Query<'_>,
-        out: &mut MatrixSpan<'_, Self::Score>,
-    ) -> Result<(), Error>;
-
-    /// Best-first ordering: `Greater` means `a` outranks `b`.
-    fn cmp(&self, a: Self::Score, b: Self::Score) -> core::cmp::Ordering;
+pub trait DTypeName: nk::Dots {
+    const DTYPE: &'static str;
 }
 
 #[cfg(feature = "search")]
-impl<A: Allocator + Clone> Table<A> {
-    /// Brute-force top-`k` over every node, for a batch of queries.
+macro_rules! dtype_names {
+    ($($scalar:ty => $name:literal),+ $(,)?) => {
+        $(
+            impl DTypeName for $scalar {
+                const DTYPE: &'static str = $name;
+            }
+        )+
+    };
+}
+
+#[cfg(feature = "search")]
+dtype_names! {
+    f32 => "f32",
+    f64 => "f64",
+    nk::f16 => "f16",
+    nk::bf16 => "bf16",
+    i8 => "i8",
+    u8 => "u8",
+    nk::e4m3 => "e4m3",
+    nk::e5m2 => "e5m2",
+}
+
+/// A scoring metric together with its reusable traversal scratch — the object a
+/// caller scores with. A metric OVERRIDES the three kernels ([`cross`], [`score`],
+/// [`compare`]) and exposes its stored [`TraversalContext`] via [`context`]; on
+/// top of those it inherits [`scan`] (brute force) and [`search`] (A*). `Score`
+/// is the metric's native accumulator (`f64` for an `f32` dot, `i32` for `i8`),
+/// never a blanket-widened type.
+///
+/// [`cross`]: ScoringLike::cross
+/// [`score`]: ScoringLike::score
+/// [`compare`]: ScoringLike::compare
+/// [`context`]: ScoringLike::context
+/// [`scan`]: ScoringLike::scan
+/// [`search`]: ScoringLike::search
+#[cfg(feature = "search")]
+pub trait ScoringLike<T: nk::Dots> {
+    /// The metric's native score type.
+    type Score: nk::StorageElement;
+    /// The allocator behind the scorer's [`TraversalContext`].
+    type Alloc: Allocator + Clone;
+    /// The node-index width of results and the frontier.
+    type Index: Copy + TryFrom<usize> + TryInto<usize>;
+
+    /// Batched: fill `matches[node][query]` for a packed query batch scored
+    /// against a whole value column in one cross-product (NumKong `DotsPacked`).
+    /// `&mut self` so a metric may drive its own executor (e.g. a thread pool).
+    fn cross(
+        &mut self,
+        queries: &nk::PackedMatrix<T>,
+        values: &nk::MatrixView<'_, T>,
+        matches: &mut nk::MatrixSpan<'_, Self::Score>,
+    ) -> Result<(), Error>;
+
+    /// Vector-vector: score one query row against one node's value (NumKong
+    /// `nk::Dot`), or `None` if the two are not the same width.
+    fn score(&self, query: &[T], value: &[T]) -> Option<Self::Score>;
+
+    /// Best-first ordering: `Greater` means `a` outranks `b`.
+    fn compare(a: Self::Score, b: Self::Score) -> core::cmp::Ordering;
+
+    /// The scorer's reusable traversal scratch.
+    fn context(&mut self) -> &mut TraversalContext<Self::Alloc, Self::Index, Self::Score>;
+
+    /// Brute-force top-`k` over every node, for an eager-packed query batch.
     ///
-    /// `out` is a caller-preallocated `q × k` slice, filled row-major so
-    /// `out[i * k + r]` is the `r`-th best match for query `i`. The `ctx` scratch
-    /// is reused across calls.
-    pub fn scan<I: Copy + TryFrom<usize>, M: ScoringLike>(
-        &self,
-        queries: M::Query<'_>,
-        metric: &M,
+    /// `queries` is packed once (and reused across shards) by e.g.
+    /// [`ScoringDot::prepare`]. `out` is a caller-preallocated `queries × k`
+    /// slice, row-major, so `out[query * k + rank]` is the `rank`-th best node for
+    /// that query.
+    fn scan(
+        &mut self,
+        queries: &nk::PackedMatrix<T>,
+        table: &Table<impl Allocator>,
         k: usize,
-        ctx: &mut Context<A, I, M::Score>,
-        out: &mut [Match<I, M::Score>],
-    ) -> Result<(), Error> {
-        let nodes = self.len();
-        let queries_count = M::query_count(&queries);
+        out: &mut [Match<Self::Index, Self::Score>],
+    ) -> Result<(), Error>
+    where
+        T: DTypeName,
+    {
+        if T::DTYPE != table.value_dtype() {
+            return Err(Error::WrongType);
+        }
+        let nodes = table.len();
+        let dimension = table.value_shape().ok_or(Error::Inconsistent)?;
+        let queries_count = queries.dims().0;
         if k == 0 || out.len() != queries_count * k {
             return Err(Error::Inconsistent);
         }
+        let values = value_view::<T>(table, nodes, dimension)?;
 
-        // Size the reusable score tile to `queries_count × nodes`, without
-        // reallocating inside the reserved capacity.
-        let cells = queries_count.checked_mul(nodes).ok_or(Error::TooLarge)?;
-        ctx.scores.clear();
-        ctx.scores.try_reserve(cells).map_err(|_| Error::Alloc)?;
-        ctx.scores.resize(cells, M::Score::default());
+        // Size the reusable `nodes × queries` score tile, then fill it in place.
+        let cells = nodes.checked_mul(queries_count).ok_or(Error::TooLarge)?;
         {
-            let elem = core::mem::size_of::<M::Score>() as isize;
+            let scratch = self.context();
+            scratch.scores.clear();
+            scratch.scores.try_reserve(cells).map_err(|_| Error::Alloc)?;
+            scratch.scores.resize(cells, Self::Score::default());
+        }
+        {
+            let element_bytes = core::mem::size_of::<Self::Score>() as isize;
+            let tile_ptr = self.context().scores.as_mut_ptr();
             let mut tile = unsafe {
-                MatrixSpan::<M::Score>::from_raw_parts(
-                    ctx.scores.as_mut_ptr(),
-                    &[queries_count, nodes],
-                    &[nodes as isize * elem, elem],
+                nk::MatrixSpan::<Self::Score>::from_raw_parts(
+                    tile_ptr,
+                    &[nodes, queries_count],
+                    &[queries_count as isize * element_bytes, element_bytes],
                 )
             };
-            metric.cross(self, queries, &mut tile)?;
+            self.cross(queries, &values, &mut tile)?;
         }
 
-        // Rank each query's row into its slot of the output.
-        for qi in 0..queries_count {
-            let row = &ctx.scores[qi * nodes..qi * nodes + nodes];
-            top_k(row, metric, &mut out[qi * k..qi * k + k])?;
+        // Rank each query's column (stride `queries_count`) into its slot of `out`.
+        let compare = |a: Self::Score, b: Self::Score| Self::compare(a, b);
+        let scores = &self.context().scores;
+        for query in 0..queries_count {
+            let ranked = &mut out[query * k..query * k + k];
+            let mut filled = 0usize;
+            for node in 0..nodes {
+                let score = scores[node * queries_count + query];
+                if filled < k {
+                    insert_at(ranked, filled, node, score, &compare)?;
+                    filled += 1;
+                } else if Self::compare(score, ranked[k - 1].score) == core::cmp::Ordering::Greater {
+                    insert_at(ranked, k - 1, node, score, &compare)?;
+                }
+            }
         }
         Ok(())
     }
-}
 
-/// Fill `out` with the best entries of `row`, best-first, by insertion into the
-/// sorted output. `out.len()` is the retained count `k`.
-#[cfg(feature = "search")]
-fn top_k<I: Copy + TryFrom<usize>, M: ScoringLike>(
-    row: &[M::Score],
-    metric: &M,
-    out: &mut [Match<I, M::Score>],
-) -> Result<(), Error> {
-    use core::cmp::Ordering;
-    let k = out.len();
-    let mut filled = 0usize;
-    for (node, &score) in row.iter().enumerate() {
-        if filled < k {
-            insert_at(out, filled, node, score, metric)?;
-            filled += 1;
-        } else if metric.cmp(score, out[k - 1].score) == Ordering::Greater {
-            insert_at(out, k - 1, node, score, metric)?;
+    /// Greedy/A* top-`k` for one query, walking the neighbor graph from `roots`.
+    ///
+    /// `ef` (≥ `k`) is the search breadth — the bounded best-so-far set kept while
+    /// walking. `out` (length `k`) is filled best-first; if fewer than `k` nodes
+    /// are reached, the trailing slots are left untouched.
+    fn search(
+        &mut self,
+        query: &[T],
+        table: &Table<impl Allocator>,
+        roots: &[Self::Index],
+        ef: usize,
+        k: usize,
+        out: &mut [Match<Self::Index, Self::Score>],
+    ) -> Result<(), Error>
+    where
+        T: DTypeName,
+    {
+        if T::DTYPE != table.value_dtype() {
+            return Err(Error::WrongType);
         }
+        if k == 0 || ef < k || out.len() != k {
+            return Err(Error::Inconsistent);
+        }
+        let nodes = table.len();
+        let toward_best =
+            |a: &Candidate<Self::Index, Self::Score>, b: &Candidate<Self::Index, Self::Score>| {
+                Self::compare(a.score, b.score) == core::cmp::Ordering::Greater
+            };
+        let toward_worst =
+            |a: &Candidate<Self::Index, Self::Score>, b: &Candidate<Self::Index, Self::Score>| {
+                Self::compare(a.score, b.score) == core::cmp::Ordering::Less
+            };
+
+        self.context().reset();
+
+        // Seed the frontier and result set with the entry points.
+        for &root in roots {
+            let index: usize = root.try_into().map_err(|_| Error::Inconsistent)?;
+            if index >= nodes || !self.context().visited.visit(index) {
+                continue;
+            }
+            let score = self.score(query, value_at::<T>(table, index)?).ok_or(Error::Inconsistent)?;
+            let candidate = Candidate { node: root, score };
+            self.context().frontier.push(candidate, toward_best)?;
+            self.context().results.push(candidate, toward_worst)?;
+            if self.context().results.len() > ef {
+                self.context().results.pop(toward_worst);
+            }
+        }
+
+        // Expand the best candidate until none can improve the result set.
+        while let Some(candidate) = self.context().frontier.pop(toward_best) {
+            if self.saturated(candidate.score, ef) {
+                break;
+            }
+            let node: usize = candidate.node.try_into().map_err(|_| Error::Inconsistent)?;
+            let neighbors = table.neighbors(node);
+            for neighbor in neighbors.iter() {
+                let index = neighbor as usize;
+                if index >= nodes || !self.context().visited.visit(index) {
+                    continue;
+                }
+                let score = self.score(query, value_at::<T>(table, index)?).ok_or(Error::Inconsistent)?;
+                if self.saturated(score, ef) {
+                    continue;
+                }
+                let node_index = Self::Index::try_from(index).map_err(|_| Error::TooLarge)?;
+                let candidate = Candidate { node: node_index, score };
+                self.context().frontier.push(candidate, toward_best)?;
+                self.context().results.push(candidate, toward_worst)?;
+                if self.context().results.len() > ef {
+                    self.context().results.pop(toward_worst);
+                }
+            }
+        }
+
+        // Drain the `k` best from the worst-first result set, best-first into `out`.
+        let found = self.context().results.len();
+        let keep = found.min(k);
+        for _ in 0..found.saturating_sub(keep) {
+            self.context().results.pop(toward_worst);
+        }
+        for slot in (0..keep).rev() {
+            let candidate = self
+                .context()
+                .results
+                .pop(toward_worst)
+                .ok_or(Error::Inconsistent)?;
+            out[slot] = Match {
+                node: candidate.node,
+                score: candidate.score,
+            };
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// True when `score` cannot enter a full (`>= ef`) result set — the walk's
+    /// admission and termination test.
+    fn saturated(&mut self, score: Self::Score, ef: usize) -> bool {
+        let results = &self.context().results;
+        results.len() >= ef
+            && match results.peek() {
+                Some(worst) => Self::compare(score, worst.score) != core::cmp::Ordering::Greater,
+                None => false,
+            }
+    }
 }
 
 /// Insert node `index` with `score` into the sorted prefix `out[..=end]`,
 /// shifting weaker entries right so the prefix stays best-first. Widening the
 /// `0..len` index into `I` fails with [`Error::TooLarge`] if it does not fit.
 #[cfg(feature = "search")]
-fn insert_at<I: Copy + TryFrom<usize>, M: ScoringLike>(
-    out: &mut [Match<I, M::Score>],
+fn insert_at<I, S>(
+    out: &mut [Match<I, S>],
     end: usize,
     index: usize,
-    score: M::Score,
-    metric: &M,
-) -> Result<(), Error> {
+    score: S,
+    compare: &impl Fn(S, S) -> core::cmp::Ordering,
+) -> Result<(), Error>
+where
+    I: Copy + TryFrom<usize>,
+    S: Copy,
+{
     let node = I::try_from(index).map_err(|_| Error::TooLarge)?;
     let mut i = end;
-    while i > 0 && metric.cmp(score, out[i - 1].score) == core::cmp::Ordering::Greater {
+    while i > 0 && compare(score, out[i - 1].score) == core::cmp::Ordering::Greater {
         out[i] = out[i - 1];
         i -= 1;
     }
     out[i] = Match { node, score };
     Ok(())
+}
+
+/// A zero-copy `nodes × dimension` view of a table's value column, straight from
+/// the memory map, for the batched scan.
+#[cfg(feature = "search")]
+fn value_view<T: DTypeName>(
+    table: &Table<impl Allocator>,
+    nodes: usize,
+    dimension: usize,
+) -> Result<nk::MatrixView<'_, T>, Error> {
+    let scalars: &[T] = crate::cast(table.value_buffer()).ok_or(Error::WrongType)?;
+    if scalars.len() != nodes * dimension {
+        return Err(Error::Inconsistent);
+    }
+    let size = core::mem::size_of::<T>() as isize;
+    // SAFETY: the value buffer is dtype-aligned and `nodes * dimension` long, so
+    // the shape and unit strides describe exactly its extent, borrowed for `'_`.
+    Ok(unsafe {
+        nk::MatrixView::<T>::from_raw_parts(
+            scalars.as_ptr(),
+            &[nodes, dimension],
+            &[dimension as isize * size, size],
+        )
+    })
+}
+
+/// One node's value reinterpreted as `&[T]` in place, for the vector-vector walk.
+#[cfg(feature = "search")]
+fn value_at<T: DTypeName>(table: &Table<impl Allocator>, node: usize) -> Result<&[T], Error> {
+    crate::cast(table.value(node)).ok_or(Error::WrongType)
 }
 
 #[cfg(test)]
@@ -415,7 +599,7 @@ mod tests {
 
     #[test]
     fn context_resets() {
-        let mut ctx: Context = Context::new(8).unwrap();
+        let mut ctx: TraversalContext = TraversalContext::new(8).unwrap();
         ctx.frontier
             .push(Candidate { node: 0, score: 1.0 }, |a, b| a.score < b.score)
             .unwrap();
