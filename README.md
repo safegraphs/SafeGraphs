@@ -1,6 +1,6 @@
 # SafeGraphs
 
-SafeGraphs is the SafeTensors of graphs - a simple format to exchange network-shaped search indexes between CPUs and GPUs and across the network.
+SafeGraphs is the SafeTensors of graphs — a simple format to exchange network-shaped search indexes between CPUs and GPUs and across the network.
 It's designed as an interoperability layer between NSW, Cagra, and similar algorithms, often used in vector databases for approximate nearest neighbor search (ANNS).
 It aims to be simple, efficient, and easy to implement across different programming languages and platforms.
 
@@ -9,7 +9,6 @@ It aims to be simple, efficient, and easy to implement across different programm
 __Minimalism__.
 No complex dependencies or external libraries should be required to read or write SafeGraphs files.
 The format should be simple and easy to implement in any programming language.
-This immediately cuts out formats like Google's [Protocol Buffers](https://github.com/protocolbuffers/protobuf), Apache [Parquet](https://github.com/apache/parquet-format/), etc.
 
 __Memory Mapping__.
 SafeGraphs should be memory-mappable, allowing for simple access to larger-than-memory graphs without loading them into memory.
@@ -17,10 +16,8 @@ With indexes often being constructed on 100+ core 8-GPU machines, they should be
 This immediately cuts out compression schemes like [Snappy](https://github.com/google/snappy), [Zstandard](https://github.com/facebook/zstd), and suggests intra-entry padding to align data blocks to SSD page sizes.
 
 __Extensibility__.
-Modern ML and AI heavily relies on mixed-precision arithmetic, starting with types like `f16`, `bf16`, and `i8`, and ending with `e4m3`, `e5m2` and other custom floating point formats.
-Most applications deal with dense high-dimensional vectors, which are often stored as arrays of these types, but some of those arrays may have a different length or be represented as sparse arrays.
-Similarly, file-level metadata may be needed to interpret the links, such as the distance metric used for nearest neighbor search.
-SafeGraphs should be easy to extend to support new types, metrics, and traversal mechanisms, while preserving file readability.
+Modern ML leans on mixed-precision arithmetic — `f16`, `bf16`, `i8`, and custom floating-point formats like `e4m3` and `e5m2` — over payloads that range from dense vectors to variable-length and sparse arrays.
+SafeGraphs should absorb new element types, metrics, and traversal mechanisms without breaking file readability.
 
 __Easy Distribution__.
 Two file formats are supported: a unified single-file bundle or separate `.json` manifest with an array of `.safegraphs` shards.
@@ -72,12 +69,12 @@ All integers are little-endian.
 Each buffer is a `<name>_start` byte position and a `<name>_length` byte size relative to the start of the data segment, so the header stays position-independent even if the segment is padded ahead.
 
 Every buffer, and the data segment itself, starts on an `alignment` boundary declared in `__metadata__`, defaulting to 4096 bytes with a floor of 64.
-Header bytes are padded with spaces, and data-segment padding is zeros.
+Header bytes are padded with spaces, and data-segment padding is zeros, so a gap can sit between one buffer's end and the next's start.
 The 4 KB default matches the x86 page, the common SSD logical sector, the `O_DIRECT` block, and GPUDirect Storage's DMA quantum, so an entire column can stream straight into GPU memory.
 SafeGraphs favors small, page-sized blocks for random traversal, like RocksDB's 4 KB SST blocks, rather than the 64 KB–1 MB scan blocks of columnar stores like ClickHouse.
 A producer targeting Apple Silicon can raise `alignment` to 16384, or to 2 MB for huge pages, and readers simply honor the declared value.
 
-A flat graph has exactly three columns - `key`, `value`, and `neighbors`.
+A flat graph has exactly three columns — `key`, `value`, and `neighbors`.
 A producer may append extra columns for its own use, and readers that only need the graph ignore them.
 
 ```json
@@ -100,7 +97,7 @@ A producer may append extra columns for its own use, and readers that only need 
     "values_length": 0
   },
   "neighbors": {
-    "dtype": "u32",           # outgoing edges as node indices: u32 or u64
+    "dtype": "u32",           # node indices into this same file, never keys: u32 or u64
     "shape": 32,              # fixed degree; drop shape and add offsets_* for variable degree
     "values_start": 0,
     "values_length": 0
@@ -108,13 +105,7 @@ A producer may append extra columns for its own use, and readers that only need 
 }
 ```
 
-- `key` is the node identity, one of `u32`, `u64`, `bin16` for a 16-byte UUID, or `utf8` for a string.
-  It is scalar and carries no `shape`, and a `utf8` key is variable-length and gains the `offsets_*` fields like any other string column.
-- `value` is the payload, either an embedding vector of any float or integer type, or a `utf8` string.
-  Give it a `shape` for fixed-size vectors, or the `offsets_*` fields for variable-length values.
-- `neighbors` lists the outgoing edges of each node as node indices into this same file, never keys and never nodes in another file.
-  Give it a `shape` for a fixed-degree graph like Cagra, or the `offsets_*` fields for a variable-degree graph.
-
+A `utf8` key or value is variable-length and gains the `offsets_*` fields like any other string column.
 No column is nullable.
 Every node is present in every column, so there is no validity bitmap and no null count.
 A node with no outgoing edges is a zero-length `neighbors` list, which is empty rather than null, and any optional payload must be encoded in-band, never as a null.
@@ -130,9 +121,6 @@ Each column is a flat set of scalar fields, and the presence of `offsets_dtype` 
 - __Irregular__ has an `offsets_dtype`, so it is an Arrow `List<T>` for `i32` or `LargeList<T>` for `i64`, and carries no `shape`.
   It has two buffers: the prefix-sum buffer at `offsets_start` and `offsets_length` holding `nodes + 1` monotonically increasing prefix sums, plus the values buffer at `values_start` and `values_length`.
   Reading the prefix sums as `p`, node `i`'s elements are `values[p[i] .. p[i + 1]]`, with `p[0] == 0` and `p[nodes]` equal to the total element count.
-
-Every buffer is a `<name>_start` byte position and a `<name>_length` byte size relative to the start of the data segment, matching Arrow's own `Buffer` descriptor of an offset and a length.
-Each buffer starts on the declared `alignment` boundary, so a gap may sit between one buffer's end and the next buffer's start.
 
 A concrete variable-degree `neighbors` column, with 3 nodes of degree 2, 3, and 1:
 
@@ -185,10 +173,10 @@ It stays thin, carrying routing, integrity, and provenance only, never column sc
 
 ```json
 {
-  "__metadata__": {
+  "__metadata__": {              # dataset-wide summary + free-form provenance
     "metric": "ip",
-    "value_dtype": "f16",
-    "value_length": 1536,
+    "value_dtype": "f16",        # payload described as in a shard header, so a
+    "value_length": 1536,        #   reader can size a load without opening a shard
     "key_dtype": "bin16",
     "created_by": "usearch 2.x",
     "embedding_model": "openai/text-embedding-3-small",
@@ -196,11 +184,11 @@ It stays thin, carrying routing, integrity, and provenance only, never column sc
   },
   "files": [
     {
-      "path": "dataset-00001-of-00002.safegraphs",
+      "path": "dataset-00001-of-00002.safegraphs",  # relative to the manifest
       "bytes": 21474836480,
-      "nodes": 20000000,
-      "keys": "^[0-7]",
-      "sha256": "9a1c…e4"
+      "nodes": 20000000,         # optional
+      "keys": "^[0-7]",          # optional regex over canonical key renderings
+      "sha256": "9a1c…e4"        # optional; hex digest of the whole shard file
     },
     {
       "path": "dataset-00002-of-00002.safegraphs",
@@ -213,18 +201,16 @@ It stays thin, carrying routing, integrity, and provenance only, never column sc
 }
 ```
 
-- `__metadata__` is a dataset-wide summary plus free-form provenance.
-  `value_dtype` with `value_length`, and `key_dtype`, describe the payload the same way a file header does, so a reader can size a load without opening a shard.
-  If a summary field ever disagrees with a shard header, the shard header wins.
-- Each `files` entry is minimal: `path` relative to the manifest, `bytes`, an optional `nodes` count, an optional `keys` regex, and an optional `sha256`.
-- `keys` matches the canonical rendering of a key: decimal for integers, lowercase dashed UUID for `bin16`, the string itself for `utf8`.
-  A coordinator routes a query to the shard whose `keys` matches, and `null` or an absent field means the shard is not key-partitioned.
-- `sha256` is the hex digest of the whole shard file for integrity.
-  It is optional and computed out of band, so it never touches the memory-mapped data.
+- If a summary field ever disagrees with a shard header, the shard header wins.
+- `keys` matches the canonical rendering of a key — decimal for integers, lowercase dashed UUID for `bin16`, the string itself for `utf8` — so a coordinator routes each query to the shard whose regex matches; `null` or an absent field means the shard is not key-partitioned.
+- `sha256` is computed out of band, so it never touches the memory-mapped data.
 
 ## Interoperability
 
-The three-column flat model maps cleanly onto the two most common on-GPU graph indexes.
+SafeGraphs interoperates through a standard, not through per-tool adapters.
+Because its data segment is Apache Arrow's physical memory layout, any Arrow-aware runtime can borrow a column zero-copy through the C Data Interface, in any language, without a SafeGraphs library.
+
+That same flat layout is the shape the most common on-GPU graph indexes already use, so moving a graph in or out is a relabeling, not a conversion.
 
 __Cagra__ from cuVS is a fixed-degree flat graph, a dense `[nodes, degree]` matrix of `u32` neighbor indices over a `[nodes, dim]` dataset.
 It drops in with zero reshaping: `value` is `FixedSizeList<dtype, dim>`, `neighbors` is `FixedSizeList<u32, degree>`, and the neighbor indices are already SafeGraphs node indices.
@@ -246,17 +232,44 @@ The reference reader ranks them with NumKong's `Dot` and `Spatial` metrics, as w
 Biological sequences are stored as `utf8` values, one strand per node, over a graph whose edges link similar sequences.
 The reference reader scores those edges with StringZilla's sequence metrics: Levenshtein for edit distance, and Needleman-Wunsch and Smith-Waterman for global and local alignment.
 
-### Geospatial Search
+### Haversine & Vincenty Search
 
-Points are stored as 2D `value` vectors of `f32` or `f64` coordinates, and the graph links spatial neighbors.
-The reference reader ranks them with NumKong's geospatial metrics, so haversine and related distances drive the traversal.
+Points are stored as 2D `value` vectors of `f32` or `f64` coordinates, and the graph links geospatial neighbors.
+The reference reader ranks them with NumKong's geospatial metrics, so haversine and Vincenty distances drive the traversal.
+
+### Raw & Weighted Sparse Feature Sets
+
+Sparse, high-dimensional features are stored per node as a variable-length `value` column of index and weight pairs, rather than a dense vector.
+The reference reader scores them with NumKong's sparse dot-product, so only the handful of non-zero dimensions each node carries drive the traversal.
+This fits bag-of-words retrieval, learned-sparse models like SPLADE, and one-hot categorical signals from recommender and ranking systems.
 
 ### ColBERT Late-Interaction Multi-Vector Entries
 
-## How Does it Compare to ...?
+Each entry is a bag of per-token embeddings, a multi-vector, stored as a variable-length `value` column of one small matrix per node.
+The reference reader scores late interaction with NumKong's MaxSim: every query token is matched to its most similar entry token, and those best matches are summed into the entry's score.
 
-__Lance__.
+## Where It Fits
+
+SafeGraphs is an interchange format, so it sits alongside these tools rather than against them: it moves an already-built index between them, and reuses the best of them — Arrow's physical layout — rather than reinventing it.
+
+__[Arrow](https://arrow.apache.org)__, __[Parquet](https://github.com/apache/parquet-format/)__, __[Iceberg](https://iceberg.apache.org)__.
+These are columnar analytics formats built for scanning and filtering wide tables.
+SafeGraphs borrows Arrow's physical layout for its buffers, but it is not a table: it stores one flat graph, tuned for random neighbor traversal over small page-sized blocks rather than large sequential scans.
+Parquet optimizes for compressed columnar scans and Iceberg for evolving, transactional tables — different goals than a single zero-copy, memory-mapped graph.
+
+__[FlatBuffers](https://github.com/google/flatbuffers)__, __[Protocol Buffers](https://github.com/protocolbuffers/protobuf)__.
+These are schema-driven serialization frameworks: you compile a schema into generated code and link a runtime to read a message.
+They trade a build step for compact, evolvable messages; SafeGraphs makes the opposite trade — its schema is the JSON header itself, read with any JSON parser.
+
+__[Lance](https://github.com/lancedb/lance)__.
 Lance is a versioned columnar storage format with optional secondary indexes built on top, aimed at replacing Parquet for ML workloads and powering LanceDB.
 SafeGraphs is the opposite slice of the problem: it has no runtime, no transaction log, no index-builder — it just freezes an already-built graph structure into a file that another library can memory-map.
 Put differently, Lance _contains_ an NSW among its indexes; SafeGraphs _is_ the NSW.
-Lance is the right choice when you want a mutable store with version history and compute pushdown; SafeGraphs is the right choice when library A has built an index and library B needs to load it without pulling in a database.
+
+__[Lucene](https://lucene.apache.org)__.
+Lucene has an on-disk format: a segmented codec whose KNN-vectors component stores an HNSW graph much as SafeGraphs stores a flat one.
+But it is an internal codec, versioned per release and read through Lucene itself; SafeGraphs aims instead for a stable, language-neutral file any engine can map directly.
+
+__[Pinecone](https://www.pinecone.io)__, __[Milvus](https://milvus.io)__, __[Elasticsearch](https://www.elastic.co/elasticsearch)__.
+These are search systems, not file formats: each owns the whole path from ingestion to query behind a service or a cluster, and its storage is an internal detail (Elasticsearch's is Lucene's, above).
+SafeGraphs sits a layer below — the frozen index such a system could import or export, not a competitor to the system itself.
