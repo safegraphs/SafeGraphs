@@ -195,7 +195,7 @@ pub trait ElementType: Copy {
 impl ElementType for StorageDType {
     fn from_dtype(text: &[u8]) -> Result<Self, Error> {
         Ok(match text {
-            b"u8" | b"i8" | b"e4m3" | b"e5m2" | b"utf8" => StorageDType::Bin8,
+            b"u8" | b"i8" | b"e4m3" | b"e5m2" | b"e2m3" | b"e3m2" | b"utf8" => StorageDType::Bin8,
             b"u16" | b"i16" | b"f16" | b"bf16" => StorageDType::Bin16,
             b"u32" | b"i32" | b"f32" => StorageDType::Bin32,
             b"u64" | b"i64" | b"f64" => StorageDType::Bin64,
