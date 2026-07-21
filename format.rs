@@ -74,6 +74,26 @@ impl OffsetDType {
     }
 }
 
+/// The typed counterpart to [`OffsetDType`]: the concrete scalar an offset column
+/// stores, `u32` or `u64`, the same two widths that back a node index and a
+/// prefix-sum entry alike. A file declares the width at runtime as an
+/// [`OffsetDType`]; a searcher resolves the matching `OffsetScalar` from it and
+/// traverses in that type, so the frontier and results stay as compact as the
+/// graph — a `u32` node paired with an `f32` score is eight bytes. `Into<u64>`
+/// widens a result only when it leaves the walk; the trait exists to seal the two
+/// legal scalars and to name which [`OffsetDType`] each one is.
+pub trait OffsetScalar: Copy + TryFrom<usize> + TryInto<usize> + Into<u64> + 'static {
+    const OFFSET_DTYPE: OffsetDType;
+}
+
+impl OffsetScalar for u32 {
+    const OFFSET_DTYPE: OffsetDType = OffsetDType::U32;
+}
+
+impl OffsetScalar for u64 {
+    const OFFSET_DTYPE: OffsetDType = OffsetDType::U64;
+}
+
 /// The prefix-sum buffer of an irregular column.
 #[derive(Clone, Copy)]
 pub struct IrregularOffsets {
@@ -382,6 +402,14 @@ impl<A: Allocator> Table<A> {
         self.backing.as_bytes()
     }
 
+    /// The complete `.safegraphs` byte image — magic, header, and data segment —
+    /// ready to write to a file or hand to [`from_bytes`](Table::from_bytes). For
+    /// a built index this is the serialization; for a mapped one it is the mapping
+    /// itself, so the borrow is always zero-copy.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.bytes()
+    }
+
     /// The free-form `__metadata__` object, if present.
     pub fn metadata(&self) -> Option<&Json<A>> {
         self.header.get("__metadata__")
@@ -425,6 +453,20 @@ impl<A: Allocator> Table<A> {
     pub fn neighbors_column(&self) -> &Column<OffsetDType> {
         &self.neighbors
     }
+
+    /// The mean out-degree: total neighbor entries divided by node count. For a
+    /// fixed-degree graph this is exactly the degree; for a variable-degree one it
+    /// is the average. A walk seeds about this many random landmarks, the way a
+    /// graph index seeds about `connectivity` — no magic constant, since the
+    /// figure is read from the graph itself.
+    pub fn mean_degree(&self) -> usize {
+        let nodes = self.len();
+        if nodes == 0 {
+            return 0;
+        }
+        let entries = self.neighbors.values.len / self.neighbors.dtype.size();
+        entries / nodes
+    }
 }
 
 impl<E: ElementType> Column<E> {
@@ -433,19 +475,15 @@ impl<E: ElementType> Column<E> {
         match self.layout {
             ColumnLayout::Regular { width } => {
                 let per = width * self.dtype.size();
-                if per == 0 {
-                    0
-                } else {
-                    self.values.len / per
-                }
+                self.values.len.checked_div(per).unwrap_or(0)
             }
             ColumnLayout::Irregular { offsets } => {
                 let element_size = offsets.dtype.size();
-                if element_size == 0 {
-                    0
-                } else {
-                    (offsets.range.len / element_size).saturating_sub(1)
-                }
+                offsets
+                    .range
+                    .len
+                    .checked_div(element_size)
+                    .map_or(0, |count| count.saturating_sub(1))
             }
         }
     }
@@ -458,10 +496,10 @@ impl<E: ElementType> Column<E> {
 /// Reinterpret a byte slice as `&[T]`, refusing a wrong length or misalignment.
 pub fn cast<T: Copy>(bytes: &[u8]) -> Option<&[T]> {
     let size = core::mem::size_of::<T>();
-    if size == 0 || bytes.len() % size != 0 {
+    if size == 0 || !bytes.len().is_multiple_of(size) {
         return None;
     }
-    if bytes.as_ptr() as usize % core::mem::align_of::<T>() != 0 {
+    if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<T>()) {
         return None;
     }
     // SAFETY: the pointer is aligned for `T` and the length is a whole number of
@@ -490,20 +528,16 @@ impl<'a> NeighborList<'a> {
         self.len() == 0
     }
 
-    /// The `i`th neighbor's node index, widened to `u64`.
-    pub fn get(&self, i: usize) -> Option<u64> {
-        let element_size = self.dtype.size();
-        let slot = self
-            .bytes
-            .get(i * element_size..i * element_size + element_size)?;
-        Some(match self.dtype {
-            OffsetDType::U32 => u32::from_le_bytes(slot.try_into().ok()?) as u64,
-            OffsetDType::U64 => u64::from_le_bytes(slot.try_into().ok()?),
-        })
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = u64> + '_ {
-        (0..self.len()).filter_map(move |i| self.get(i))
+    /// This node's neighbors as a native `&[I]`, zero-copy, or `None` when `I`'s
+    /// width does not match the stored one. A searcher resolves `I` from the same
+    /// table, so the width agrees and the walk reads its neighbors without a copy
+    /// or a widen; the check is what makes a mismatched reader fail cleanly rather
+    /// than reinterpret bytes.
+    pub fn as_slice<I: OffsetScalar>(&self) -> Option<&'a [I]> {
+        if self.dtype != I::OFFSET_DTYPE {
+            return None;
+        }
+        cast(self.bytes)
     }
 }
 
@@ -512,6 +546,21 @@ impl<A: Allocator> Table<A> {
     /// a regular value column; pair with [`GraphLike::value_shape`].
     pub fn value_buffer(&self) -> &[u8] {
         self.buffer(self.value.values)
+    }
+
+    /// The value column's prefix-sum buffer and its width, or `None` when the
+    /// column is regular and has no offsets at all.
+    ///
+    /// Exposed because a variable-length column is exactly an Arrow-style tape —
+    /// prefix sums plus concatenated bytes — and a sequence metric can hand that
+    /// pair to its backend with no copy, provided it can reach both halves.
+    pub fn value_offsets(&self) -> Option<(&[u8], OffsetDType)> {
+        match self.value.layout {
+            ColumnLayout::Regular { .. } => None,
+            ColumnLayout::Irregular { offsets } => {
+                Some((self.buffer(offsets.range), offsets.dtype))
+            }
+        }
     }
 
     /// The node whose key equals `key` byte-for-byte, by linear scan.
@@ -808,7 +857,7 @@ impl<A: Allocator + Clone> ColumnBuilder<A> {
     }
 
     fn push_row(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.element_size == 0 || bytes.len() % self.element_size != 0 {
+        if self.element_size == 0 || !bytes.len().is_multiple_of(self.element_size) {
             return Err(Error::Inconsistent);
         }
         let count = bytes.len() / self.element_size;
@@ -927,11 +976,31 @@ where
         ColumnBuilder::new(neighbor_dtype.size(), graph.neighbors_degree(), &alloc)?;
     let mut scratch: AVec<u8, A> = AVec::new_in(alloc.clone());
     for i in 0..node_count {
-        scratch.clear();
-        for edge in graph.neighbors(i).iter() {
-            push_offset(&mut scratch, neighbor_dtype, edge)?;
+        let list = graph.neighbors(i);
+        if list.dtype == neighbor_dtype {
+            // Same width: the bytes are already node indices in the target
+            // encoding, so copy the row verbatim with no per-edge widening. This
+            // is the path a re-materialized `Table` always takes.
+            neighbors.push_row(list.bytes)?;
+        } else {
+            // The one place widths genuinely cross, when a producer's graph and
+            // the chosen target width differ. Read each edge native, write it in
+            // the target width.
+            scratch.clear();
+            match list.dtype {
+                OffsetDType::U32 => {
+                    for &edge in cast::<u32>(list.bytes).ok_or(Error::WrongType)? {
+                        push_offset(&mut scratch, neighbor_dtype, edge as u64)?;
+                    }
+                }
+                OffsetDType::U64 => {
+                    for &edge in cast::<u64>(list.bytes).ok_or(Error::WrongType)? {
+                        push_offset(&mut scratch, neighbor_dtype, edge)?;
+                    }
+                }
+            }
+            neighbors.push_row(&scratch)?;
         }
-        neighbors.push_row(&scratch)?;
     }
 
     let mut cursor = 0usize;
@@ -1091,8 +1160,8 @@ mod tests {
         expected.extend_from_slice(&6.0f32.to_le_bytes());
         assert_eq!(table.value(2), &expected[..]);
 
-        let edges: Vec<u64> = table.neighbors(0).iter().collect();
-        assert_eq!(edges, vec![1, 2]);
+        let edges = table.neighbors(0);
+        assert_eq!(edges.as_slice::<u32>().unwrap(), &[1u32, 2]);
 
         assert_eq!(table.dtype_name("value"), Some("f32"));
         assert_eq!(table.dtype_name("key"), Some("u64"));
@@ -1114,8 +1183,8 @@ mod tests {
         let rebuilt = Table::build(&table, None).unwrap();
         assert_eq!(rebuilt.len(), 3);
         assert_eq!(rebuilt.key(0), &10u64.to_le_bytes()[..]);
-        let edges: Vec<u64> = rebuilt.neighbors(1).iter().collect();
-        assert_eq!(edges, vec![2, 0]);
+        let edges = rebuilt.neighbors(1);
+        assert_eq!(edges.as_slice::<u32>().unwrap(), &[2u32, 0]);
     }
 
     #[test]
