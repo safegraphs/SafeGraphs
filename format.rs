@@ -31,11 +31,18 @@ pub struct ByteRange {
 }
 
 /// Storage width of a payload element, in bits. Storage is decoupled from
-/// compute, so a `StorageDType` only says how many bytes an element occupies, never how
-/// to interpret it. A 2-byte `Bin16` is equally an `f16`, a `bf16`, or a `u16`;
-/// the numeric meaning lives in `metadata` and is the compute layer's concern.
+/// compute, so a `StorageDType` only says how wide an element is, never how to
+/// interpret it. A 2-byte `Bin16` is equally an `f16`, a `bf16`, or a `u16`; the
+/// numeric meaning lives in `metadata` and is the compute layer's concern. Widths
+/// below a byte — `Bin4` for a `4`-bit nibble, `Bin1` for a packed bit — pack
+/// several elements into a byte, so a row's byte length is [`row_bytes`], never a
+/// per-element size times the width.
+///
+/// [`row_bytes`]: StorageDType::row_bytes
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum StorageDType {
+    Bin1,
+    Bin4,
     Bin8,
     Bin16,
     Bin32,
@@ -44,15 +51,34 @@ pub enum StorageDType {
 }
 
 impl StorageDType {
-    /// Element size in bytes.
-    pub const fn size(self) -> usize {
+    /// Element width in bits, the one figure that stays exact for a sub-byte type.
+    pub const fn bits(self) -> usize {
         match self {
-            StorageDType::Bin8 => 1,
-            StorageDType::Bin16 => 2,
-            StorageDType::Bin32 => 4,
-            StorageDType::Bin64 => 8,
-            StorageDType::Bin128 => 16,
+            StorageDType::Bin1 => 1,
+            StorageDType::Bin4 => 4,
+            StorageDType::Bin8 => 8,
+            StorageDType::Bin16 => 16,
+            StorageDType::Bin32 => 32,
+            StorageDType::Bin64 => 64,
+            StorageDType::Bin128 => 128,
         }
+    }
+
+    /// Element size in bytes, rounded up. Meaningful only for whole-byte widths,
+    /// where a column indexes elements one at a time — offsets, keys, neighbor
+    /// ids. A sub-byte value column never reaches here; it measures rows through
+    /// [`row_bytes`] instead.
+    ///
+    /// [`row_bytes`]: StorageDType::row_bytes
+    pub const fn size(self) -> usize {
+        self.bits().div_ceil(8)
+    }
+
+    /// Byte length of one regular row of `width` logical elements, packing sub-byte
+    /// elements tight. For a whole-byte type this is `width * size()`; for `Bin4`
+    /// it is `width` nibbles rounded up to bytes, for `Bin1` `width` bits.
+    pub const fn row_bytes(self, width: usize) -> usize {
+        (width * self.bits()).div_ceil(8)
     }
 }
 
@@ -92,6 +118,40 @@ impl OffsetScalar for u32 {
 
 impl OffsetScalar for u64 {
     const OFFSET_DTYPE: OffsetDType = OffsetDType::U64;
+}
+
+/// The score-side twin of [`OffsetScalar::to_u64`]: a native metric accumulator
+/// widened to the one score type a runtime caller can name. Where a walk leaves
+/// the graph it widens its node through [`OffsetScalar`] and its score through
+/// this, so the erased boundary is `(u64, f64)` and nothing wider. Every native
+/// accumulator — `i32`, `u32`, `f32`, `f64` — fits exactly in `f64`'s mantissa, so
+/// this loses nothing today; a metric scoring past 2^53 is the only thing it could.
+pub trait Widen: Copy {
+    fn widen(self) -> f64;
+}
+
+impl Widen for i32 {
+    fn widen(self) -> f64 {
+        self as f64
+    }
+}
+
+impl Widen for u32 {
+    fn widen(self) -> f64 {
+        self as f64
+    }
+}
+
+impl Widen for f32 {
+    fn widen(self) -> f64 {
+        self as f64
+    }
+}
+
+impl Widen for f64 {
+    fn widen(self) -> f64 {
+        self
+    }
 }
 
 /// The prefix-sum buffer of an irregular column.
@@ -210,11 +270,18 @@ impl From<JsonError> for Error {
 pub trait ElementType: Copy {
     fn from_dtype(text: &[u8]) -> Result<Self, Error>;
     fn size(self) -> usize;
+    /// Byte length of a regular row of `width` elements. Whole-byte by default —
+    /// only [`StorageDType`] overrides it to pack sub-byte elements tight.
+    fn row_bytes(self, width: usize) -> usize {
+        width * self.size()
+    }
 }
 
 impl ElementType for StorageDType {
     fn from_dtype(text: &[u8]) -> Result<Self, Error> {
         Ok(match text {
+            b"u1x8" => StorageDType::Bin1,
+            b"i4x2" | b"u4x2" => StorageDType::Bin4,
             b"u8" | b"i8" | b"e4m3" | b"e5m2" | b"e2m3" | b"e3m2" | b"utf8" => StorageDType::Bin8,
             b"u16" | b"i16" | b"f16" | b"bf16" => StorageDType::Bin16,
             b"u32" | b"i32" | b"f32" => StorageDType::Bin32,
@@ -226,6 +293,10 @@ impl ElementType for StorageDType {
 
     fn size(self) -> usize {
         StorageDType::size(self)
+    }
+
+    fn row_bytes(self, width: usize) -> usize {
+        StorageDType::row_bytes(self, width)
     }
 }
 
@@ -474,7 +545,7 @@ impl<E: ElementType> Column<E> {
     pub fn len(&self) -> usize {
         match self.layout {
             ColumnLayout::Regular { width } => {
-                let per = width * self.dtype.size();
+                let per = self.dtype.row_bytes(width);
                 self.values.len.checked_div(per).unwrap_or(0)
             }
             ColumnLayout::Irregular { offsets } => {
@@ -507,7 +578,12 @@ pub fn cast<T: Copy>(bytes: &[u8]) -> Option<&[T]> {
     Some(unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / size) })
 }
 
-/// A node's outgoing edges: node indices in this file, as `u32` or `u64`.
+/// A node's outgoing edges: node indices in this file, as `u32` or `u64`. An
+/// index at or past the file's node count names no node and is a sentinel by
+/// convention, so a reader skips it; a producer may therefore pad a fixed-degree
+/// row with such a value rather than emit a variable-length list. This type holds
+/// only the raw bytes, so the skip is applied by whoever knows the node count,
+/// namely the traversal.
 pub struct NeighborList<'a> {
     bytes: &'a [u8],
     dtype: OffsetDType,
@@ -617,7 +693,7 @@ impl<A: Allocator> Table<A> {
     fn node_bytes<E: ElementType>(&self, column: &Column<E>, node: usize) -> Option<&[u8]> {
         match column.layout {
             ColumnLayout::Regular { width } => {
-                let per = width.checked_mul(column.dtype.size())?;
+                let per = column.dtype.row_bytes(width);
                 self.subslice(column.values, node.checked_mul(per)?, per)
             }
             ColumnLayout::Irregular { offsets } => {
@@ -648,9 +724,7 @@ impl<A: Allocator> Table<A> {
     fn check_layout<E: ElementType>(&self, column: &Column<E>, len: usize) -> Result<(), Error> {
         match column.layout {
             ColumnLayout::Regular { width } => {
-                let per = width
-                    .checked_mul(column.dtype.size())
-                    .ok_or(Error::TooLarge)?;
+                let per = column.dtype.row_bytes(width);
                 if per.checked_mul(len) != Some(column.values.len) {
                     return Err(Error::Inconsistent);
                 }
@@ -834,7 +908,7 @@ fn reserve_span(cursor: &mut usize, len: usize, alignment: usize) -> Result<usiz
 /// Accumulates one column's on-disk buffers: concatenated values, and u64
 /// prefix-sum offsets when the column is irregular.
 struct ColumnBuilder<A: Allocator> {
-    element_size: usize,
+    dtype: StorageDType,
     width: Option<usize>,
     values: AVec<u8, A>,
     offsets: AVec<u8, A>,
@@ -842,13 +916,13 @@ struct ColumnBuilder<A: Allocator> {
 }
 
 impl<A: Allocator + Clone> ColumnBuilder<A> {
-    fn new(element_size: usize, width: Option<usize>, alloc: &A) -> Result<Self, Error> {
+    fn new(dtype: StorageDType, width: Option<usize>, alloc: &A) -> Result<Self, Error> {
         let mut offsets = AVec::new_in(alloc.clone());
         if width.is_none() {
             push_bytes(&mut offsets, &0u64.to_le_bytes())?;
         }
         Ok(ColumnBuilder {
-            element_size,
+            dtype,
             width,
             values: AVec::new_in(alloc.clone()),
             offsets,
@@ -857,19 +931,28 @@ impl<A: Allocator + Clone> ColumnBuilder<A> {
     }
 
     fn push_row(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if self.element_size == 0 || !bytes.len().is_multiple_of(self.element_size) {
-            return Err(Error::Inconsistent);
-        }
-        let count = bytes.len() / self.element_size;
-        if let Some(width) = self.width {
-            if count != width {
-                return Err(Error::Inconsistent);
+        match self.width {
+            // Regular: every row is exactly `row_bytes(width)`, packing sub-byte
+            // elements tight, so the length is checked against that, never against
+            // a per-element size the packing would make fractional.
+            Some(width) => {
+                if bytes.len() != self.dtype.row_bytes(width) {
+                    return Err(Error::Inconsistent);
+                }
+                push_bytes(&mut self.values, bytes)?;
             }
-        }
-        push_bytes(&mut self.values, bytes)?;
-        self.running += count as u64;
-        if self.width.is_none() {
-            push_bytes(&mut self.offsets, &self.running.to_le_bytes())?;
+            // Irregular: whole-byte elements counted for the prefix sum. A sub-byte
+            // dtype never arrives here — only sequences are irregular, and they are
+            // `utf8`, a byte.
+            None => {
+                let element_size = self.dtype.size();
+                if element_size == 0 || !bytes.len().is_multiple_of(element_size) {
+                    return Err(Error::Inconsistent);
+                }
+                push_bytes(&mut self.values, bytes)?;
+                self.running += (bytes.len() / element_size) as u64;
+                push_bytes(&mut self.offsets, &self.running.to_le_bytes())?;
+            }
         }
         Ok(())
     }
@@ -948,16 +1031,16 @@ where
         .max(64);
 
     let key_dtype = graph.key_dtype();
-    let key_esz = StorageDType::from_dtype(key_dtype.as_bytes())?.size();
+    let key_storage = StorageDType::from_dtype(key_dtype.as_bytes())?;
     let key_width = if key_dtype == "utf8" { None } else { Some(1) };
-    let mut key = ColumnBuilder::new(key_esz, key_width, &alloc)?;
+    let mut key = ColumnBuilder::new(key_storage, key_width, &alloc)?;
     for i in 0..node_count {
         key.push_row(graph.key(i))?;
     }
 
     let value_dtype = graph.value_dtype();
-    let value_esz = StorageDType::from_dtype(value_dtype.as_bytes())?.size();
-    let mut value = ColumnBuilder::new(value_esz, graph.value_shape(), &alloc)?;
+    let value_storage = StorageDType::from_dtype(value_dtype.as_bytes())?;
+    let mut value = ColumnBuilder::new(value_storage, graph.value_shape(), &alloc)?;
     for i in 0..node_count {
         value.push_row(graph.value(i))?;
     }
@@ -968,12 +1051,11 @@ where
     } else {
         OffsetDType::U32
     };
-    let neighbor_dtype_name = match neighbor_dtype {
-        OffsetDType::U32 => "u32",
-        OffsetDType::U64 => "u64",
+    let (neighbor_dtype_name, neighbor_storage) = match neighbor_dtype {
+        OffsetDType::U32 => ("u32", StorageDType::Bin32),
+        OffsetDType::U64 => ("u64", StorageDType::Bin64),
     };
-    let mut neighbors =
-        ColumnBuilder::new(neighbor_dtype.size(), graph.neighbors_degree(), &alloc)?;
+    let mut neighbors = ColumnBuilder::new(neighbor_storage, graph.neighbors_degree(), &alloc)?;
     let mut scratch: AVec<u8, A> = AVec::new_in(alloc.clone());
     for i in 0..node_count {
         let list = graph.neighbors(i);

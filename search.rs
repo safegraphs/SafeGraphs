@@ -428,6 +428,86 @@ impl<'a, S: Copy> Scores2D<'a, S> {
     }
 }
 
+/// A dense, owned, row-major `rows × cols` matrix. Allocation is fallible and never
+/// panics. The shape it carries is what lets a batch search read `k` and the query
+/// count off the output instead of taking them as arguments, and it grows-and-reuses
+/// across calls. Deliberately NumKong-free, so it holds a batch's `matches` and
+/// `distances` for a StringZilla sequence search as readily as a NumKong dense one,
+/// and doubles as a scanner's reusable score tile.
+pub struct Matrix<T, A: Allocator = Global> {
+    data: AVec<T, A>,
+    rows: usize,
+    cols: usize,
+}
+
+impl<T: Copy + Default> Matrix<T, Global> {
+    pub fn new(rows: usize, cols: usize) -> Result<Self, Error> {
+        Self::new_in(rows, cols, Global)
+    }
+}
+
+impl<T: Copy + Default, A: Allocator + Clone> Matrix<T, A> {
+    pub fn new_in(rows: usize, cols: usize, alloc: A) -> Result<Self, Error> {
+        let mut matrix = Matrix {
+            data: AVec::new_in(alloc),
+            rows: 0,
+            cols: 0,
+        };
+        matrix.reshape(rows, cols)?;
+        Ok(matrix)
+    }
+
+    /// Grow the backing to `rows * cols` if needed — never shrink — and adopt that
+    /// shape, so a scanner reuses one tile across batches with no per-call alloc.
+    pub fn reshape(&mut self, rows: usize, cols: usize) -> Result<(), Error> {
+        let cells = rows.checked_mul(cols).ok_or(Error::TooLarge)?;
+        if self.data.len() < cells {
+            let extra = cells - self.data.len();
+            self.data.try_reserve(extra).map_err(|_| Error::Alloc)?;
+            self.data.resize(cells, T::default());
+        }
+        (self.rows, self.cols) = (rows, cols);
+        Ok(())
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn row(&self, i: usize) -> Option<&[T]> {
+        (i < self.rows).then(|| &self.data[i * self.cols..i * self.cols + self.cols])
+    }
+
+    pub fn row_mut(&mut self, i: usize) -> Option<&mut [T]> {
+        (i < self.rows).then(|| &mut self.data[i * self.cols..i * self.cols + self.cols])
+    }
+
+    /// The `rows * cols` cells in row-major order, the whole live extent.
+    pub fn as_slice(&self) -> &[T] {
+        &self.data[..self.rows * self.cols]
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.data[..self.rows * self.cols]
+    }
+}
+
+/// A batch of queries a walk consumes one at a time: it reports how many it holds
+/// and yields each as the metric's [`Query`](ScoringLike::Query). A dense batch is a
+/// `nk::MatrixView` yielding rows; a sequence batch is a `StringTape` view yielding
+/// byte strings. This is the seam that lets one batch `search` walk either without
+/// assuming a `&[T]`.
+pub trait QueryBatch<M: ScoringLike + ?Sized> {
+    /// How many queries the batch holds.
+    fn count(&self) -> usize;
+    /// The query at `index`, or `None` if out of range or the batch is malformed.
+    fn query(&self, index: usize) -> Option<M::Query<'_>>;
+}
+
 /// A metric: the vocabulary of its types, nothing more. It names how a query and
 /// a query batch are shaped and what a score is; the functors that do the work —
 /// a [`ScannerLike`] and a [`SearcherLike`] — reference it, so it declares no
@@ -491,14 +571,6 @@ pub trait SearcherLike<M: ScoringLike + ?Sized> {
     /// metric reverses it here and needs no change anywhere else.
     fn compare(a: M::Score, b: M::Score) -> Ordering;
 
-    /// Claim whatever per-thread state the metric's kernels need before scoring on
-    /// this thread. A driver that moves a searcher onto a worker thread calls this
-    /// once there. It is idempotent, so calling it again on an already-prepared
-    /// thread is harmless — a dense metric asks for AMX tile permission, which a
-    /// worker needs and the constructor's thread cannot grant on its behalf; a
-    /// sequence metric needs nothing and implements it empty.
-    fn prepare_thread(&self);
-
     /// Walk toward `query` from randomly sampled entry points, leaving the result
     /// set in the context. Every implementation is one line — a call to [`walk`] —
     /// because shared code is called here, never inherited.
@@ -520,7 +592,9 @@ pub trait SearcherLike<M: ScoringLike + ?Sized> {
 ///
 /// One iteration expands one node and scores its entire unvisited neighbor list
 /// in a single [`score_nodes`](SearcherLike::score_nodes) call, which is the shape
-/// both backends want and the only shape a sequence metric can serve at all.
+/// both backends want and the only shape a sequence metric can serve at all. A
+/// neighbor id outside `0..table.len()` is a sentinel and is skipped, so a
+/// fixed-degree adjacency row may be padded rather than trimmed to length.
 /// Results are left in the searcher's context; drain them with
 /// [`TraversalContext::drain_into`].
 ///
@@ -674,6 +748,13 @@ where
 
 /// Collect the not-yet-visited members of `candidates` into `staged`, marking
 /// each as visited so no node is ever scored twice.
+///
+/// Any candidate outside `0..nodes` is a sentinel and is skipped, by the format's
+/// convention: a neighbor id at or past the node count names no node, so a
+/// producer may pad a fixed-degree adjacency row with such a value — the node
+/// count itself, or the id type's maximum — instead of storing a variable-length
+/// list. The reader needs no distinguished sentinel value; every out-of-range id
+/// is one.
 fn stage_unvisited<M, S>(
     searcher: &mut S,
     candidates: impl Iterator<Item = S::Index>,
@@ -686,6 +767,8 @@ where
 {
     staged.clear();
     for node in candidates {
+        // Out of range, whether the id overflows `usize` or merely names no node:
+        // a sentinel, skipped.
         let Ok(index) = TryInto::<usize>::try_into(node) else {
             continue;
         };
@@ -806,6 +889,8 @@ fn insert_at<I: Copy, S: Copy>(
 // Each metric family lives in its own module, grouped by how it reads a node's
 // value, and shares no code path with any other.
 #[cfg(feature = "search")]
+pub mod binary;
+#[cfg(feature = "search")]
 pub mod dense;
 #[cfg(feature = "search")]
 pub mod geospatial;
@@ -813,6 +898,11 @@ pub mod geospatial;
 pub mod maxsim;
 #[cfg(feature = "search")]
 pub mod sequence;
+
+// Runtime dtype dispatch: pick a concrete scorer from a file's header string,
+// the counterpart to the compile-time descriptors in `dense`.
+#[cfg(feature = "search")]
+pub mod dispatch;
 
 #[cfg(test)]
 mod tests {
@@ -1006,11 +1096,12 @@ mod tests {
     #[cfg(feature = "search")]
     #[test]
     fn backend_surfaces_resolve() {
+        use forkunion as fu;
         use stringzilla::szs;
 
         // NumKong's pool-taking kernels exist only under its `parallel` feature.
-        let topology = forkunion::Topology::new().expect("probe machine topology");
-        let pool = forkunion::ThreadPool::try_spawn(&topology, 2).expect("spawn workers");
+        let topology = fu::Topology::new().expect("probe machine topology");
+        let pool = fu::ThreadPool::try_spawn(&topology, 2).expect("spawn workers");
         assert!(pool.threads_count() >= 1);
 
         // StringZilla's batch engines exist only under its `cpus` feature.
