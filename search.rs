@@ -149,6 +149,21 @@ impl<A: Allocator + Clone> VisitedSet<A> {
         self.stamps.len()
     }
 
+    /// Grow to cover `nodes`, keeping the current generation's marks: new slots are
+    /// zero-stamped, which no live generation matches, so they read as unvisited.
+    /// Never shrinks — a set follows its context from table to table.
+    pub fn reserve(&mut self, nodes: usize) -> Result<(), Error> {
+        let current = self.stamps.len();
+        if nodes <= current {
+            return Ok(());
+        }
+        self.stamps
+            .try_reserve_exact(nodes - current)
+            .map_err(|_| Error::Alloc)?;
+        self.stamps.resize(nodes, 0);
+        Ok(())
+    }
+
     /// How many distinct nodes are marked this generation.
     pub fn len(&self) -> usize {
         self.marked
@@ -251,18 +266,20 @@ pub struct TraversalContext<I, S, A: Allocator = Global> {
 }
 
 impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<I, S, A> {
-    /// A context for a graph of `nodes` nodes, searching with breadth
-    /// `expansion_factor`. The landmark generator is seeded to a fixed constant,
-    /// so a single-threaded run is reproducible; a driver spreading work across
-    /// threads seeds each context differently with [`seed`](TraversalContext::seed).
-    pub fn new_in(nodes: usize, expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    /// A context searching with breadth `expansion_factor`. It knows no table:
+    /// [`walk`] grows the scratch to each searched graph through
+    /// [`reserve`](TraversalContext::reserve), so one context serves many tables. The
+    /// landmark generator is seeded to a fixed constant, so a single-threaded run
+    /// is reproducible; a driver spreading work across threads seeds each context
+    /// differently with [`seed`](TraversalContext::seed).
+    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
         if expansion_factor == 0 {
             return Err(Error::Inconsistent);
         }
         Ok(TraversalContext {
             frontier: MinQueue::new_in(alloc.clone()),
             results: MinQueue::new_in(alloc.clone()),
-            visited: VisitedSet::new_in(nodes, alloc.clone())?,
+            visited: VisitedSet::new_in(0, alloc.clone())?,
             neighbors: AVec::new_in(alloc.clone()),
             scores: AVec::new_in(alloc.clone()),
             expansion_factor,
@@ -278,8 +295,16 @@ impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<
         self.rng = SplitMix::new(seed);
     }
 
+    /// The largest node count this context has grown to fit.
     pub fn nodes(&self) -> usize {
         self.visited.capacity()
+    }
+
+    /// Grow the scratch to cover a graph of `nodes` nodes — a no-op once sized.
+    /// [`walk`] calls this at the start of every query, which is what lets one
+    /// context follow its searcher from table to table.
+    pub fn reserve(&mut self, nodes: usize) -> Result<(), Error> {
+        self.visited.reserve(nodes)
     }
 
     pub fn expansion_factor(&self) -> usize {
@@ -354,8 +379,8 @@ impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<
 
 impl<I: OffsetScalar, S: Copy + Default> TraversalContext<I, S, Global> {
     /// A context on the global heap.
-    pub fn new(nodes: usize, expansion_factor: usize) -> Result<Self, Error> {
-        TraversalContext::new_in(nodes, expansion_factor, Global)
+    pub fn new(expansion_factor: usize) -> Result<Self, Error> {
+        TraversalContext::new_in(expansion_factor, Global)
     }
 }
 
@@ -608,6 +633,7 @@ where
     M: ScoringLike + ?Sized,
     S: SearcherLike<M> + ?Sized,
 {
+    searcher.context().reserve(table.len())?;
     searcher.context().reset();
     let (mut staged, mut scores) = searcher.context().lend_staging();
     let outcome = walk_staged::<M, S>(searcher, query, table, &mut staged, &mut scores);
@@ -966,7 +992,8 @@ mod tests {
 
     #[test]
     fn context_resets() {
-        let mut context: TraversalContext<u32, f32> = TraversalContext::new(8, 4).unwrap();
+        let mut context: TraversalContext<u32, f32> = TraversalContext::new(4).unwrap();
+        context.reserve(8).unwrap();
         context
             .frontier
             .push(
@@ -986,7 +1013,7 @@ mod tests {
     #[test]
     fn context_rejects_zero_breadth() {
         assert!(matches!(
-            TraversalContext::<u32, f32>::new(8, 0),
+            TraversalContext::<u32, f32>::new(0),
             Err(Error::Inconsistent)
         ));
     }

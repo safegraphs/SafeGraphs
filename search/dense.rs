@@ -24,6 +24,7 @@ use allocator_api2::alloc::{Allocator, Global};
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
+use std::sync::Mutex;
 
 /// A zero-copy `rows × width` view over caller-owned scalars, where `width` is a
 /// count of logical elements. For a sub-byte scalar like `i4x2` or `u1x8` that is
@@ -80,16 +81,15 @@ pub struct DotScanner<T: nk::Dots> {
 }
 
 impl<T: nk::Dots> DotScanner<T> {
-    /// A scanner driving `threads` workers, the caller included. `Topology` probes
-    /// the machine and is neither cheap nor cloneable, so the driver builds one
-    /// and lends it to every scanner it makes.
-    pub fn new(topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    /// A scanner driving `threads` workers, the caller included, over a pool it
+    /// builds and owns.
+    pub fn new(threads: usize) -> Result<Self, Error> {
         // NumKong's own workers claim AMX tile state themselves, but the calling
         // thread also participates in a dispatch, so it must claim it too — the
         // packed integer kernels trap without it.
         nk::capabilities::configure_thread();
         Ok(DotScanner {
-            pool: fu::ThreadPool::try_spawn(topology, threads.max(1)).map_err(|_| Error::Alloc)?,
+            pool: spawn_pool(threads)?,
             packed: nk::DotsPackedMatrix::empty_in(nk::Global),
         })
     }
@@ -236,12 +236,101 @@ where
     Ok(())
 }
 
-/// Batch top-k by graph walk for any searcher, one query at a time — the pool
-/// fan-out over queries is the next step. The searcher's own comparator drains each
-/// walk best-first into `matches`/`distances`, widening node to `u64` and score to
-/// `f64`; `counts` is the number found, `< k` when a walk exhausts a small component.
+/// Probe the machine and spawn `threads` workers, the caller included. The
+/// topology is a construction-time local, so no ForkUnion type ever crosses the
+/// API — `threads` is the one parallelism knob every functor exposes.
+pub(crate) fn spawn_pool(threads: usize) -> Result<fu::ThreadPool, Error> {
+    let topology = fu::Topology::new().map_err(|_| Error::Alloc)?;
+    fu::ThreadPool::try_spawn(&topology, threads.max(1)).map_err(|_| Error::Alloc)
+}
+
+/// Build `count` searchers from a fallible constructor, reserving up front so the
+/// whole set of per-thread contexts is either allocated or the batch fails cleanly.
+pub(crate) fn build_workers<Se>(
+    count: usize,
+    mut make: impl FnMut() -> Result<Se, Error>,
+) -> Result<Vec<Se>, Error> {
+    let mut workers = Vec::new();
+    workers.try_reserve_exact(count).map_err(|_| Error::Alloc)?;
+    for _ in 0..count {
+        workers.push(make()?);
+    }
+    Ok(workers)
+}
+
+/// A width resolver's worker lanes: one traversal-scratch leaf per pool thread, at
+/// the neighbor width of the tables being searched. Construction sees no table, so
+/// the lane starts [`Unresolved`](Workers::Unresolved); the first searched table
+/// settles it, and a table of the other width rebuilds it — cheap, since a leaf is
+/// empty scratch that grows on its first walk.
+pub(crate) enum Workers<Narrow, Wide> {
+    Unresolved,
+    U32(Vec<Narrow>),
+    U64(Vec<Wide>),
+}
+
+/// One query's walk and drain, called on a worker's own context and writing that
+/// query's row of the outputs — the shared body of every fan-out task. `matches`
+/// and `distances` are written through `SafePtr`, disjoint by `query_index` and so
+/// safe to touch from many threads at once; a walk short of `k` leaves a `u64::MAX`
+/// sentinel and reports its true count.
+/// The three caller-owned output buffers, held as raw `SafePtr`s so many threads can
+/// fill disjoint query rows at once. `k` is the row width; row `query_index` and slot
+/// `query_index` of `counts` belong to one walk alone.
+struct Sink {
+    matches: fu::SafePtr<u64>,
+    distances: fu::SafePtr<f64>,
+    counts: fu::SafePtr<u64>,
+    k: usize,
+}
+
+fn walk_one<M, Se>(
+    worker: &mut Se,
+    queries: &M::Queries<'_>,
+    query_index: usize,
+    table: &Table<impl Allocator>,
+    sink: &Sink,
+) -> Result<(), Error>
+where
+    M: ScoringLike,
+    M::Score: Widen,
+    for<'a> M::Queries<'a>: QueryBatch<M>,
+    Se: SearcherLike<M>,
+{
+    let query = queries.query(query_index).ok_or(Error::Inconsistent)?;
+    <Se as SearcherLike<M>>::search(worker, query, table)?;
+    let base = query_index * sink.k;
+    let found = <Se as SearcherLike<M>>::context(worker).drain(
+        <Se as SearcherLike<M>>::compare,
+        sink.k,
+        |slot, node, score| {
+            *sink.matches.get_mut_at(base + slot) = node.into();
+            *sink.distances.get_mut_at(base + slot) = score.widen();
+        },
+    );
+    for slot in found..sink.k {
+        *sink.matches.get_mut_at(base + slot) = u64::MAX;
+    }
+    *sink.counts.get_mut_at(query_index) = found as u64;
+    Ok(())
+}
+
+/// Batch top-k by graph walk, fanned across the pool: each thread runs whole
+/// independent walks on its own [`TraversalContext`], draining best-first into its
+/// query's row of `matches`/`distances`; `counts` is the number found, `< k` when a
+/// walk exhausts a small component. The schedule steals work per query, since a
+/// walk's length varies with the component it lands in. With a one-thread pool the
+/// fan-out runs inline on the caller, so this is the sole batch-search path, parallel
+/// or not.
+///
+/// `workers` holds one leaf per pool thread — for a dense metric that is exactly a
+/// pool of contexts, the leaf being nothing but its scratch. The query batch and the
+/// table are read-only and shared; each query's output row is written by one thread
+/// alone, so `SafePtr`/`SyncConstPtr`, ForkUnion's own wrappers, carry them across
+/// the boundary. The first error any walk raises becomes the batch's.
 pub(crate) fn batch_search<M, Se>(
-    searcher: &mut Se,
+    pool: &mut fu::ThreadPool,
+    workers: &mut [Se],
     queries: M::Queries<'_>,
     table: &Table<impl Allocator>,
     matches: &mut Matrix<u64>,
@@ -252,29 +341,49 @@ where
     M: ScoringLike,
     M::Score: Widen,
     for<'a> M::Queries<'a>: QueryBatch<M>,
-    Se: SearcherLike<M>,
+    Se: SearcherLike<M> + Send,
 {
     let query_count = queries.count();
     let k = batch_shape(query_count, matches, distances, counts)?;
-    for (query, count) in counts.iter_mut().enumerate() {
-        let one = queries.query(query).ok_or(Error::Inconsistent)?;
-        <Se as SearcherLike<M>>::search(searcher, one, table)?;
-        let nodes_out = matches.row_mut(query).ok_or(Error::Inconsistent)?;
-        let scores_out = distances.row_mut(query).ok_or(Error::Inconsistent)?;
-        let found = <Se as SearcherLike<M>>::context(searcher).drain(
-            <Se as SearcherLike<M>>::compare,
-            k,
-            |slot, node, score| {
-                nodes_out[slot] = node.into();
-                scores_out[slot] = score.widen();
-            },
-        );
-        for slot in nodes_out.iter_mut().skip(found) {
-            *slot = u64::MAX;
-        }
-        *count = found as u64;
+
+    let sink = Sink {
+        matches: fu::SafePtr::new(matches.as_mut_slice().as_mut_ptr()),
+        distances: fu::SafePtr::new(distances.as_mut_slice().as_mut_ptr()),
+        counts: fu::SafePtr::new(counts.as_mut_ptr()),
+        k,
+    };
+    let queries_ptr = fu::SyncConstPtr::new(&queries as *const M::Queries<'_>);
+    // The table is immutable for the whole walk and its allocator is only touched on
+    // drop, long after the join, so every thread may read it at once. The `impl
+    // Allocator` is not declared `Sync`, so share it through the read-only wrapper
+    // rather than cascading a `Sync` bound up every signature.
+    let table_ptr = fu::SyncConstPtr::new(table as *const _);
+    let failure = Mutex::new(None::<Error>);
+
+    fu::fold_with_scratch(
+        pool,
+        fu::ParallelRange::new(0..query_count),
+        fu::DynamicScheduler,
+        workers,
+        |worker, query_index, _prong| {
+            // SAFETY: both pointers target locals held for the whole blocking fold and
+            // are only read — `QueryBatch::query` and the walk never mutate them.
+            let queries = unsafe { queries_ptr.get(0) };
+            let table = unsafe { table_ptr.get(0) };
+            let outcome = walk_one::<M, Se>(worker, queries, query_index, table, &sink);
+            if let Err(error) = outcome {
+                if let Ok(mut slot) = failure.lock() {
+                    slot.get_or_insert(error);
+                }
+            }
+        },
+    );
+
+    match failure.into_inner() {
+        Ok(Some(error)) => Err(error),
+        Ok(None) => Ok(()),
+        Err(poison) => poison.into_inner().map_or(Ok(()), Err),
     }
-    Ok(())
 }
 
 impl<T> DotScanner<T>
@@ -312,10 +421,10 @@ where
     I: OffsetScalar,
     <T as nk::Dot>::Output: Copy + Default,
 {
-    /// A searcher for a graph of `nodes` nodes, walking with breadth
-    /// `expansion_factor`.
-    pub fn new(nodes: usize, expansion_factor: usize) -> Result<Self, Error> {
-        DotSearcher::new_in(nodes, expansion_factor, Global)
+    /// A searcher walking with breadth `expansion_factor`. It carries no table:
+    /// the scratch grows to fit each searched graph at walk time.
+    pub fn new(expansion_factor: usize) -> Result<Self, Error> {
+        DotSearcher::new_in(expansion_factor, Global)
     }
 }
 
@@ -326,10 +435,10 @@ where
     A: Allocator + Clone,
     <T as nk::Dot>::Output: Copy + Default,
 {
-    pub fn new_in(nodes: usize, expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(DotSearcher {
-            context: TraversalContext::new_in(nodes, expansion_factor, alloc)?,
+            context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
 
@@ -338,28 +447,6 @@ where
     /// shadows.
     pub fn context(&mut self) -> &mut TraversalContext<I, <T as nk::Dot>::Output, A> {
         &mut self.context
-    }
-}
-
-impl<T, I, A> DotSearcher<T, I, A>
-where
-    T: nk::Dot + 'static,
-    I: OffsetScalar,
-    A: Allocator + Clone,
-    <T as nk::Dot>::Output: Copy + Default + PartialOrd + Widen,
-    DotSearcher<T, I, A>: SearcherLike<DotScoring<T>, Index = I>,
-{
-    /// Batch top-k by graph walk. Uniform with [`DotScanner::scan`]; `matches`/
-    /// `distances` carry `k` and the query count, `counts` the number found per query.
-    pub fn search(
-        &mut self,
-        queries: nk::MatrixView<'_, T>,
-        table: &Table<impl Allocator>,
-        matches: &mut Matrix<u64>,
-        distances: &mut Matrix<f64>,
-        counts: &mut [u64],
-    ) -> Result<(), Error> {
-        batch_search::<DotScoring<T>, _>(self, queries, table, matches, distances, counts)
     }
 }
 
@@ -481,12 +568,31 @@ where
     }
 }
 
-/// A dot searcher whose neighbor width is resolved from the table, not named by
-/// the caller — the two arms hold the `u32` and `u64` leaves. A dispatcher over
-/// value dtypes builds one of these per dtype and never branches on width itself.
-pub enum DotSearch<T: nk::Dot, A: Allocator = Global> {
-    U32(DotSearcher<T, u32, A>),
-    U64(DotSearcher<T, u64, A>),
+/// A dot searcher whose neighbor width is settled by the tables it searches, not
+/// named by the caller. Construction is configuration alone — breadth, `threads` —
+/// and builds the pool; the first searched table picks the `u32` or `u64` worker
+/// lane, one traversal context per pool thread, and a later table of the other
+/// width rebuilds it. For a dense metric a leaf is nothing but its scratch, so the
+/// lane is exactly a pool of contexts. A dispatcher over value dtypes builds one of
+/// these per dtype and never branches on width itself; the query fan-out lives in
+/// [`batch_search`].
+pub struct DotSearch<T: nk::Dot, A: Allocator = Global> {
+    pool: fu::ThreadPool,
+    expansion_factor: usize,
+    workers: Workers<DotSearcher<T, u32, A>, DotSearcher<T, u64, A>>,
+    alloc: A,
+}
+
+impl<T> DotSearch<T, Global>
+where
+    T: nk::Dot + 'static,
+    <T as nk::Dot>::Output: Copy + Default + PartialOrd,
+{
+    /// A searcher walking with breadth `expansion_factor` across `threads`
+    /// workers, on the global heap.
+    pub fn new(expansion_factor: usize, threads: usize) -> Result<Self, Error> {
+        DotSearch::new_in(expansion_factor, threads, Global)
+    }
 }
 
 impl<T, A> DotSearch<T, A>
@@ -495,24 +601,19 @@ where
     A: Allocator + Clone,
     <T as nk::Dot>::Output: Copy + Default + PartialOrd,
 {
-    /// Read the neighbor width from `table` and build the matching leaf.
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-        alloc: A,
-    ) -> Result<Self, Error> {
-        Ok(match table.neighbors_column().dtype {
-            OffsetDType::U32 => {
-                DotSearch::U32(DotSearcher::new_in(table.len(), expansion_factor, alloc)?)
-            }
-            OffsetDType::U64 => {
-                DotSearch::U64(DotSearcher::new_in(table.len(), expansion_factor, alloc)?)
-            }
+    /// A searcher walking with breadth `expansion_factor` across `threads`
+    /// workers, over a pool it builds and owns. No table is seen here: the
+    /// neighbor-width worker lane settles on the first searched table.
+    pub fn new_in(expansion_factor: usize, threads: usize, alloc: A) -> Result<Self, Error> {
+        Ok(DotSearch {
+            pool: spawn_pool(threads)?,
+            expansion_factor,
+            workers: Workers::Unresolved,
+            alloc,
         })
     }
 
-    /// Batch top-k by walk, forwarding to the width-resolved leaf. Uniform with
-    /// [`DotScanner::scan`].
+    /// Batch top-k by walk, fanned across the pool. Uniform with [`DotScanner::scan`].
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, T>,
@@ -523,12 +624,52 @@ where
     ) -> Result<(), Error>
     where
         <T as nk::Dot>::Output: Widen,
-        DotSearcher<T, u32, A>: SearcherLike<DotScoring<T>, Index = u32>,
-        DotSearcher<T, u64, A>: SearcherLike<DotScoring<T>, Index = u64>,
+        DotSearcher<T, u32, A>: SearcherLike<DotScoring<T>, Index = u32> + Send,
+        DotSearcher<T, u64, A>: SearcherLike<DotScoring<T>, Index = u64> + Send,
     {
-        match self {
-            DotSearch::U32(leaf) => leaf.search(queries, table, matches, distances, counts),
-            DotSearch::U64(leaf) => leaf.search(queries, table, matches, distances, counts),
+        let threads = self.pool.threads_count();
+        let expansion_factor = self.expansion_factor;
+        match table.neighbors_column().dtype {
+            OffsetDType::U32 => {
+                if !matches!(self.workers, Workers::U32(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U32(build_workers(threads, || {
+                        DotSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U32(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<DotScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
+            OffsetDType::U64 => {
+                if !matches!(self.workers, Workers::U64(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U64(build_workers(threads, || {
+                        DotSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U64(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<DotScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
         }
     }
 }
@@ -547,10 +688,10 @@ pub struct EuclideanScanner<T: nk::Dots> {
 }
 
 impl<T: nk::Dots> EuclideanScanner<T> {
-    pub fn new(topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(threads: usize) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(EuclideanScanner {
-            pool: fu::ThreadPool::try_spawn(topology, threads.max(1)).map_err(|_| Error::Alloc)?,
+            pool: spawn_pool(threads)?,
             packed: nk::DotsPackedMatrix::empty_in(nk::Global),
         })
     }
@@ -586,8 +727,8 @@ where
     I: OffsetScalar,
     <T as nk::Euclidean>::EuclideanOutput: Copy + Default,
 {
-    pub fn new(nodes: usize, expansion_factor: usize) -> Result<Self, Error> {
-        EuclideanSearcher::new_in(nodes, expansion_factor, Global)
+    pub fn new(expansion_factor: usize) -> Result<Self, Error> {
+        EuclideanSearcher::new_in(expansion_factor, Global)
     }
 }
 
@@ -598,10 +739,10 @@ where
     A: Allocator + Clone,
     <T as nk::Euclidean>::EuclideanOutput: Copy + Default,
 {
-    pub fn new_in(nodes: usize, expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(EuclideanSearcher {
-            context: TraversalContext::new_in(nodes, expansion_factor, alloc)?,
+            context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
 
@@ -609,27 +750,6 @@ where
         &mut self,
     ) -> &mut TraversalContext<I, <T as nk::Euclidean>::EuclideanOutput, A> {
         &mut self.context
-    }
-}
-
-impl<T, I, A> EuclideanSearcher<T, I, A>
-where
-    T: nk::Euclidean + 'static,
-    I: OffsetScalar,
-    A: Allocator + Clone,
-    <T as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd + Widen,
-    EuclideanSearcher<T, I, A>: SearcherLike<EuclideanScoring<T>, Index = I>,
-{
-    /// Batch top-k by graph walk, uniform with [`EuclideanScanner::scan`].
-    pub fn search(
-        &mut self,
-        queries: nk::MatrixView<'_, T>,
-        table: &Table<impl Allocator>,
-        matches: &mut Matrix<u64>,
-        distances: &mut Matrix<f64>,
-        counts: &mut [u64],
-    ) -> Result<(), Error> {
-        batch_search::<EuclideanScoring<T>, _>(self, queries, table, matches, distances, counts)
     }
 }
 
@@ -744,11 +864,25 @@ where
     }
 }
 
-/// A Euclidean searcher whose neighbor width is resolved from the table, the
-/// distance twin of [`DotSearch`].
-pub enum EuclideanSearch<T: nk::Euclidean, A: Allocator = Global> {
-    U32(EuclideanSearcher<T, u32, A>),
-    U64(EuclideanSearcher<T, u64, A>),
+/// A Euclidean searcher whose neighbor width is settled by the tables it searches,
+/// the distance twin of [`DotSearch`]: a pool plus one context per thread.
+pub struct EuclideanSearch<T: nk::Euclidean, A: Allocator = Global> {
+    pool: fu::ThreadPool,
+    expansion_factor: usize,
+    workers: Workers<EuclideanSearcher<T, u32, A>, EuclideanSearcher<T, u64, A>>,
+    alloc: A,
+}
+
+impl<T> EuclideanSearch<T, Global>
+where
+    T: nk::Euclidean + 'static,
+    <T as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd,
+{
+    /// A searcher walking with breadth `expansion_factor` across `threads`
+    /// workers, on the global heap.
+    pub fn new(expansion_factor: usize, threads: usize) -> Result<Self, Error> {
+        EuclideanSearch::new_in(expansion_factor, threads, Global)
+    }
 }
 
 impl<T, A> EuclideanSearch<T, A>
@@ -757,26 +891,16 @@ where
     A: Allocator + Clone,
     <T as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd,
 {
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-        alloc: A,
-    ) -> Result<Self, Error> {
-        Ok(match table.neighbors_column().dtype {
-            OffsetDType::U32 => EuclideanSearch::U32(EuclideanSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
-            OffsetDType::U64 => EuclideanSearch::U64(EuclideanSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
+    pub fn new_in(expansion_factor: usize, threads: usize, alloc: A) -> Result<Self, Error> {
+        Ok(EuclideanSearch {
+            pool: spawn_pool(threads)?,
+            expansion_factor,
+            workers: Workers::Unresolved,
+            alloc,
         })
     }
 
-    /// Batch top-k by walk, forwarding to the width-resolved leaf. Uniform with
+    /// Batch top-k by walk, fanned across the pool. Uniform with
     /// [`EuclideanScanner::scan`].
     pub fn search(
         &mut self,
@@ -788,12 +912,52 @@ where
     ) -> Result<(), Error>
     where
         <T as nk::Euclidean>::EuclideanOutput: Widen,
-        EuclideanSearcher<T, u32, A>: SearcherLike<EuclideanScoring<T>, Index = u32>,
-        EuclideanSearcher<T, u64, A>: SearcherLike<EuclideanScoring<T>, Index = u64>,
+        EuclideanSearcher<T, u32, A>: SearcherLike<EuclideanScoring<T>, Index = u32> + Send,
+        EuclideanSearcher<T, u64, A>: SearcherLike<EuclideanScoring<T>, Index = u64> + Send,
     {
-        match self {
-            EuclideanSearch::U32(leaf) => leaf.search(queries, table, matches, distances, counts),
-            EuclideanSearch::U64(leaf) => leaf.search(queries, table, matches, distances, counts),
+        let threads = self.pool.threads_count();
+        let expansion_factor = self.expansion_factor;
+        match table.neighbors_column().dtype {
+            OffsetDType::U32 => {
+                if !matches!(self.workers, Workers::U32(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U32(build_workers(threads, || {
+                        EuclideanSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U32(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<EuclideanScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
+            OffsetDType::U64 => {
+                if !matches!(self.workers, Workers::U64(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U64(build_workers(threads, || {
+                        EuclideanSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U64(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<EuclideanScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
         }
     }
 }
@@ -807,10 +971,10 @@ pub struct AngularScanner<T: nk::Dots> {
 }
 
 impl<T: nk::Dots> AngularScanner<T> {
-    pub fn new(topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(threads: usize) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(AngularScanner {
-            pool: fu::ThreadPool::try_spawn(topology, threads.max(1)).map_err(|_| Error::Alloc)?,
+            pool: spawn_pool(threads)?,
             packed: nk::DotsPackedMatrix::empty_in(nk::Global),
         })
     }
@@ -846,8 +1010,8 @@ where
     I: OffsetScalar,
     <T as nk::Angular>::Output: Copy + Default,
 {
-    pub fn new(nodes: usize, expansion_factor: usize) -> Result<Self, Error> {
-        AngularSearcher::new_in(nodes, expansion_factor, Global)
+    pub fn new(expansion_factor: usize) -> Result<Self, Error> {
+        AngularSearcher::new_in(expansion_factor, Global)
     }
 }
 
@@ -858,36 +1022,15 @@ where
     A: Allocator + Clone,
     <T as nk::Angular>::Output: Copy + Default,
 {
-    pub fn new_in(nodes: usize, expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(AngularSearcher {
-            context: TraversalContext::new_in(nodes, expansion_factor, alloc)?,
+            context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
 
     pub fn context(&mut self) -> &mut TraversalContext<I, <T as nk::Angular>::Output, A> {
         &mut self.context
-    }
-}
-
-impl<T, I, A> AngularSearcher<T, I, A>
-where
-    T: nk::Angular + 'static,
-    I: OffsetScalar,
-    A: Allocator + Clone,
-    <T as nk::Angular>::Output: Copy + Default + PartialOrd + Widen,
-    AngularSearcher<T, I, A>: SearcherLike<AngularScoring<T>, Index = I>,
-{
-    /// Batch top-k by graph walk, uniform with [`AngularScanner::scan`].
-    pub fn search(
-        &mut self,
-        queries: nk::MatrixView<'_, T>,
-        table: &Table<impl Allocator>,
-        matches: &mut Matrix<u64>,
-        distances: &mut Matrix<f64>,
-        counts: &mut [u64],
-    ) -> Result<(), Error> {
-        batch_search::<AngularScoring<T>, _>(self, queries, table, matches, distances, counts)
     }
 }
 
@@ -999,11 +1142,25 @@ where
     }
 }
 
-/// An angular searcher whose neighbor width is resolved from the table, the
-/// cosine twin of [`EuclideanSearch`].
-pub enum AngularSearch<T: nk::Angular, A: Allocator = Global> {
-    U32(AngularSearcher<T, u32, A>),
-    U64(AngularSearcher<T, u64, A>),
+/// An angular searcher whose neighbor width is settled by the tables it searches,
+/// the cosine twin of [`EuclideanSearch`]: a pool plus one context per thread.
+pub struct AngularSearch<T: nk::Angular, A: Allocator = Global> {
+    pool: fu::ThreadPool,
+    expansion_factor: usize,
+    workers: Workers<AngularSearcher<T, u32, A>, AngularSearcher<T, u64, A>>,
+    alloc: A,
+}
+
+impl<T> AngularSearch<T, Global>
+where
+    T: nk::Angular + 'static,
+    <T as nk::Angular>::Output: Copy + Default + PartialOrd,
+{
+    /// A searcher walking with breadth `expansion_factor` across `threads`
+    /// workers, on the global heap.
+    pub fn new(expansion_factor: usize, threads: usize) -> Result<Self, Error> {
+        AngularSearch::new_in(expansion_factor, threads, Global)
+    }
 }
 
 impl<T, A> AngularSearch<T, A>
@@ -1012,26 +1169,16 @@ where
     A: Allocator + Clone,
     <T as nk::Angular>::Output: Copy + Default + PartialOrd,
 {
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-        alloc: A,
-    ) -> Result<Self, Error> {
-        Ok(match table.neighbors_column().dtype {
-            OffsetDType::U32 => AngularSearch::U32(AngularSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
-            OffsetDType::U64 => AngularSearch::U64(AngularSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
+    pub fn new_in(expansion_factor: usize, threads: usize, alloc: A) -> Result<Self, Error> {
+        Ok(AngularSearch {
+            pool: spawn_pool(threads)?,
+            expansion_factor,
+            workers: Workers::Unresolved,
+            alloc,
         })
     }
 
-    /// Batch top-k by walk, forwarding to the width-resolved leaf. Uniform with
+    /// Batch top-k by walk, fanned across the pool. Uniform with
     /// [`AngularScanner::scan`].
     pub fn search(
         &mut self,
@@ -1043,12 +1190,52 @@ where
     ) -> Result<(), Error>
     where
         <T as nk::Angular>::Output: Widen,
-        AngularSearcher<T, u32, A>: SearcherLike<AngularScoring<T>, Index = u32>,
-        AngularSearcher<T, u64, A>: SearcherLike<AngularScoring<T>, Index = u64>,
+        AngularSearcher<T, u32, A>: SearcherLike<AngularScoring<T>, Index = u32> + Send,
+        AngularSearcher<T, u64, A>: SearcherLike<AngularScoring<T>, Index = u64> + Send,
     {
-        match self {
-            AngularSearch::U32(leaf) => leaf.search(queries, table, matches, distances, counts),
-            AngularSearch::U64(leaf) => leaf.search(queries, table, matches, distances, counts),
+        let threads = self.pool.threads_count();
+        let expansion_factor = self.expansion_factor;
+        match table.neighbors_column().dtype {
+            OffsetDType::U32 => {
+                if !matches!(self.workers, Workers::U32(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U32(build_workers(threads, || {
+                        AngularSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U32(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<AngularScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
+            OffsetDType::U64 => {
+                if !matches!(self.workers, Workers::U64(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U64(build_workers(threads, || {
+                        AngularSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U64(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<AngularScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
         }
     }
 }
@@ -1099,32 +1286,23 @@ impl DotScannerAny {
     /// A scanner for `dtype`, driving `threads` workers. [`Error::UnknownDType`] if
     /// no arm covers it — including a dtype the format understands but this metric
     /// has not been instantiated for.
-    pub fn for_dtype(dtype: &str, topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(dtype: &str, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => DotScannerAny::F64(DotScanner::new(topology, threads)?),
-            "f32" => DotScannerAny::F32(DotScanner::new(topology, threads)?),
-            "bf16" => DotScannerAny::Bf16(DotScanner::new(topology, threads)?),
-            "f16" => DotScannerAny::F16(DotScanner::new(topology, threads)?),
-            "e5m2" => DotScannerAny::E5M2(DotScanner::new(topology, threads)?),
-            "e4m3" => DotScannerAny::E4M3(DotScanner::new(topology, threads)?),
-            "e3m2" => DotScannerAny::E3M2(DotScanner::new(topology, threads)?),
-            "e2m3" => DotScannerAny::E2M3(DotScanner::new(topology, threads)?),
-            "i8" => DotScannerAny::I8(DotScanner::new(topology, threads)?),
-            "i4x2" => DotScannerAny::I4x2(DotScanner::new(topology, threads)?),
-            "u8" => DotScannerAny::U8(DotScanner::new(topology, threads)?),
-            "u4x2" => DotScannerAny::U4x2(DotScanner::new(topology, threads)?),
-            "u1x8" => DotScannerAny::U1x8(DotScanner::new(topology, threads)?),
+            "f64" => DotScannerAny::F64(DotScanner::new(threads)?),
+            "f32" => DotScannerAny::F32(DotScanner::new(threads)?),
+            "bf16" => DotScannerAny::Bf16(DotScanner::new(threads)?),
+            "f16" => DotScannerAny::F16(DotScanner::new(threads)?),
+            "e5m2" => DotScannerAny::E5M2(DotScanner::new(threads)?),
+            "e4m3" => DotScannerAny::E4M3(DotScanner::new(threads)?),
+            "e3m2" => DotScannerAny::E3M2(DotScanner::new(threads)?),
+            "e2m3" => DotScannerAny::E2M3(DotScanner::new(threads)?),
+            "i8" => DotScannerAny::I8(DotScanner::new(threads)?),
+            "i4x2" => DotScannerAny::I4x2(DotScanner::new(threads)?),
+            "u8" => DotScannerAny::U8(DotScanner::new(threads)?),
+            "u4x2" => DotScannerAny::U4x2(DotScanner::new(threads)?),
+            "u1x8" => DotScannerAny::U1x8(DotScanner::new(threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    /// A scanner matched to an open table — its value dtype and thread pool.
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        topology: &fu::Topology,
-        threads: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), topology, threads)
     }
 
     /// The header dtype this scanner was built for.
@@ -1274,38 +1452,26 @@ pub enum DotSearcherAny {
 }
 
 impl DotSearcherAny {
-    /// A searcher for `table`'s value dtype, walking with breadth
-    /// `expansion_factor`. The neighbor width is read from the table inside
-    /// [`DotSearch::for_table`], not branched on here.
-    pub fn for_dtype(
-        dtype: &str,
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
+    /// A searcher for `dtype`, walking with breadth `expansion_factor` across
+    /// `threads` workers. No table is seen here: the neighbor width is settled
+    /// inside [`DotSearch`] by the first searched table, never branched on here.
+    pub fn new(dtype: &str, expansion_factor: usize, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => DotSearcherAny::F64(DotSearch::for_table(table, expansion_factor, Global)?),
-            "f32" => DotSearcherAny::F32(DotSearch::for_table(table, expansion_factor, Global)?),
-            "bf16" => DotSearcherAny::Bf16(DotSearch::for_table(table, expansion_factor, Global)?),
-            "f16" => DotSearcherAny::F16(DotSearch::for_table(table, expansion_factor, Global)?),
-            "e5m2" => DotSearcherAny::E5M2(DotSearch::for_table(table, expansion_factor, Global)?),
-            "e4m3" => DotSearcherAny::E4M3(DotSearch::for_table(table, expansion_factor, Global)?),
-            "e3m2" => DotSearcherAny::E3M2(DotSearch::for_table(table, expansion_factor, Global)?),
-            "e2m3" => DotSearcherAny::E2M3(DotSearch::for_table(table, expansion_factor, Global)?),
-            "i8" => DotSearcherAny::I8(DotSearch::for_table(table, expansion_factor, Global)?),
-            "i4x2" => DotSearcherAny::I4x2(DotSearch::for_table(table, expansion_factor, Global)?),
-            "u8" => DotSearcherAny::U8(DotSearch::for_table(table, expansion_factor, Global)?),
-            "u4x2" => DotSearcherAny::U4x2(DotSearch::for_table(table, expansion_factor, Global)?),
-            "u1x8" => DotSearcherAny::U1x8(DotSearch::for_table(table, expansion_factor, Global)?),
+            "f64" => DotSearcherAny::F64(DotSearch::new(expansion_factor, threads)?),
+            "f32" => DotSearcherAny::F32(DotSearch::new(expansion_factor, threads)?),
+            "bf16" => DotSearcherAny::Bf16(DotSearch::new(expansion_factor, threads)?),
+            "f16" => DotSearcherAny::F16(DotSearch::new(expansion_factor, threads)?),
+            "e5m2" => DotSearcherAny::E5M2(DotSearch::new(expansion_factor, threads)?),
+            "e4m3" => DotSearcherAny::E4M3(DotSearch::new(expansion_factor, threads)?),
+            "e3m2" => DotSearcherAny::E3M2(DotSearch::new(expansion_factor, threads)?),
+            "e2m3" => DotSearcherAny::E2M3(DotSearch::new(expansion_factor, threads)?),
+            "i8" => DotSearcherAny::I8(DotSearch::new(expansion_factor, threads)?),
+            "i4x2" => DotSearcherAny::I4x2(DotSearch::new(expansion_factor, threads)?),
+            "u8" => DotSearcherAny::U8(DotSearch::new(expansion_factor, threads)?),
+            "u4x2" => DotSearcherAny::U4x2(DotSearch::new(expansion_factor, threads)?),
+            "u1x8" => DotSearcherAny::U1x8(DotSearch::new(expansion_factor, threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    /// A searcher matched to an open table — its value dtype and neighbor width.
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), table, expansion_factor)
     }
 
     /// The header dtype this searcher was built for.
@@ -1452,30 +1618,22 @@ pub enum EuclideanScannerAny {
 }
 
 impl EuclideanScannerAny {
-    pub fn for_dtype(dtype: &str, topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(dtype: &str, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => EuclideanScannerAny::F64(EuclideanScanner::new(topology, threads)?),
-            "f32" => EuclideanScannerAny::F32(EuclideanScanner::new(topology, threads)?),
-            "bf16" => EuclideanScannerAny::Bf16(EuclideanScanner::new(topology, threads)?),
-            "f16" => EuclideanScannerAny::F16(EuclideanScanner::new(topology, threads)?),
-            "e5m2" => EuclideanScannerAny::E5M2(EuclideanScanner::new(topology, threads)?),
-            "e4m3" => EuclideanScannerAny::E4M3(EuclideanScanner::new(topology, threads)?),
-            "e3m2" => EuclideanScannerAny::E3M2(EuclideanScanner::new(topology, threads)?),
-            "e2m3" => EuclideanScannerAny::E2M3(EuclideanScanner::new(topology, threads)?),
-            "i8" => EuclideanScannerAny::I8(EuclideanScanner::new(topology, threads)?),
-            "i4x2" => EuclideanScannerAny::I4x2(EuclideanScanner::new(topology, threads)?),
-            "u8" => EuclideanScannerAny::U8(EuclideanScanner::new(topology, threads)?),
-            "u4x2" => EuclideanScannerAny::U4x2(EuclideanScanner::new(topology, threads)?),
+            "f64" => EuclideanScannerAny::F64(EuclideanScanner::new(threads)?),
+            "f32" => EuclideanScannerAny::F32(EuclideanScanner::new(threads)?),
+            "bf16" => EuclideanScannerAny::Bf16(EuclideanScanner::new(threads)?),
+            "f16" => EuclideanScannerAny::F16(EuclideanScanner::new(threads)?),
+            "e5m2" => EuclideanScannerAny::E5M2(EuclideanScanner::new(threads)?),
+            "e4m3" => EuclideanScannerAny::E4M3(EuclideanScanner::new(threads)?),
+            "e3m2" => EuclideanScannerAny::E3M2(EuclideanScanner::new(threads)?),
+            "e2m3" => EuclideanScannerAny::E2M3(EuclideanScanner::new(threads)?),
+            "i8" => EuclideanScannerAny::I8(EuclideanScanner::new(threads)?),
+            "i4x2" => EuclideanScannerAny::I4x2(EuclideanScanner::new(threads)?),
+            "u8" => EuclideanScannerAny::U8(EuclideanScanner::new(threads)?),
+            "u4x2" => EuclideanScannerAny::U4x2(EuclideanScanner::new(threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        topology: &fu::Topology,
-        threads: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), topology, threads)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -1610,81 +1768,22 @@ pub enum EuclideanSearcherAny {
 }
 
 impl EuclideanSearcherAny {
-    pub fn for_dtype(
-        dtype: &str,
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
+    pub fn new(dtype: &str, expansion_factor: usize, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => EuclideanSearcherAny::F64(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "f32" => EuclideanSearcherAny::F32(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "bf16" => EuclideanSearcherAny::Bf16(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "f16" => EuclideanSearcherAny::F16(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "e5m2" => EuclideanSearcherAny::E5M2(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "e4m3" => EuclideanSearcherAny::E4M3(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "e3m2" => EuclideanSearcherAny::E3M2(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "e2m3" => EuclideanSearcherAny::E2M3(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "i8" => EuclideanSearcherAny::I8(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "i4x2" => EuclideanSearcherAny::I4x2(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "u8" => EuclideanSearcherAny::U8(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
-            "u4x2" => EuclideanSearcherAny::U4x2(EuclideanSearch::for_table(
-                table,
-                expansion_factor,
-                Global,
-            )?),
+            "f64" => EuclideanSearcherAny::F64(EuclideanSearch::new(expansion_factor, threads)?),
+            "f32" => EuclideanSearcherAny::F32(EuclideanSearch::new(expansion_factor, threads)?),
+            "bf16" => EuclideanSearcherAny::Bf16(EuclideanSearch::new(expansion_factor, threads)?),
+            "f16" => EuclideanSearcherAny::F16(EuclideanSearch::new(expansion_factor, threads)?),
+            "e5m2" => EuclideanSearcherAny::E5M2(EuclideanSearch::new(expansion_factor, threads)?),
+            "e4m3" => EuclideanSearcherAny::E4M3(EuclideanSearch::new(expansion_factor, threads)?),
+            "e3m2" => EuclideanSearcherAny::E3M2(EuclideanSearch::new(expansion_factor, threads)?),
+            "e2m3" => EuclideanSearcherAny::E2M3(EuclideanSearch::new(expansion_factor, threads)?),
+            "i8" => EuclideanSearcherAny::I8(EuclideanSearch::new(expansion_factor, threads)?),
+            "i4x2" => EuclideanSearcherAny::I4x2(EuclideanSearch::new(expansion_factor, threads)?),
+            "u8" => EuclideanSearcherAny::U8(EuclideanSearch::new(expansion_factor, threads)?),
+            "u4x2" => EuclideanSearcherAny::U4x2(EuclideanSearch::new(expansion_factor, threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), table, expansion_factor)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -1819,30 +1918,22 @@ pub enum AngularScannerAny {
 }
 
 impl AngularScannerAny {
-    pub fn for_dtype(dtype: &str, topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(dtype: &str, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => AngularScannerAny::F64(AngularScanner::new(topology, threads)?),
-            "f32" => AngularScannerAny::F32(AngularScanner::new(topology, threads)?),
-            "bf16" => AngularScannerAny::Bf16(AngularScanner::new(topology, threads)?),
-            "f16" => AngularScannerAny::F16(AngularScanner::new(topology, threads)?),
-            "e5m2" => AngularScannerAny::E5M2(AngularScanner::new(topology, threads)?),
-            "e4m3" => AngularScannerAny::E4M3(AngularScanner::new(topology, threads)?),
-            "e3m2" => AngularScannerAny::E3M2(AngularScanner::new(topology, threads)?),
-            "e2m3" => AngularScannerAny::E2M3(AngularScanner::new(topology, threads)?),
-            "i8" => AngularScannerAny::I8(AngularScanner::new(topology, threads)?),
-            "i4x2" => AngularScannerAny::I4x2(AngularScanner::new(topology, threads)?),
-            "u8" => AngularScannerAny::U8(AngularScanner::new(topology, threads)?),
-            "u4x2" => AngularScannerAny::U4x2(AngularScanner::new(topology, threads)?),
+            "f64" => AngularScannerAny::F64(AngularScanner::new(threads)?),
+            "f32" => AngularScannerAny::F32(AngularScanner::new(threads)?),
+            "bf16" => AngularScannerAny::Bf16(AngularScanner::new(threads)?),
+            "f16" => AngularScannerAny::F16(AngularScanner::new(threads)?),
+            "e5m2" => AngularScannerAny::E5M2(AngularScanner::new(threads)?),
+            "e4m3" => AngularScannerAny::E4M3(AngularScanner::new(threads)?),
+            "e3m2" => AngularScannerAny::E3M2(AngularScanner::new(threads)?),
+            "e2m3" => AngularScannerAny::E2M3(AngularScanner::new(threads)?),
+            "i8" => AngularScannerAny::I8(AngularScanner::new(threads)?),
+            "i4x2" => AngularScannerAny::I4x2(AngularScanner::new(threads)?),
+            "u8" => AngularScannerAny::U8(AngularScanner::new(threads)?),
+            "u4x2" => AngularScannerAny::U4x2(AngularScanner::new(threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        topology: &fu::Topology,
-        threads: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), topology, threads)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -1977,57 +2068,22 @@ pub enum AngularSearcherAny {
 }
 
 impl AngularSearcherAny {
-    pub fn for_dtype(
-        dtype: &str,
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
+    pub fn new(dtype: &str, expansion_factor: usize, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => {
-                AngularSearcherAny::F64(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "f32" => {
-                AngularSearcherAny::F32(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "bf16" => {
-                AngularSearcherAny::Bf16(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "f16" => {
-                AngularSearcherAny::F16(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "e5m2" => {
-                AngularSearcherAny::E5M2(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "e4m3" => {
-                AngularSearcherAny::E4M3(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "e3m2" => {
-                AngularSearcherAny::E3M2(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "e2m3" => {
-                AngularSearcherAny::E2M3(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "i8" => {
-                AngularSearcherAny::I8(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "i4x2" => {
-                AngularSearcherAny::I4x2(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "u8" => {
-                AngularSearcherAny::U8(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
-            "u4x2" => {
-                AngularSearcherAny::U4x2(AngularSearch::for_table(table, expansion_factor, Global)?)
-            }
+            "f64" => AngularSearcherAny::F64(AngularSearch::new(expansion_factor, threads)?),
+            "f32" => AngularSearcherAny::F32(AngularSearch::new(expansion_factor, threads)?),
+            "bf16" => AngularSearcherAny::Bf16(AngularSearch::new(expansion_factor, threads)?),
+            "f16" => AngularSearcherAny::F16(AngularSearch::new(expansion_factor, threads)?),
+            "e5m2" => AngularSearcherAny::E5M2(AngularSearch::new(expansion_factor, threads)?),
+            "e4m3" => AngularSearcherAny::E4M3(AngularSearch::new(expansion_factor, threads)?),
+            "e3m2" => AngularSearcherAny::E3M2(AngularSearch::new(expansion_factor, threads)?),
+            "e2m3" => AngularSearcherAny::E2M3(AngularSearch::new(expansion_factor, threads)?),
+            "i8" => AngularSearcherAny::I8(AngularSearch::new(expansion_factor, threads)?),
+            "i4x2" => AngularSearcherAny::I4x2(AngularSearch::new(expansion_factor, threads)?),
+            "u8" => AngularSearcherAny::U8(AngularSearch::new(expansion_factor, threads)?),
+            "u4x2" => AngularSearcherAny::U4x2(AngularSearch::new(expansion_factor, threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), table, expansion_factor)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -2285,23 +2341,19 @@ mod tests {
         )
     }
 
-    fn dot_covers<T>(
-        topology: &fu::Topology,
-        dtype: &'static str,
-        rows: &[f32],
-        query: &[f32],
-        order: [u64; 3],
-    ) where
+    fn dot_covers<T>(dtype: &'static str, rows: &[f32], query: &[f32], order: [u64; 3])
+    where
         T: nk::FloatConvertible + nk::Dot + nk::Dots + Clone + Send + Sync + 'static,
         T: nk::Dot<Output = <T as nk::Dots>::Accumulator>,
         <T as nk::Dot>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
-        DotSearcher<T>: SearcherLike<DotScoring<T>, Index = u32>,
+        DotSearcher<T, u32>: SearcherLike<DotScoring<T>, Index = u32> + Send,
+        DotSearcher<T, u64>: SearcherLike<DotScoring<T>, Index = u64> + Send,
     {
         let (table, query) = ring_table::<T>(dtype, rows, query);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
-        DotScanner::<T>::new(topology, 1)
+        DotScanner::<T>::new(1)
             .unwrap()
             .scan(
                 query.view(),
@@ -2312,7 +2364,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} scan");
-        DotSearcher::<T>::new(3, 3)
+        DotSearch::<T>::new(3, 1)
             .unwrap()
             .search(
                 query.view(),
@@ -2325,23 +2377,19 @@ mod tests {
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} walk");
     }
 
-    fn euclidean_covers<T>(
-        topology: &fu::Topology,
-        dtype: &'static str,
-        rows: &[f32],
-        query: &[f32],
-        order: [u64; 3],
-    ) where
+    fn euclidean_covers<T>(dtype: &'static str, rows: &[f32], query: &[f32], order: [u64; 3])
+    where
         T: nk::FloatConvertible + nk::Euclidean + nk::Euclideans + Clone + Send + Sync + 'static,
         T: nk::Euclidean<EuclideanOutput = <T as nk::Euclideans>::SpatialResult>,
         <T as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd + Widen + Send + Sync,
-        EuclideanSearcher<T>: SearcherLike<EuclideanScoring<T>, Index = u32>,
+        EuclideanSearcher<T, u32>: SearcherLike<EuclideanScoring<T>, Index = u32> + Send,
+        EuclideanSearcher<T, u64>: SearcherLike<EuclideanScoring<T>, Index = u64> + Send,
     {
         let (table, query) = ring_table::<T>(dtype, rows, query);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
-        EuclideanScanner::<T>::new(topology, 1)
+        EuclideanScanner::<T>::new(1)
             .unwrap()
             .scan(
                 query.view(),
@@ -2352,7 +2400,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} scan");
-        EuclideanSearcher::<T>::new(3, 3)
+        EuclideanSearch::<T>::new(3, 1)
             .unwrap()
             .search(
                 query.view(),
@@ -2365,23 +2413,19 @@ mod tests {
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} walk");
     }
 
-    fn angular_covers<T>(
-        topology: &fu::Topology,
-        dtype: &'static str,
-        rows: &[f32],
-        query: &[f32],
-        order: [u64; 3],
-    ) where
+    fn angular_covers<T>(dtype: &'static str, rows: &[f32], query: &[f32], order: [u64; 3])
+    where
         T: nk::FloatConvertible + nk::Angular + nk::Angulars + Clone + Send + Sync + 'static,
         T: nk::Angular<Output = <T as nk::Angulars>::SpatialResult>,
         <T as nk::Angular>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
-        AngularSearcher<T>: SearcherLike<AngularScoring<T>, Index = u32>,
+        AngularSearcher<T, u32>: SearcherLike<AngularScoring<T>, Index = u32> + Send,
+        AngularSearcher<T, u64>: SearcherLike<AngularScoring<T>, Index = u64> + Send,
     {
         let (table, query) = ring_table::<T>(dtype, rows, query);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
-        AngularScanner::<T>::new(topology, 1)
+        AngularScanner::<T>::new(1)
             .unwrap()
             .scan(
                 query.view(),
@@ -2392,7 +2436,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} scan");
-        AngularSearcher::<T>::new(3, 3)
+        AngularSearch::<T>::new(3, 1)
             .unwrap()
             .search(
                 query.view(),
@@ -2410,22 +2454,21 @@ mod tests {
         // The dot of `[3,5]` against the ring is `[13, 29, 45]`, so nodes rank
         // `[2, 1, 0]` in every real dtype. One line each, sorted by dynamic range —
         // widest float to tightest int — over the whole NumKong scalar zoo.
-        let topology = fu::Topology::new().unwrap();
         let dense = [2u64, 1, 0];
-        dot_covers::<f64>(&topology, "f64", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<f32>(&topology, "f32", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::bf16>(&topology, "bf16", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::f16>(&topology, "f16", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::e5m2>(&topology, "e5m2", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::e4m3>(&topology, "e4m3", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::e3m2>(&topology, "e3m2", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::e2m3>(&topology, "e2m3", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<i8>(&topology, "i8", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::i4x2>(&topology, "i4x2", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<u8>(&topology, "u8", &RING_ROWS, &RING_QUERY, dense);
-        dot_covers::<nk::u4x2>(&topology, "u4x2", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<f64>("f64", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<f32>("f32", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::bf16>("bf16", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::f16>("f16", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::e5m2>("e5m2", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::e4m3>("e4m3", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::e3m2>("e3m2", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::e2m3>("e2m3", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<i8>("i8", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::i4x2>("i4x2", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<u8>("u8", &RING_ROWS, &RING_QUERY, dense);
+        dot_covers::<nk::u4x2>("u4x2", &RING_ROWS, &RING_QUERY, dense);
         // The bit type takes the binary ring: dot is `|A ∩ B|`, larger first.
-        dot_covers::<nk::u1x8>(&topology, "u1x8", &BINARY_ROWS, &BINARY_QUERY, [0, 1, 2]);
+        dot_covers::<nk::u1x8>("u1x8", &BINARY_ROWS, &BINARY_QUERY, [0, 1, 2]);
     }
 
     #[test]
@@ -2434,20 +2477,19 @@ mod tests {
         // helper — ranking by the searcher's reversed comparator — yields `[1, 2, 0]`,
         // a different order from the dot over the very same fixture. No `u1x8`: L2 is
         // not a bit metric.
-        let topology = fu::Topology::new().unwrap();
         let near = [1u64, 2, 0];
-        euclidean_covers::<f64>(&topology, "f64", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<f32>(&topology, "f32", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::bf16>(&topology, "bf16", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::f16>(&topology, "f16", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::e5m2>(&topology, "e5m2", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::e4m3>(&topology, "e4m3", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::e3m2>(&topology, "e3m2", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::e2m3>(&topology, "e2m3", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<i8>(&topology, "i8", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::i4x2>(&topology, "i4x2", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<u8>(&topology, "u8", &RING_ROWS, &RING_QUERY, near);
-        euclidean_covers::<nk::u4x2>(&topology, "u4x2", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<f64>("f64", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<f32>("f32", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::bf16>("bf16", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::f16>("f16", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::e5m2>("e5m2", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::e4m3>("e4m3", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::e3m2>("e3m2", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::e2m3>("e2m3", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<i8>("i8", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::i4x2>("i4x2", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<u8>("u8", &RING_ROWS, &RING_QUERY, near);
+        euclidean_covers::<nk::u4x2>("u4x2", &RING_ROWS, &RING_QUERY, near);
     }
 
     #[test]
@@ -2455,20 +2497,19 @@ mod tests {
         // Cosine distance: `[3,5]` is most aligned with node 0, least with node 2, so
         // nearest-first is `[0, 1, 2]` — a third distinct order from one fixture,
         // proving the metric, not the data, decides the ranking.
-        let topology = fu::Topology::new().unwrap();
         let aligned = [0u64, 1, 2];
-        angular_covers::<f64>(&topology, "f64", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<f32>(&topology, "f32", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::bf16>(&topology, "bf16", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::f16>(&topology, "f16", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::e5m2>(&topology, "e5m2", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::e4m3>(&topology, "e4m3", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::e3m2>(&topology, "e3m2", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::e2m3>(&topology, "e2m3", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<i8>(&topology, "i8", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::i4x2>(&topology, "i4x2", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<u8>(&topology, "u8", &RING_ROWS, &RING_QUERY, aligned);
-        angular_covers::<nk::u4x2>(&topology, "u4x2", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<f64>("f64", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<f32>("f32", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::bf16>("bf16", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::f16>("f16", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::e5m2>("e5m2", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::e4m3>("e4m3", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::e3m2>("e3m2", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::e2m3>("e2m3", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<i8>("i8", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::i4x2>("i4x2", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<u8>("u8", &RING_ROWS, &RING_QUERY, aligned);
+        angular_covers::<nk::u4x2>("u4x2", &RING_ROWS, &RING_QUERY, aligned);
     }
 
     #[test]
@@ -2478,14 +2519,13 @@ mod tests {
         // how many each query found. Query `[3,5]` dots to `[13,29,45]`, so both the
         // brute-force scan and the graph walk rank nodes `[2,1,0]`, scores `[45,29,13]`.
         let table = Table::build(&ring_i8(), None).unwrap();
-        let topology = fu::Topology::new().unwrap();
         let queries = i8_query(&[3.0, 5.0]);
 
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
 
-        let mut scanner: DotScanner<i8> = DotScanner::new(&topology, 1).unwrap();
+        let mut scanner: DotScanner<i8> = DotScanner::new(1).unwrap();
         scanner
             .scan(
                 queries.view(),
@@ -2499,7 +2539,7 @@ mod tests {
         assert_eq!(matches.row(0).unwrap(), &[2, 1, 0]);
         assert_eq!(distances.row(0).unwrap(), &[45.0, 29.0, 13.0]);
 
-        let mut searcher: DotSearcher<i8> = DotSearcher::new(table.len(), 3).unwrap();
+        let mut searcher = DotSearch::<i8>::new(3, 1).unwrap();
         let mut walked = Matrix::<u64>::new(1, 3).unwrap();
         let mut walked_scores = Matrix::<f64>::new(1, 3).unwrap();
         searcher
@@ -2529,8 +2569,7 @@ mod tests {
         let image = built.as_bytes().to_vec();
         let table = Table::from_bytes(&image).unwrap();
 
-        let topology = fu::Topology::new().unwrap();
-        let mut scanner = DotScanner::<i8>::new(&topology, 2).unwrap();
+        let mut scanner = DotScanner::<i8>::new(2).unwrap();
         let query = i8_query(&[3.0, 4.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2554,8 +2593,7 @@ mod tests {
         // The distances themselves, not just the ranking: node 1 sits at `√8`, node 0
         // and 2 farther, confirming the kernel returns real L2 distance, not squared.
         let table = Table::build(&ring_i8(), None).unwrap();
-        let topology = fu::Topology::new().unwrap();
-        let mut scanner = EuclideanScanner::<i8>::new(&topology, 1).unwrap();
+        let mut scanner = EuclideanScanner::<i8>::new(1).unwrap();
         let query = i8_query(&[1.0, 2.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2582,7 +2620,7 @@ mod tests {
         let table = Table::build(&ring_i8(), None).unwrap();
         let queries =
             nk::Matrix::<i8>::try_from_scalars(&[3.0, 4.0, 5.0, 6.0, 1.0, 2.0], &[3, 2]).unwrap();
-        let mut searcher = DotSearcher::<i8>::new(table.len(), 3).unwrap();
+        let mut searcher = DotSearch::<i8>::new(3, 1).unwrap();
         let mut matches = Matrix::<u64>::new(3, 2).unwrap();
         let mut distances = Matrix::<f64>::new(3, 2).unwrap();
         let mut counts = [0u64; 3];
@@ -2602,6 +2640,52 @@ mod tests {
         assert_eq!(matches.row(2).unwrap(), &[2, 1]);
         assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0]);
         assert_eq!(distances.row(1).unwrap(), &[61.0, 39.0]);
+    }
+
+    #[test]
+    fn parallel_search_matches_single_thread() {
+        // The fan-out is only correct if a four-thread run lands the exact same top-k
+        // as a one-thread run: the dynamic schedule hands each query to whichever
+        // thread is free, and each must write its own row of the outputs with no
+        // crosstalk. Eight varied queries make the schedule interleave.
+        let table = Table::build(&ring_i8(), None).unwrap();
+        let scalars: [f32; 16] = [
+            3.0, 5.0, 1.0, 4.0, 5.0, 2.0, 2.0, 6.0, 4.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+        ];
+        let queries = nk::Matrix::<i8>::try_from_scalars(&scalars, &[8, 2]).unwrap();
+
+        let run = |threads: usize| {
+            let mut searcher = DotSearch::<i8>::new(3, threads).unwrap();
+            let mut matches = Matrix::<u64>::new(8, 3).unwrap();
+            let mut distances = Matrix::<f64>::new(8, 3).unwrap();
+            let mut counts = [0u64; 8];
+            searcher
+                .search(
+                    queries.view(),
+                    &table,
+                    &mut matches,
+                    &mut distances,
+                    &mut counts,
+                )
+                .unwrap();
+            (matches, distances, counts)
+        };
+
+        let (sequential_matches, sequential_distances, sequential_counts) = run(1);
+        let (parallel_matches, parallel_distances, parallel_counts) = run(4);
+        assert_eq!(sequential_counts, parallel_counts);
+        for query in 0..8 {
+            assert_eq!(
+                sequential_matches.row(query).unwrap(),
+                parallel_matches.row(query).unwrap(),
+                "query {query} matches"
+            );
+            assert_eq!(
+                sequential_distances.row(query).unwrap(),
+                parallel_distances.row(query).unwrap(),
+                "query {query} distances"
+            );
+        }
     }
 
     /// Two disconnected triangles. A single entry point reaches only its own
@@ -2660,7 +2744,7 @@ mod tests {
         let table = Table::build(&TwoTriangles, None).unwrap();
         // ef spans the whole graph, so the walk must keep restarting until every node
         // is visited — and only then can it name the true top-3.
-        let mut searcher = DotSearcher::<i8>::new(table.len(), 6).unwrap();
+        let mut searcher = DotSearch::<i8>::new(6, 1).unwrap();
         let query = i8_query(&[1.0, 1.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2682,12 +2766,49 @@ mod tests {
     }
 
     #[test]
+    fn one_searcher_serves_many_tables() {
+        // The construction-is-configuration contract: a searcher built with no table
+        // in sight serves a three-node ring, then a six-node graph, the scratch
+        // growing to fit each at walk time and the width lane settling on first use.
+        let ring = Table::build(&ring_i8(), None).unwrap();
+        let triangles = Table::build(&TwoTriangles, None).unwrap();
+        let mut searcher = DotSearch::<i8>::new(6, 1).unwrap();
+        let query = i8_query(&[1.0, 1.0]);
+        let mut matches = Matrix::<u64>::new(1, 3).unwrap();
+        let mut distances = Matrix::<f64>::new(1, 3).unwrap();
+        let mut counts = [0u64; 1];
+
+        searcher
+            .search(
+                query.view(),
+                &ring,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        // Ring dots against [1,1]: [3, 7, 11] — larger first.
+        assert_eq!(matches.row(0).unwrap(), &[2, 1, 0]);
+
+        searcher
+            .search(
+                query.view(),
+                &triangles,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        // The bigger graph's global best, reachable only after the scratch grew.
+        assert_eq!(matches.row(0).unwrap(), &[5, 4, 3]);
+    }
+
+    #[test]
     fn scan_f32_accumulates_in_f64() {
         // The same ring in `f32`, degree zero so the fixture also covers an edgeless
         // graph; the tile lands exactly in the `f64` accumulator.
         let table = Table::build(&ring::<f32>("f32", &RING_ROWS, 2, 0), None).unwrap();
-        let topology = fu::Topology::new().unwrap();
-        let mut scanner = DotScanner::<f32>::new(&topology, 2).unwrap();
+        let mut scanner = DotScanner::<f32>::new(2).unwrap();
         let query = nk::Matrix::<f32>::try_from_scalars(&[3.0, 4.0], &[1, 2]).unwrap();
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2711,8 +2832,7 @@ mod tests {
         // The output matrices carry the query count; a `matches` claiming two queries
         // against a one-query batch is inconsistent, and the scan says so.
         let table = Table::build(&ring_i8(), None).unwrap();
-        let topology = fu::Topology::new().unwrap();
-        let mut scanner = DotScanner::<i8>::new(&topology, 1).unwrap();
+        let mut scanner = DotScanner::<i8>::new(1).unwrap();
         let query = i8_query(&[3.0, 4.0]);
         let mut matches = Matrix::<u64>::new(2, 3).unwrap();
         let mut distances = Matrix::<f64>::new(2, 3).unwrap();
@@ -2749,23 +2869,18 @@ mod tests {
     #[test]
     fn u64_leaf_walks() {
         // The width is a real parameter, not a fixed `u32`: a `DotSearcher<i8, u64>` is
-        // constructible and runs the batch path. This table's neighbors are `u32`, so
-        // reading them at `u64` is a genuine width mismatch — [`Error::WrongType`] —
-        // which is exactly the check that proves `I` is honored at the neighbor read. A
-        // true `u64`-neighbor table needs a graph past four billion nodes to build.
+        // constructible and runs the per-query walk. This table's neighbors are `u32`,
+        // so reading them at `u64` is a genuine width mismatch — [`Error::WrongType`] —
+        // exactly the check that proves `I` is honored at the neighbor read. A true
+        // `u64`-neighbor table needs a graph past four billion nodes to build.
         let table = Table::build(&ring_i8(), None).unwrap();
-        let mut searcher: DotSearcher<i8, u64> = DotSearcher::new(table.len(), 3).unwrap();
-        let query = i8_query(&[3.0, 4.0]);
-        let mut matches = Matrix::<u64>::new(1, 3).unwrap();
-        let mut distances = Matrix::<f64>::new(1, 3).unwrap();
-        let mut counts = [0u64; 1];
+        let mut searcher: DotSearcher<i8, u64> = DotSearcher::new(3).unwrap();
+        let query: [i8; 2] = [3, 4];
         assert!(matches!(
-            searcher.search(
-                query.view(),
+            <DotSearcher<i8, u64> as SearcherLike<DotScoring<i8>>>::search(
+                &mut searcher,
+                &query,
                 &table,
-                &mut matches,
-                &mut distances,
-                &mut counts
             ),
             Err(Error::WrongType)
         ));
@@ -2776,7 +2891,7 @@ mod tests {
         // A caller who opened the file blind: dtype from the header, neighbor width
         // from the column, both resolved inside the searcher, not at the call site.
         let table = Table::build(&ring_i8(), None).unwrap();
-        let mut searcher = DotSearcherAny::for_table(&table, 3).unwrap();
+        let mut searcher = DotSearcherAny::new(table.value_dtype(), 3, 1).unwrap();
         assert_eq!(searcher.dtype(), "i8");
         let query: [i8; 2] = [3, 4];
         let bytes = unsafe { core::slice::from_raw_parts(query.as_ptr() as *const u8, 2) };
@@ -2796,8 +2911,7 @@ mod tests {
         let image = Table::build(&ring_i8(), None).unwrap().as_bytes().to_vec();
         let table = Table::from_bytes(&image).unwrap();
 
-        let topology = fu::Topology::new().unwrap();
-        let mut scanner = DotScannerAny::for_table(&table, &topology, 1).unwrap();
+        let mut scanner = DotScannerAny::new(table.value_dtype(), 1).unwrap();
         assert_eq!(scanner.dtype(), "i8");
 
         let query: [i8; 2] = [3, 4];
@@ -2817,9 +2931,8 @@ mod tests {
     fn dispatch_rejects_an_uninstantiated_dtype() {
         // `u16` is a dtype the format understands but Dot has no kernel for, so the
         // router rejects it rather than silently mismatching a scalar.
-        let topology = fu::Topology::new().unwrap();
         assert!(matches!(
-            DotScannerAny::for_dtype("u16", &topology, 1),
+            DotScannerAny::new("u16", 1),
             Err(Error::UnknownDType)
         ));
     }
@@ -2830,21 +2943,20 @@ mod tests {
         // dtype and rank nearest-first, the scan for Euclidean and the walk for
         // Angular, from the same `[3,5]` query.
         let table = Table::build(&ring_i8(), None).unwrap();
-        let topology = fu::Topology::new().unwrap();
         let query: [i8; 2] = [3, 5];
         let bytes = unsafe { core::slice::from_raw_parts(query.as_ptr() as *const u8, 2) };
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
 
-        let mut euclidean = EuclideanScannerAny::for_table(&table, &topology, 1).unwrap();
+        let mut euclidean = EuclideanScannerAny::new(table.value_dtype(), 1).unwrap();
         assert_eq!(euclidean.dtype(), "i8");
         euclidean
             .scan(bytes, &table, &mut matches, &mut distances, &mut counts)
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[1, 2, 0]);
 
-        let mut angular = AngularSearcherAny::for_table(&table, 3).unwrap();
+        let mut angular = AngularSearcherAny::new(table.value_dtype(), 3, 1).unwrap();
         assert_eq!(angular.dtype(), "i8");
         angular
             .search(bytes, &table, &mut matches, &mut distances, &mut counts)
@@ -2898,7 +3010,7 @@ mod tests {
     #[test]
     fn walk_skips_neighbor_sentinels() {
         let table = Table::build(&SentinelRing, None).unwrap();
-        let mut searcher = DotSearcher::<i8>::new(table.len(), 3).unwrap();
+        let mut searcher = DotSearch::<i8>::new(3, 1).unwrap();
         let query = i8_query(&[3.0, 4.0]);
         let mut matches = Matrix::<u64>::new(1, 2).unwrap();
         let mut distances = Matrix::<f64>::new(1, 2).unwrap();

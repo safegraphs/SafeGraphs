@@ -4,12 +4,6 @@ version = 4
 
 [[package]]
 name = "allocator-api2"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c583acf993cf4245c4acb0a2cc2ab1f9cc097de73411bb6d3647ff6af2b1013d"
-
-[[package]]
-name = "allocator-api2"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
@@ -32,17 +26,17 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "forkunion"
-version = "3.0.0"
-source = "git+https://github.com/ashvardanian/ForkUnion#08fdef52b2526c50a32e554ea7a50d5ca61f4736"
+version = "3.0.2"
+source = "git+https://github.com/ashvardanian/ForkUnion#9f1d91c3529fc735f0ab60cbc895f449c7139d28"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "jsontape"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
- "allocator-api2 0.4.0",
+ "allocator-api2",
  "serde",
 ]
 
@@ -63,10 +57,10 @@ dependencies = [
 
 [[package]]
 name = "numkong"
-version = "7.7.0"
-source = "git+https://github.com/ashvardanian/NumKong?branch=main-v8-block-scaling#e1002da286adbd12792379d366611eeb8296ef03"
+version = "7.7.1"
 dependencies = [
  "cc",
+ "forkunion",
 ]
 
 [[package]]
@@ -91,7 +85,7 @@ dependencies = [
 name = "safegraphs"
 version = "0.1.0"
 dependencies = [
- "allocator-api2 0.4.0",
+ "allocator-api2",
  "forkunion",
  "jsontape",
  "memmap2",
@@ -137,18 +131,22 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "stringtape"
-version = "2.4.1"
-source = "git+https://github.com/ashvardanian/StringTape#08ea6a877764b0f5d9e2bc3b582210e7614e01d6"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c2ad8ddd435760c2439d6548e52bca5097890f3af26b3c417af3a87ed28e0fa"
 dependencies = [
- "allocator-api2 0.3.1",
+ "allocator-api2",
 ]
 
 [[package]]
 name = "stringzilla"
-version = "4.6.2"
-source = "git+https://github.com/ashvardanian/StringZilla?branch=main-v5#2c0e79f58ae63d82e97e37275610ed3eb78f809d"
+version = "5.0.3"
+source = "git+https://github.com/ashvardanian/StringZilla#a6402dd71d01a8967a62bcc45a900477e0232f60"
 dependencies = [
+ "allocator-api2",
  "cc",
+ "forkunion",
+ "stringtape",
 ]
 
 [[package]]

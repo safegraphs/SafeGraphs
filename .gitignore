@@ -55,6 +55,9 @@ dkms.conf
 target/
 debug/
 
+# Local-only sibling-checkout overrides, as in StringWars and NumWars
+.cargo/
+
 # rustfmt backups
 **/*.rs.bk
 

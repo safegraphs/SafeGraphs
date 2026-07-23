@@ -18,7 +18,9 @@
 //! [`batch_search`]: crate::search::dense::batch_search
 
 use super::{walk, Matrix, ScannerLike, Scores2D, ScoringLike, SearcherLike, TraversalContext};
-use crate::search::dense::{batch_scan, batch_search, value_view, view_from_bytes};
+use crate::search::dense::{
+    batch_scan, batch_search, build_workers, spawn_pool, value_view, view_from_bytes, Workers,
+};
 use crate::{cast, Error, GraphLike, OffsetDType, OffsetScalar, Table, Widen};
 use allocator_api2::alloc::{Allocator, Global};
 use core::cmp::Ordering;
@@ -44,10 +46,10 @@ pub struct HammingScanner<T: nk::Hammings> {
 }
 
 impl<T: nk::Hammings> HammingScanner<T> {
-    pub fn new(topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(threads: usize) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(HammingScanner {
-            pool: fu::ThreadPool::try_spawn(topology, threads.max(1)).map_err(|_| Error::Alloc)?,
+            pool: spawn_pool(threads)?,
             packed: nk::DotsPackedMatrix::empty_in(nk::Global),
         })
     }
@@ -84,8 +86,8 @@ where
     I: OffsetScalar,
     <T as nk::Hamming>::Output: Copy + Default,
 {
-    pub fn new(nodes: usize, expansion_factor: usize) -> Result<Self, Error> {
-        HammingSearcher::new_in(nodes, expansion_factor, Global)
+    pub fn new(expansion_factor: usize) -> Result<Self, Error> {
+        HammingSearcher::new_in(expansion_factor, Global)
     }
 }
 
@@ -96,36 +98,15 @@ where
     A: Allocator + Clone,
     <T as nk::Hamming>::Output: Copy + Default,
 {
-    pub fn new_in(nodes: usize, expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(HammingSearcher {
-            context: TraversalContext::new_in(nodes, expansion_factor, alloc)?,
+            context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
 
     pub fn context(&mut self) -> &mut TraversalContext<I, <T as nk::Hamming>::Output, A> {
         &mut self.context
-    }
-}
-
-impl<T, I, A> HammingSearcher<T, I, A>
-where
-    T: nk::Hamming + 'static,
-    I: OffsetScalar,
-    A: Allocator + Clone,
-    <T as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen,
-    HammingSearcher<T, I, A>: SearcherLike<HammingScoring<T>, Index = I>,
-{
-    /// Batch top-k by graph walk, uniform with [`HammingScanner::scan`].
-    pub fn search(
-        &mut self,
-        queries: nk::MatrixView<'_, T>,
-        table: &Table<impl Allocator>,
-        matches: &mut Matrix<u64>,
-        distances: &mut Matrix<f64>,
-        counts: &mut [u64],
-    ) -> Result<(), Error> {
-        batch_search::<HammingScoring<T>, _>(self, queries, table, matches, distances, counts)
     }
 }
 
@@ -238,13 +219,27 @@ where
     }
 }
 
-/// A Hamming searcher whose neighbor width is resolved from the table, the bit twin
-/// of [`AngularSearch`].
+/// A Hamming searcher whose neighbor width is settled by the tables it searches,
+/// the bit twin of [`AngularSearch`].
 ///
 /// [`AngularSearch`]: crate::search::dense::AngularSearch
-pub enum HammingSearch<T: nk::Hamming, A: Allocator = Global> {
-    U32(HammingSearcher<T, u32, A>),
-    U64(HammingSearcher<T, u64, A>),
+pub struct HammingSearch<T: nk::Hamming, A: Allocator = Global> {
+    pool: fu::ThreadPool,
+    expansion_factor: usize,
+    workers: Workers<HammingSearcher<T, u32, A>, HammingSearcher<T, u64, A>>,
+    alloc: A,
+}
+
+impl<T> HammingSearch<T, Global>
+where
+    T: nk::Hamming + 'static,
+    <T as nk::Hamming>::Output: Copy + Default + PartialOrd,
+{
+    /// A searcher walking with breadth `expansion_factor` across `threads`
+    /// workers, on the global heap.
+    pub fn new(expansion_factor: usize, threads: usize) -> Result<Self, Error> {
+        HammingSearch::new_in(expansion_factor, threads, Global)
+    }
 }
 
 impl<T, A> HammingSearch<T, A>
@@ -253,27 +248,16 @@ where
     A: Allocator + Clone,
     <T as nk::Hamming>::Output: Copy + Default + PartialOrd,
 {
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-        alloc: A,
-    ) -> Result<Self, Error> {
-        Ok(match table.neighbors_column().dtype {
-            OffsetDType::U32 => HammingSearch::U32(HammingSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
-            OffsetDType::U64 => HammingSearch::U64(HammingSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
+    pub fn new_in(expansion_factor: usize, threads: usize, alloc: A) -> Result<Self, Error> {
+        Ok(HammingSearch {
+            pool: spawn_pool(threads)?,
+            expansion_factor,
+            workers: Workers::Unresolved,
+            alloc,
         })
     }
 
-    /// Batch top-k by walk, forwarding to the width-resolved leaf. Uniform with
-    /// [`HammingScanner::scan`].
+    /// Batch top-k by walk, fanned across the pool. Uniform with [`HammingScanner::scan`].
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, T>,
@@ -284,12 +268,52 @@ where
     ) -> Result<(), Error>
     where
         <T as nk::Hamming>::Output: Widen,
-        HammingSearcher<T, u32, A>: SearcherLike<HammingScoring<T>, Index = u32>,
-        HammingSearcher<T, u64, A>: SearcherLike<HammingScoring<T>, Index = u64>,
+        HammingSearcher<T, u32, A>: SearcherLike<HammingScoring<T>, Index = u32> + Send,
+        HammingSearcher<T, u64, A>: SearcherLike<HammingScoring<T>, Index = u64> + Send,
     {
-        match self {
-            HammingSearch::U32(leaf) => leaf.search(queries, table, matches, distances, counts),
-            HammingSearch::U64(leaf) => leaf.search(queries, table, matches, distances, counts),
+        let threads = self.pool.threads_count();
+        let expansion_factor = self.expansion_factor;
+        match table.neighbors_column().dtype {
+            OffsetDType::U32 => {
+                if !matches!(self.workers, Workers::U32(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U32(build_workers(threads, || {
+                        HammingSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U32(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<HammingScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
+            OffsetDType::U64 => {
+                if !matches!(self.workers, Workers::U64(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U64(build_workers(threads, || {
+                        HammingSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U64(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<HammingScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
         }
     }
 }
@@ -304,19 +328,11 @@ pub enum HammingScannerAny {
 }
 
 impl HammingScannerAny {
-    pub fn for_dtype(dtype: &str, topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(dtype: &str, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "u1x8" => HammingScannerAny::U1x8(HammingScanner::new(topology, threads)?),
+            "u1x8" => HammingScannerAny::U1x8(HammingScanner::new(threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        topology: &fu::Topology,
-        threads: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), topology, threads)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -355,24 +371,11 @@ pub enum HammingSearcherAny {
 }
 
 impl HammingSearcherAny {
-    pub fn for_dtype(
-        dtype: &str,
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
+    pub fn new(dtype: &str, expansion_factor: usize, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "u1x8" => {
-                HammingSearcherAny::U1x8(HammingSearch::for_table(table, expansion_factor, Global)?)
-            }
+            "u1x8" => HammingSearcherAny::U1x8(HammingSearch::new(expansion_factor, threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), table, expansion_factor)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -413,10 +416,10 @@ pub struct JaccardScanner<T: nk::Jaccards> {
 }
 
 impl<T: nk::Jaccards> JaccardScanner<T> {
-    pub fn new(topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(threads: usize) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(JaccardScanner {
-            pool: fu::ThreadPool::try_spawn(topology, threads.max(1)).map_err(|_| Error::Alloc)?,
+            pool: spawn_pool(threads)?,
             packed: nk::DotsPackedMatrix::empty_in(nk::Global),
         })
     }
@@ -453,8 +456,8 @@ where
     I: OffsetScalar,
     <T as nk::Jaccard>::Output: Copy + Default,
 {
-    pub fn new(nodes: usize, expansion_factor: usize) -> Result<Self, Error> {
-        JaccardSearcher::new_in(nodes, expansion_factor, Global)
+    pub fn new(expansion_factor: usize) -> Result<Self, Error> {
+        JaccardSearcher::new_in(expansion_factor, Global)
     }
 }
 
@@ -465,36 +468,15 @@ where
     A: Allocator + Clone,
     <T as nk::Jaccard>::Output: Copy + Default,
 {
-    pub fn new_in(nodes: usize, expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(JaccardSearcher {
-            context: TraversalContext::new_in(nodes, expansion_factor, alloc)?,
+            context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
 
     pub fn context(&mut self) -> &mut TraversalContext<I, <T as nk::Jaccard>::Output, A> {
         &mut self.context
-    }
-}
-
-impl<T, I, A> JaccardSearcher<T, I, A>
-where
-    T: nk::Jaccard + 'static,
-    I: OffsetScalar,
-    A: Allocator + Clone,
-    <T as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen,
-    JaccardSearcher<T, I, A>: SearcherLike<JaccardScoring<T>, Index = I>,
-{
-    /// Batch top-k by graph walk, uniform with [`JaccardScanner::scan`].
-    pub fn search(
-        &mut self,
-        queries: nk::MatrixView<'_, T>,
-        table: &Table<impl Allocator>,
-        matches: &mut Matrix<u64>,
-        distances: &mut Matrix<f64>,
-        counts: &mut [u64],
-    ) -> Result<(), Error> {
-        batch_search::<JaccardScoring<T>, _>(self, queries, table, matches, distances, counts)
     }
 }
 
@@ -604,10 +586,24 @@ where
     }
 }
 
-/// A Jaccard searcher whose neighbor width is resolved from the table.
-pub enum JaccardSearch<T: nk::Jaccard, A: Allocator = Global> {
-    U32(JaccardSearcher<T, u32, A>),
-    U64(JaccardSearcher<T, u64, A>),
+/// A Jaccard searcher whose neighbor width is settled by the tables it searches.
+pub struct JaccardSearch<T: nk::Jaccard, A: Allocator = Global> {
+    pool: fu::ThreadPool,
+    expansion_factor: usize,
+    workers: Workers<JaccardSearcher<T, u32, A>, JaccardSearcher<T, u64, A>>,
+    alloc: A,
+}
+
+impl<T> JaccardSearch<T, Global>
+where
+    T: nk::Jaccard + 'static,
+    <T as nk::Jaccard>::Output: Copy + Default + PartialOrd,
+{
+    /// A searcher walking with breadth `expansion_factor` across `threads`
+    /// workers, on the global heap.
+    pub fn new(expansion_factor: usize, threads: usize) -> Result<Self, Error> {
+        JaccardSearch::new_in(expansion_factor, threads, Global)
+    }
 }
 
 impl<T, A> JaccardSearch<T, A>
@@ -616,27 +612,16 @@ where
     A: Allocator + Clone,
     <T as nk::Jaccard>::Output: Copy + Default + PartialOrd,
 {
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-        alloc: A,
-    ) -> Result<Self, Error> {
-        Ok(match table.neighbors_column().dtype {
-            OffsetDType::U32 => JaccardSearch::U32(JaccardSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
-            OffsetDType::U64 => JaccardSearch::U64(JaccardSearcher::new_in(
-                table.len(),
-                expansion_factor,
-                alloc,
-            )?),
+    pub fn new_in(expansion_factor: usize, threads: usize, alloc: A) -> Result<Self, Error> {
+        Ok(JaccardSearch {
+            pool: spawn_pool(threads)?,
+            expansion_factor,
+            workers: Workers::Unresolved,
+            alloc,
         })
     }
 
-    /// Batch top-k by walk, forwarding to the width-resolved leaf. Uniform with
-    /// [`JaccardScanner::scan`].
+    /// Batch top-k by walk, fanned across the pool. Uniform with [`JaccardScanner::scan`].
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, T>,
@@ -647,12 +632,52 @@ where
     ) -> Result<(), Error>
     where
         <T as nk::Jaccard>::Output: Widen,
-        JaccardSearcher<T, u32, A>: SearcherLike<JaccardScoring<T>, Index = u32>,
-        JaccardSearcher<T, u64, A>: SearcherLike<JaccardScoring<T>, Index = u64>,
+        JaccardSearcher<T, u32, A>: SearcherLike<JaccardScoring<T>, Index = u32> + Send,
+        JaccardSearcher<T, u64, A>: SearcherLike<JaccardScoring<T>, Index = u64> + Send,
     {
-        match self {
-            JaccardSearch::U32(leaf) => leaf.search(queries, table, matches, distances, counts),
-            JaccardSearch::U64(leaf) => leaf.search(queries, table, matches, distances, counts),
+        let threads = self.pool.threads_count();
+        let expansion_factor = self.expansion_factor;
+        match table.neighbors_column().dtype {
+            OffsetDType::U32 => {
+                if !matches!(self.workers, Workers::U32(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U32(build_workers(threads, || {
+                        JaccardSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U32(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<JaccardScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
+            OffsetDType::U64 => {
+                if !matches!(self.workers, Workers::U64(_)) {
+                    let alloc = &self.alloc;
+                    self.workers = Workers::U64(build_workers(threads, || {
+                        JaccardSearcher::new_in(expansion_factor, alloc.clone())
+                    })?);
+                }
+                let Workers::U64(workers) = &mut self.workers else {
+                    return Err(Error::Inconsistent);
+                };
+                batch_search::<JaccardScoring<T>, _>(
+                    &mut self.pool,
+                    workers,
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                )
+            }
         }
     }
 }
@@ -663,19 +688,11 @@ pub enum JaccardScannerAny {
 }
 
 impl JaccardScannerAny {
-    pub fn for_dtype(dtype: &str, topology: &fu::Topology, threads: usize) -> Result<Self, Error> {
+    pub fn new(dtype: &str, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "u1x8" => JaccardScannerAny::U1x8(JaccardScanner::new(topology, threads)?),
+            "u1x8" => JaccardScannerAny::U1x8(JaccardScanner::new(threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        topology: &fu::Topology,
-        threads: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), topology, threads)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -710,24 +727,11 @@ pub enum JaccardSearcherAny {
 }
 
 impl JaccardSearcherAny {
-    pub fn for_dtype(
-        dtype: &str,
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
+    pub fn new(dtype: &str, expansion_factor: usize, threads: usize) -> Result<Self, Error> {
         Ok(match dtype {
-            "u1x8" => {
-                JaccardSearcherAny::U1x8(JaccardSearch::for_table(table, expansion_factor, Global)?)
-            }
+            "u1x8" => JaccardSearcherAny::U1x8(JaccardSearch::new(expansion_factor, threads)?),
             _ => return Err(Error::UnknownDType),
         })
-    }
-
-    pub fn for_table(
-        table: &Table<impl Allocator>,
-        expansion_factor: usize,
-    ) -> Result<Self, Error> {
-        Self::for_dtype(table.value_dtype(), table, expansion_factor)
     }
 
     pub fn dtype(&self) -> &'static str {
@@ -843,7 +847,6 @@ mod tests {
         // Popcount of XOR against `11111110`: node 0 differs in 1 bit, node 1 in 3,
         // node 2 in 6 — so the batch ranks `[0,1,2]`, distances `[1,3,6]`, and the
         // scan and the walk agree exactly. `k` and the query count read off `matches`.
-        let topology = fu::Topology::new().unwrap();
         let table = Table::build(&binary_ring(2), None).unwrap();
         let query = binary_query();
 
@@ -851,7 +854,7 @@ mod tests {
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
 
-        let mut scanner = HammingScanner::<nk::u1x8>::new(&topology, 1).unwrap();
+        let mut scanner = HammingScanner::<nk::u1x8>::new(1).unwrap();
         scanner
             .scan(
                 query.view(),
@@ -865,7 +868,7 @@ mod tests {
         assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
         assert_eq!(distances.row(0).unwrap(), &[1.0, 3.0, 6.0]);
 
-        let mut searcher = HammingSearcher::<nk::u1x8>::new(table.len(), 3).unwrap();
+        let mut searcher = HammingSearch::<nk::u1x8>::new(3, 1).unwrap();
         let mut walked = Matrix::<u64>::new(1, 3).unwrap();
         let mut walked_scores = Matrix::<f64>::new(1, 3).unwrap();
         searcher
@@ -885,7 +888,6 @@ mod tests {
     fn jaccard_scan_and_search_agree() {
         // One minus intersection over union: node 0 is `1 - 7/8`, the others farther,
         // so the ranking is `[0,1,2]`, and scan and walk agree.
-        let topology = fu::Topology::new().unwrap();
         let table = Table::build(&binary_ring(2), None).unwrap();
         let query = binary_query();
 
@@ -893,7 +895,7 @@ mod tests {
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
 
-        let mut scanner = JaccardScanner::<nk::u1x8>::new(&topology, 1).unwrap();
+        let mut scanner = JaccardScanner::<nk::u1x8>::new(1).unwrap();
         scanner
             .scan(
                 query.view(),
@@ -906,7 +908,7 @@ mod tests {
         assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
         assert_eq!(distances.row(0).unwrap()[0], 0.125);
 
-        let mut searcher = JaccardSearcher::<nk::u1x8>::new(table.len(), 3).unwrap();
+        let mut searcher = JaccardSearch::<nk::u1x8>::new(3, 1).unwrap();
         let mut walked = Matrix::<u64>::new(1, 3).unwrap();
         let mut walked_scores = Matrix::<f64>::new(1, 3).unwrap();
         searcher
@@ -928,20 +930,19 @@ mod tests {
         // and rank nearest-first through both a batch scan and a batch walk.
         let table = Table::build(&binary_ring(2), None).unwrap();
         let query: [u8; 1] = [0b0111_1111];
-        let topology = fu::Topology::new().unwrap();
 
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
 
-        let mut scanner = HammingScannerAny::for_table(&table, &topology, 1).unwrap();
+        let mut scanner = HammingScannerAny::new(table.value_dtype(), 1).unwrap();
         assert_eq!(scanner.dtype(), "u1x8");
         scanner
             .scan(&query, &table, &mut matches, &mut distances, &mut counts)
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
 
-        let mut searcher = JaccardSearcherAny::for_table(&table, 3).unwrap();
+        let mut searcher = JaccardSearcherAny::new(table.value_dtype(), 3, 1).unwrap();
         assert_eq!(searcher.dtype(), "u1x8");
         searcher
             .search(&query, &table, &mut matches, &mut distances, &mut counts)

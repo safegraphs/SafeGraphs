@@ -46,21 +46,21 @@ For datasets up to roughly 100M nodes, a single `.safegraphs` file holds everyth
 
 ```
 ┌────────────────────────────────────┐
-│ Magic "SAFEGRPH" (8 bytes)          │
+│ Magic "SAFEGRPH" (8 bytes)         │
 ├────────────────────────────────────┤
-│ Header size (u64, little-endian)    │
+│ Header size (u64, little-endian)   │
 ├────────────────────────────────────┤
-│ Header JSON (UTF-8, space-padded)   │
-│  - __metadata__                     │
-│  - key / value / neighbors schema   │
+│ Header JSON (UTF-8, space-padded)  │
+│  - __metadata__                    │
+│  - key / value / neighbors schema  │
 ├────────────────────────────────────┤
-│ Data: key buffer                    │
+│ Data: key buffer                   │
 ├────────────────────────────────────┤
-│ Data: value buffer                  │
+│ Data: value buffer                 │
 ├────────────────────────────────────┤
-│ Data: neighbors offsets, if any     │
+│ Data: neighbors offsets, if any    │
 ├────────────────────────────────────┤
-│ Data: neighbors values              │
+│ Data: neighbors values             │
 └────────────────────────────────────┘
 ```
 
@@ -109,6 +109,11 @@ A `utf8` key or value is variable-length and gains the `offsets_*` fields like a
 No column is nullable.
 Every node is present in every column, so there is no validity bitmap and no null count.
 A node with no outgoing edges is a zero-length `neighbors` list, which is empty rather than null, and any optional payload must be encoded in-band, never as a null.
+
+Within a `neighbors` list, any index at or past the node count is a __sentinel__ and names no node: a reader skips it.
+This is what lets a fixed-degree `neighbors` column stand in for a variable-degree one — a producer pads a short adjacency row with a sentinel rather than dropping to the irregular layout.
+Any out-of-range value serves, so there is no distinguished sentinel to agree on; the node count itself, or the index type's maximum, is the natural choice.
+A reader that walks the graph honors this; one that only unpacks buffers passes the raw indices through untouched, since the skip needs the node count, which lives with the traversal, not the column.
 
 ### Regular vs Irregular Columns
 
@@ -214,9 +219,10 @@ That same flat layout is the shape the most common on-GPU graph indexes already 
 
 __Cagra__ from cuVS is a fixed-degree flat graph, a dense `[nodes, degree]` matrix of `u32` neighbor indices over a `[nodes, dim]` dataset.
 It drops in with zero reshaping: `value` is `FixedSizeList<dtype, dim>`, `neighbors` is `FixedSizeList<u32, degree>`, and the neighbor indices are already SafeGraphs node indices.
+Any dead slot Cagra leaves in a short row is an out-of-range index, which the sentinel convention already skips, so the matrix copies over verbatim.
 
 __FAISS__ maps through `IndexNSG`, its flat navigable graph, rather than the hierarchical `IndexHNSW`.
-Its adjacency is fixed-max-degree neighbor ids that are node indices, so exporting as a variable-length `neighbors` column drops the unused padding slots and needs no sentinel value.
+Its adjacency is fixed-max-degree neighbor ids that are node indices, so it drops in either way: keep the fixed matrix and let its padding become sentinels, or export a variable-length `neighbors` column that omits the padding entirely.
 Vectors come from the paired storage index, and external ids attach through `IndexIDMap`, which become the `key` column.
 FAISS `IndexShards`, independent sub-indexes with their own row spaces merged at query time, is a direct match for the Distributed manifest with overlapping local offsets.
 
