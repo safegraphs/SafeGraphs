@@ -2,32 +2,74 @@
 //! every searcher follows.
 //!
 //! This module deliberately contains no scoring. It provides the pieces a metric
-//! reuses — [`MinQueue`], [`VisitedSet`], [`TraversalContext`], [`Scores2D`],
+//! reuses — [`MinQueue`], [`VisitedSet`], [`TraversalContext`], [`Matrix`],
 //! [`rank_tile`], and the [`walk`] itself — and the vocabulary that lets a caller
 //! treat two metrics alike. Everything that touches a kernel lives in a family
 //! module, so `dense` never mentions StringZilla and `sequence` never mentions
 //! NumKong.
 //!
-//! A metric is described by [`ScoringLike`], which declares types and no
+//! A metric is described by [`MetricLike`], which declares types and no
 //! behavior, and is worked by two functors it names. A [`ScannerLike`] owns an
 //! executor — a thread pool or a device — and scores a whole batch; there are few
 //! of them. A [`SearcherLike`] owns a [`TraversalContext`] and walks the graph for
 //! one query; there is one per worker thread, which is what makes its `&mut self`
 //! free. Nothing here is inherited: shared code is called, never derived.
 
-use allocator_api2::alloc::{Allocator, Global};
+use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
 
-use crate::{Error, GraphLike, OffsetScalar};
+use crate::{Error, GraphLike, IndexLike};
+
+/// Where a functor's kernels run, and how wide — the single parallelism knob
+/// that crosses the API. Every functor's one constructor takes one of these;
+/// no pool, topology, scheduler, or device handle appears in any signature.
+///
+/// Each family opens the scope into whatever its backend calls an executor: the
+/// NumKong families spawn a ForkUnion thread pool, the StringZilla ones a
+/// `DeviceScope`, and that conversion is the only place a backend type appears.
+/// A family whose kernels are CPU-only answers [`Gpu`](ExecutionScope::Gpu)
+/// with [`Error::WrongType`] at construction rather than pretending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionScope {
+    /// The caller's thread alone — the nil state. Nothing is spawned, and the
+    /// sequential path is the same code path as the parallel one.
+    Serial,
+    /// CPU threads, the caller included; zero means every logical core the
+    /// machine reports.
+    Cpus(usize),
+    /// One GPU, by zero-based device index. Fanning across several GPUs is not
+    /// a functor's business: build one functor per device and shard tables
+    /// across them.
+    Gpu(usize),
+}
+
+/// Which end of a score axis wins: `Nearest` for a distance, where smaller is
+/// better, `Farthest` for a similarity. Carried instead of a bare `bool` so a
+/// call site reads its direction: `batch_scan(.., Ranking::Nearest, ..)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ranking {
+    Nearest,
+    Farthest,
+}
+
+impl Ranking {
+    /// Does `a` outrank `b` under this direction?
+    pub fn outranks(self, a: f64, b: f64) -> bool {
+        match self {
+            Ranking::Nearest => a < b,
+            Ranking::Farthest => a > b,
+        }
+    }
+}
 
 /// A scored result. The node is the table's own index type `I`, `u32` or `u64`,
 /// so a result carries no more width than the graph declares; it is widened to
 /// `u64` only when it leaves a walk for an untyped caller.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Match<I, S> {
-    pub node: I,
-    pub score: S,
+pub struct Match<Index, Score> {
+    pub node: Index,
+    pub score: Score,
 }
 
 /// A frontier entry: a node paired with the score that orders it, in the table's
@@ -35,9 +77,9 @@ pub struct Match<I, S> {
 /// Ordering comes from the metric's own comparator, so no total order — and no
 /// encoded sort key — is baked into the type.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Candidate<I, S> {
-    pub node: I,
-    pub score: S,
+pub struct Candidate<Index, Score> {
+    pub node: Index,
+    pub score: Score,
 }
 
 /// A reusable binary heap ordered by a caller-supplied comparator, where
@@ -45,12 +87,12 @@ pub struct Candidate<I, S> {
 /// comparator per call keeps the heap free of any `Ord` bound, so it can order
 /// scores like `f64` that have no total order. `clear` keeps the allocation for
 /// the next query.
-pub struct MinQueue<T, A: Allocator = Global> {
-    heap: AVec<T, A>,
+pub struct MinQueue<Item, Allocator: AllocatorLike = Global> {
+    heap: AVec<Item, Allocator>,
 }
 
-impl<T, A: Allocator + Clone> MinQueue<T, A> {
-    pub fn new_in(alloc: A) -> Self {
+impl<Item, Allocator: AllocatorLike + Clone> MinQueue<Item, Allocator> {
+    pub fn new_in(alloc: Allocator) -> Self {
         MinQueue {
             heap: AVec::new_in(alloc),
         }
@@ -70,12 +112,12 @@ impl<T, A: Allocator + Clone> MinQueue<T, A> {
     }
 
     /// The highest-priority element without removing it.
-    pub fn peek(&self) -> Option<&T> {
+    pub fn peek(&self) -> Option<&Item> {
         self.heap.first()
     }
 
     /// Push `item`, sifting it up while it should precede its parent.
-    pub fn push(&mut self, item: T, before: impl Fn(&T, &T) -> bool) -> Result<(), Error> {
+    pub fn push(&mut self, item: Item, before: impl Fn(&Item, &Item) -> bool) -> Result<(), Error> {
         self.heap.try_reserve(1).map_err(|_| Error::Alloc)?;
         self.heap.push(item);
         let mut i = self.heap.len() - 1;
@@ -92,7 +134,7 @@ impl<T, A: Allocator + Clone> MinQueue<T, A> {
     }
 
     /// Pop the highest-priority element — the one no sibling precedes.
-    pub fn pop(&mut self, before: impl Fn(&T, &T) -> bool) -> Option<T> {
+    pub fn pop(&mut self, before: impl Fn(&Item, &Item) -> bool) -> Option<Item> {
         let count = self.heap.len();
         if count == 0 {
             return None;
@@ -122,8 +164,8 @@ impl<T, A: Allocator + Clone> MinQueue<T, A> {
 
 /// A reusable visited set over a fixed node range. Version-stamped, so `reset`
 /// is O(1): it bumps a generation counter instead of clearing the array.
-pub struct VisitedSet<A: Allocator = Global> {
-    stamps: AVec<u32, A>,
+pub struct VisitedSet<Allocator: AllocatorLike = Global> {
+    stamps: AVec<u32, Allocator>,
     generation: u32,
     /// How many nodes are marked this generation. The stamped array cannot report
     /// this in O(1), and the landmark sampler needs it to know when the whole
@@ -131,8 +173,8 @@ pub struct VisitedSet<A: Allocator = Global> {
     marked: usize,
 }
 
-impl<A: Allocator + Clone> VisitedSet<A> {
-    pub fn new_in(capacity: usize, alloc: A) -> Result<Self, Error> {
+impl<Allocator: AllocatorLike + Clone> VisitedSet<Allocator> {
+    pub fn new_in(capacity: usize, alloc: Allocator) -> Result<Self, Error> {
         let mut stamps = AVec::new_in(alloc);
         stamps
             .try_reserve_exact(capacity)
@@ -241,18 +283,18 @@ impl SplitMix {
 /// Generic over the table's native index type `I` and the metric's score `S`, so
 /// the frontier and results stay exactly as wide as the graph — a `u32` node and
 /// an `f32` score is an eight-byte [`Candidate`].
-pub struct TraversalContext<I, S, A: Allocator = Global> {
+pub struct TraversalContext<Index, Score, Allocator: AllocatorLike = Global> {
     /// Candidate frontier, ordered best-first for expansion.
-    frontier: MinQueue<Candidate<I, S>, A>,
+    frontier: MinQueue<Candidate<Index, Score>, Allocator>,
     /// Bounded best-so-far set, ordered worst-first so eviction is a pop.
-    results: MinQueue<Candidate<I, S>, A>,
+    results: MinQueue<Candidate<Index, Score>, Allocator>,
     /// Closed set.
-    visited: VisitedSet<A>,
+    visited: VisitedSet<Allocator>,
     /// Nodes staged for one batched expansion, and the scores that come back.
     /// Lent out wholesale for the duration of a walk, so the searcher can be
     /// borrowed mutably while they are in use.
-    neighbors: AVec<I, A>,
-    scores: AVec<S, A>,
+    neighbors: AVec<Index, Allocator>,
+    scores: AVec<Score, Allocator>,
     /// Search breadth, at least `k`. A per-searcher tuning knob rather than a
     /// per-query argument, since one searcher is one thread's worth of policy.
     expansion_factor: usize,
@@ -261,18 +303,20 @@ pub struct TraversalContext<I, S, A: Allocator = Global> {
     /// entry points, a stochastic multi-start rather than a fixed one.
     rng: SplitMix,
     /// Kept so a lent-out buffer can be replaced by an empty one of the same
-    /// allocator; `AVec<_, A>` has no `Default` to `take` through.
-    alloc: A,
+    /// allocator; `AVec<_, Allocator>` has no `Default` to `take` through.
+    alloc: Allocator,
 }
 
-impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<I, S, A> {
+impl<Index: IndexLike, Score: Copy + Default, Allocator: AllocatorLike + Clone>
+    TraversalContext<Index, Score, Allocator>
+{
     /// A context searching with breadth `expansion_factor`. It knows no table:
     /// [`walk`] grows the scratch to each searched graph through
     /// [`reserve`](TraversalContext::reserve), so one context serves many tables. The
     /// landmark generator is seeded to a fixed constant, so a single-threaded run
     /// is reproducible; a driver spreading work across threads seeds each context
     /// differently with [`seed`](TraversalContext::seed).
-    pub fn new_in(expansion_factor: usize, alloc: A) -> Result<Self, Error> {
+    pub fn new_in(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         if expansion_factor == 0 {
             return Err(Error::Inconsistent);
         }
@@ -324,30 +368,35 @@ impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<
     /// borrow the searcher mutably while holding them. Always paired with
     /// [`restore_staging`](TraversalContext::restore_staging), including on the
     /// error path, or their capacity is lost.
-    fn lend_staging(&mut self) -> (AVec<I, A>, AVec<S, A>) {
+    fn lend_staging(&mut self) -> (AVec<Index, Allocator>, AVec<Score, Allocator>) {
         (
             core::mem::replace(&mut self.neighbors, AVec::new_in(self.alloc.clone())),
             core::mem::replace(&mut self.scores, AVec::new_in(self.alloc.clone())),
         )
     }
 
-    fn restore_staging(&mut self, neighbors: AVec<I, A>, scores: AVec<S, A>) {
+    fn restore_staging(
+        &mut self,
+        neighbors: AVec<Index, Allocator>,
+        scores: AVec<Score, Allocator>,
+    ) {
         self.neighbors = neighbors;
         self.scores = scores;
     }
 
     /// Drain the best-first results, calling `write(slot, node, score)` for each of
     /// the up-to-`count` best, and report how many. The writer decides the output
-    /// shape, so one drain fills a native `Match<I, S>` and, at the erased
+    /// shape, so one drain fills a native `Match<Index, Score>` and, at the erased
     /// boundary, a widened one — with no intermediate buffer either way.
     pub fn drain(
         &mut self,
-        compare: impl Fn(S, S) -> Ordering,
+        compare: impl Fn(Score, Score) -> Ordering,
         count: usize,
-        mut write: impl FnMut(usize, I, S),
+        mut write: impl FnMut(usize, Index, Score),
     ) -> usize {
-        let toward_worst =
-            |a: &Candidate<I, S>, b: &Candidate<I, S>| compare(a.score, b.score) == Ordering::Less;
+        let toward_worst = |a: &Candidate<Index, Score>, b: &Candidate<Index, Score>| {
+            compare(a.score, b.score) == Ordering::Less
+        };
         let found = self.results.len();
         let keep = found.min(count);
         // The set is ordered worst-first, so drop the excess before filling from
@@ -364,12 +413,12 @@ impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<
         keep
     }
 
-    /// Drain into a native `Match<I, S>` slice, best-first. Trailing slots are
+    /// Drain into a native `Match<Index, Score>` slice, best-first. Trailing slots are
     /// left untouched.
     pub fn drain_into(
         &mut self,
-        compare: impl Fn(S, S) -> Ordering,
-        out: &mut [Match<I, S>],
+        compare: impl Fn(Score, Score) -> Ordering,
+        out: &mut [Match<Index, Score>],
     ) -> usize {
         self.drain(compare, out.len(), |slot, node, score| {
             out[slot] = Match { node, score }
@@ -377,102 +426,68 @@ impl<I: OffsetScalar, S: Copy + Default, A: Allocator + Clone> TraversalContext<
     }
 }
 
-impl<I: OffsetScalar, S: Copy + Default> TraversalContext<I, S, Global> {
+impl<Index: IndexLike, Score: Copy + Default> TraversalContext<Index, Score, Global> {
     /// A context on the global heap.
     pub fn new(expansion_factor: usize) -> Result<Self, Error> {
         TraversalContext::new_in(expansion_factor, Global)
     }
 }
 
-/// A `nodes × queries` score tile, row-major by node.
+/// A dense, owned, row-major `rows × cols` matrix — the crate's only 2D container.
+/// Allocation is fallible and never panics. The shape it carries is what lets a
+/// batch search read `k` and the query count off the output instead of taking them
+/// as arguments, and it grows-and-reuses across calls. Deliberately NumKong-free,
+/// so it holds a batch's `matches` and `distances` for a StringZilla sequence
+/// search as readily as a NumKong dense one.
 ///
-/// Node-major reads backwards next to "top-`k` per query", and it is deliberate.
-/// This is the layout NumKong's cross-product writes natively, and its kernels
-/// reject a strided output outright, so the dense scan — the path that touches
-/// every node — fills this with no copy and no transpose. A sequence metric has
-/// to copy out of its device matrix regardless, so it transposes inside that copy
-/// for free. Ranking then strides across the tile, which costs one cache line per
-/// node per query and is dwarfed by the work of producing the scores.
-pub struct Scores2D<'a, S> {
-    data: &'a mut [S],
-    nodes: usize,
-    queries: usize,
-}
-
-impl<'a, S: Copy> Scores2D<'a, S> {
-    /// Borrow `data` as a `nodes × queries` tile, or [`Error::Inconsistent`] if it
-    /// is not exactly that size.
-    pub fn new(data: &'a mut [S], nodes: usize, queries: usize) -> Result<Self, Error> {
-        let cells = nodes.checked_mul(queries).ok_or(Error::TooLarge)?;
-        if data.len() != cells {
-            return Err(Error::Inconsistent);
-        }
-        Ok(Scores2D {
-            data,
-            nodes,
-            queries,
-        })
-    }
-
-    pub fn nodes(&self) -> usize {
-        self.nodes
-    }
-
-    pub fn queries(&self) -> usize {
-        self.queries
-    }
-
-    pub fn get(&self, node: usize, query: usize) -> Option<S> {
-        if query >= self.queries {
-            return None;
-        }
-        self.data.get(node * self.queries + query).copied()
-    }
-
-    pub fn set(&mut self, node: usize, query: usize, score: S) -> Result<(), Error> {
-        if query >= self.queries {
-            return Err(Error::Inconsistent);
-        }
-        match self.data.get_mut(node * self.queries + query) {
-            Some(slot) => {
-                *slot = score;
-                Ok(())
-            }
-            None => Err(Error::Inconsistent),
-        }
-    }
-
-    /// The whole tile, for a caller that knows its shape — chiefly tests and the
-    /// single-query case, where node-major and query-major coincide.
-    pub fn as_slice(&self) -> &[S] {
-        self.data
-    }
-
-    pub fn as_mut_ptr(&mut self) -> *mut S {
-        self.data.as_mut_ptr()
-    }
-}
-
-/// A dense, owned, row-major `rows × cols` matrix. Allocation is fallible and never
-/// panics. The shape it carries is what lets a batch search read `k` and the query
-/// count off the output instead of taking them as arguments, and it grows-and-reuses
-/// across calls. Deliberately NumKong-free, so it holds a batch's `matches` and
-/// `distances` for a StringZilla sequence search as readily as a NumKong dense one,
-/// and doubles as a scanner's reusable score tile.
-pub struct Matrix<T, A: Allocator = Global> {
-    data: AVec<T, A>,
+/// It also serves as a scanner's reusable score tile, with `rows = nodes` and
+/// `cols = queries`. Node-major reads backwards next to "top-`k` per query", and
+/// it is deliberate: this is the layout NumKong's cross-product writes natively,
+/// and its kernels reject a strided output outright, so the dense scan fills it
+/// with no copy and no transpose. A sequence metric has to copy out of its device
+/// matrix regardless, so it transposes inside that copy for free. Ranking then
+/// strides across the tile, one cache line per row per column, dwarfed by the
+/// work of producing the scores.
+pub struct Matrix<Cell, Allocator: AllocatorLike = Global> {
+    data: AVec<Cell, Allocator>,
     rows: usize,
     cols: usize,
 }
 
-impl<T: Copy + Default> Matrix<T, Global> {
+impl<Cell: Copy + Default> Matrix<Cell, Global> {
     pub fn new(rows: usize, cols: usize) -> Result<Self, Error> {
         Self::new_in(rows, cols, Global)
     }
 }
 
-impl<T: Copy + Default, A: Allocator + Clone> Matrix<T, A> {
-    pub fn new_in(rows: usize, cols: usize, alloc: A) -> Result<Self, Error> {
+impl<Cell, Allocator: AllocatorLike> Matrix<Cell, Allocator> {
+    /// An empty matrix awaiting its first [`reshape`](Matrix::reshape) —
+    /// allocation-free, so a scanner can hold one as a field from construction.
+    pub fn empty_in(alloc: Allocator) -> Self {
+        Matrix {
+            data: AVec::new_in(alloc),
+            rows: 0,
+            cols: 0,
+        }
+    }
+}
+
+impl<Cell> Matrix<Cell, Global> {
+    pub fn empty() -> Self {
+        Self::empty_in(Global)
+    }
+}
+
+/// The empty matrix, so scratch tiles can be `mem::take`n around a call that
+/// borrows their owner mutably at the same time.
+impl<Cell> Default for Matrix<Cell, Global> {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<Cell: Copy + Default, Allocator: AllocatorLike + Clone> Matrix<Cell, Allocator> {
+    pub fn new_in(rows: usize, cols: usize, alloc: Allocator) -> Result<Self, Error> {
         let mut matrix = Matrix {
             data: AVec::new_in(alloc),
             rows: 0,
@@ -489,7 +504,7 @@ impl<T: Copy + Default, A: Allocator + Clone> Matrix<T, A> {
         if self.data.len() < cells {
             let extra = cells - self.data.len();
             self.data.try_reserve(extra).map_err(|_| Error::Alloc)?;
-            self.data.resize(cells, T::default());
+            self.data.resize(cells, Cell::default());
         }
         (self.rows, self.cols) = (rows, cols);
         Ok(())
@@ -503,34 +518,51 @@ impl<T: Copy + Default, A: Allocator + Clone> Matrix<T, A> {
         self.cols
     }
 
-    pub fn row(&self, i: usize) -> Option<&[T]> {
+    pub fn row(&self, i: usize) -> Option<&[Cell]> {
         (i < self.rows).then(|| &self.data[i * self.cols..i * self.cols + self.cols])
     }
 
-    pub fn row_mut(&mut self, i: usize) -> Option<&mut [T]> {
+    pub fn row_mut(&mut self, i: usize) -> Option<&mut [Cell]> {
         (i < self.rows).then(|| &mut self.data[i * self.cols..i * self.cols + self.cols])
     }
 
     /// The `rows * cols` cells in row-major order, the whole live extent.
-    pub fn as_slice(&self) -> &[T] {
+    pub fn as_slice(&self) -> &[Cell] {
         &self.data[..self.rows * self.cols]
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    pub fn as_mut_slice(&mut self) -> &mut [Cell] {
         &mut self.data[..self.rows * self.cols]
+    }
+
+    /// The cell at `(row, col)`, or `None` out of range. Bounds are checked on
+    /// both axes, so a `col` past the row's end cannot alias into the next row.
+    pub fn get(&self, row: usize, col: usize) -> Option<Cell> {
+        (row < self.rows && col < self.cols).then(|| self.data[row * self.cols + col])
+    }
+
+    /// A mutable reference to the cell at `(row, col)`, or `None` out of range.
+    pub fn get_mut(&mut self, row: usize, col: usize) -> Option<&mut Cell> {
+        (row < self.rows && col < self.cols).then(|| &mut self.data[row * self.cols + col])
+    }
+
+    /// The raw base pointer, for kernels that fill the matrix wholesale. The
+    /// live extent is `rows() * cols()` cells, row-major.
+    pub fn as_mut_ptr(&mut self) -> *mut Cell {
+        self.data.as_mut_ptr()
     }
 }
 
 /// A batch of queries a walk consumes one at a time: it reports how many it holds
-/// and yields each as the metric's [`Query`](ScoringLike::Query). A dense batch is a
+/// and yields each as the metric's [`Query`](MetricLike::Query). A dense batch is a
 /// `nk::MatrixView` yielding rows; a sequence batch is a `StringTape` view yielding
 /// byte strings. This is the seam that lets one batch `search` walk either without
 /// assuming a `&[T]`.
-pub trait QueryBatch<M: ScoringLike + ?Sized> {
+pub trait QueryBatchLike<Metric: MetricLike + ?Sized> {
     /// How many queries the batch holds.
     fn count(&self) -> usize;
     /// The query at `index`, or `None` if out of range or the batch is malformed.
-    fn query(&self, index: usize) -> Option<M::Query<'_>>;
+    fn query(&self, index: usize) -> Option<Metric::Query<'_>>;
 }
 
 /// A metric: the vocabulary of its types, nothing more. It names how a query and
@@ -538,7 +570,7 @@ pub trait QueryBatch<M: ScoringLike + ?Sized> {
 /// a [`ScannerLike`] and a [`SearcherLike`] — reference it, so it declares no
 /// method and no index, which is what keeps a dense metric and a sequence metric
 /// from sharing a line of implementation.
-pub trait ScoringLike {
+pub trait MetricLike {
     /// One query. A rank-1 vector view for a dense metric, a byte slice for a
     /// sequence one. `Copy` because a walk scores with the same query on every
     /// expansion, and a cheap view is all any backend needs here.
@@ -552,27 +584,27 @@ pub trait ScoringLike {
 }
 
 /// The batch half of a metric: score every query against every node.
-pub trait ScannerLike<M: ScoringLike + ?Sized> {
+pub trait ScannerLike<Metric: MetricLike + ?Sized> {
     /// Fill `scores` with one score per (query, node) pair. Ranking is not this
     /// method's business; [`rank_tile`] does that afterwards.
     fn scan(
         &mut self,
-        queries: M::Queries<'_>,
-        table: &crate::Table<impl Allocator>,
-        scores: &mut Scores2D<'_, M::Score>,
+        queries: Metric::Queries<'_>,
+        table: &crate::Table<impl AllocatorLike>,
+        scores: &mut Matrix<Metric::Score>,
     ) -> Result<(), Error>;
 }
 
 /// The traversal half of a metric: walk the neighbor graph for one query.
-pub trait SearcherLike<M: ScoringLike + ?Sized> {
+pub trait SearcherLike<Metric: MetricLike + ?Sized> {
     /// The node-index width this searcher traverses in, resolved from the table it
     /// was built for. Its scratch, frontier, and results are all this wide, so a
-    /// `u32` graph never pays for `u64` cells. Not on [`ScoringLike`]: it describes
+    /// `u32` graph never pays for `u64` cells. Not on [`MetricLike`]: it describes
     /// the table, not the metric.
-    type Index: OffsetScalar;
+    type Index: IndexLike;
 
     /// The allocator behind the context.
-    type Alloc: Allocator + Clone;
+    type Alloc: AllocatorLike + Clone;
 
     /// The walk's only scoring primitive: one query against an arbitrary set of
     /// nodes, writing `nodes.len()` scores into `out`.
@@ -583,26 +615,26 @@ pub trait SearcherLike<M: ScoringLike + ?Sized> {
     /// actually want.
     fn score_nodes(
         &mut self,
-        query: M::Query<'_>,
-        table: &crate::Table<impl Allocator>,
+        query: Metric::Query<'_>,
+        table: &crate::Table<impl AllocatorLike>,
         nodes: &[Self::Index],
-        out: &mut [M::Score],
+        out: &mut [Metric::Score],
     ) -> Result<(), Error>;
 
     /// The reusable traversal scratch this searcher owns.
-    fn context(&mut self) -> &mut TraversalContext<Self::Index, M::Score, Self::Alloc>;
+    fn context(&mut self) -> &mut TraversalContext<Self::Index, Metric::Score, Self::Alloc>;
 
     /// Best-first ordering: `Greater` means `a` outranks `b`. A smaller-is-better
     /// metric reverses it here and needs no change anywhere else.
-    fn compare(a: M::Score, b: M::Score) -> Ordering;
+    fn compare(a: Metric::Score, b: Metric::Score) -> Ordering;
 
     /// Walk toward `query` from randomly sampled entry points, leaving the result
     /// set in the context. Every implementation is one line — a call to [`walk`] —
     /// because shared code is called here, never inherited.
     fn search(
         &mut self,
-        query: M::Query<'_>,
-        table: &crate::Table<impl Allocator>,
+        query: Metric::Query<'_>,
+        table: &crate::Table<impl AllocatorLike>,
     ) -> Result<(), Error>;
 }
 
@@ -624,35 +656,35 @@ pub trait SearcherLike<M: ScoringLike + ?Sized> {
 /// [`TraversalContext::drain_into`].
 ///
 /// [`Error::WrongType`] and friends propagate from the metric untouched.
-pub fn walk<M, S>(
-    searcher: &mut S,
-    query: M::Query<'_>,
-    table: &crate::Table<impl Allocator>,
+pub fn walk<Metric, Score>(
+    searcher: &mut Score,
+    query: Metric::Query<'_>,
+    table: &crate::Table<impl AllocatorLike>,
 ) -> Result<(), Error>
 where
-    M: ScoringLike + ?Sized,
-    S: SearcherLike<M> + ?Sized,
+    Metric: MetricLike + ?Sized,
+    Score: SearcherLike<Metric> + ?Sized,
 {
     searcher.context().reserve(table.len())?;
     searcher.context().reset();
     let (mut staged, mut scores) = searcher.context().lend_staging();
-    let outcome = walk_staged::<M, S>(searcher, query, table, &mut staged, &mut scores);
+    let outcome = walk_staged::<Metric, Score>(searcher, query, table, &mut staged, &mut scores);
     searcher.context().restore_staging(staged, scores);
     outcome
 }
 
 /// The body of [`walk`], with the staging buffers held as locals so the searcher
 /// stays mutably borrowable while they are in use.
-fn walk_staged<M, S>(
-    searcher: &mut S,
-    query: M::Query<'_>,
-    table: &crate::Table<impl Allocator>,
-    staged: &mut AVec<S::Index, impl Allocator>,
-    scores: &mut AVec<M::Score, impl Allocator>,
+fn walk_staged<Metric, Score>(
+    searcher: &mut Score,
+    query: Metric::Query<'_>,
+    table: &crate::Table<impl AllocatorLike>,
+    staged: &mut AVec<Score::Index, impl AllocatorLike>,
+    scores: &mut AVec<Metric::Score, impl AllocatorLike>,
 ) -> Result<(), Error>
 where
-    M: ScoringLike + ?Sized,
-    S: SearcherLike<M> + ?Sized,
+    Metric: MetricLike + ?Sized,
+    Score: SearcherLike<Metric> + ?Sized,
 {
     let nodes = table.len();
     if nodes == 0 {
@@ -663,11 +695,13 @@ where
     // connectivity — so a walk rarely rides one entry point's local minimum to the
     // exclusion of others. At least one, so even an edgeless graph makes progress.
     let landmarks = table.mean_degree().max(1);
-    let toward_best = |a: &Candidate<S::Index, M::Score>, b: &Candidate<S::Index, M::Score>| {
-        S::compare(a.score, b.score) == Ordering::Greater
+    let toward_best = |a: &Candidate<Score::Index, Metric::Score>,
+                       b: &Candidate<Score::Index, Metric::Score>| {
+        Score::compare(a.score, b.score) == Ordering::Greater
     };
-    let toward_worst = |a: &Candidate<S::Index, M::Score>, b: &Candidate<S::Index, M::Score>| {
-        S::compare(a.score, b.score) == Ordering::Less
+    let toward_worst = |a: &Candidate<Score::Index, Metric::Score>,
+                        b: &Candidate<Score::Index, Metric::Score>| {
+        Score::compare(a.score, b.score) == Ordering::Less
     };
 
     // First seed, scored in one batch like any other expansion.
@@ -710,14 +744,14 @@ where
                 continue;
             }
         };
-        if saturated::<M, S>(searcher, candidate.score, expansion_factor) {
+        if saturated::<Metric, Score>(searcher, candidate.score, expansion_factor) {
             break;
         }
         let index: usize = candidate.node.try_into().map_err(|_| Error::TooLarge)?;
         // The neighbor bytes are read as the native index type with no widening;
         // the searcher's `Index` was resolved from this table, so the width agrees.
         let list = table.neighbors(index);
-        let neighbors = list.as_slice::<S::Index>().ok_or(Error::WrongType)?;
+        let neighbors = list.as_slice::<Score::Index>().ok_or(Error::WrongType)?;
         stage_unvisited(searcher, neighbors.iter().copied(), nodes, staged)?;
         if staged.is_empty() {
             continue;
@@ -741,15 +775,15 @@ where
 /// until it finds a free one, so every call makes strict progress and needs no
 /// retry budget. Returns false when the whole graph is already visited, which is
 /// the walk's signal that no restart can add anything.
-fn sample_landmarks<M, S>(
-    searcher: &mut S,
+fn sample_landmarks<Metric, Score>(
+    searcher: &mut Score,
     nodes: usize,
     count: usize,
-    staged: &mut AVec<S::Index, impl Allocator>,
+    staged: &mut AVec<Score::Index, impl AllocatorLike>,
 ) -> bool
 where
-    M: ScoringLike + ?Sized,
-    S: SearcherLike<M> + ?Sized,
+    Metric: MetricLike + ?Sized,
+    Score: SearcherLike<Metric> + ?Sized,
 {
     staged.clear();
     let bound = nodes as u64;
@@ -760,7 +794,7 @@ where
         }
         // `id < nodes`, and the searcher was sized for this table, so it fits; a
         // failure is treated like a failed reserve below, seeding fewer.
-        let Ok(node) = S::Index::try_from(id) else {
+        let Ok(node) = Score::Index::try_from(id) else {
             break;
         };
         searcher.context().visited.visit(id);
@@ -781,15 +815,15 @@ where
 /// count itself, or the id type's maximum — instead of storing a variable-length
 /// list. The reader needs no distinguished sentinel value; every out-of-range id
 /// is one.
-fn stage_unvisited<M, S>(
-    searcher: &mut S,
-    candidates: impl Iterator<Item = S::Index>,
+fn stage_unvisited<Metric, Score>(
+    searcher: &mut Score,
+    candidates: impl Iterator<Item = Score::Index>,
     nodes: usize,
-    staged: &mut AVec<S::Index, impl Allocator>,
+    staged: &mut AVec<Score::Index, impl AllocatorLike>,
 ) -> Result<(), Error>
 where
-    M: ScoringLike + ?Sized,
-    S: SearcherLike<M> + ?Sized,
+    Metric: MetricLike + ?Sized,
+    Score: SearcherLike<Metric> + ?Sized,
 {
     staged.clear();
     for node in candidates {
@@ -812,30 +846,36 @@ where
 /// Score every staged node in one call, then admit each into the frontier and the
 /// bounded result set.
 #[allow(clippy::too_many_arguments)]
-fn admit<M, S>(
-    searcher: &mut S,
-    query: M::Query<'_>,
-    table: &crate::Table<impl Allocator>,
-    staged: &AVec<S::Index, impl Allocator>,
-    scores: &mut AVec<M::Score, impl Allocator>,
+fn admit<Metric, Score>(
+    searcher: &mut Score,
+    query: Metric::Query<'_>,
+    table: &crate::Table<impl AllocatorLike>,
+    staged: &AVec<Score::Index, impl AllocatorLike>,
+    scores: &mut AVec<Metric::Score, impl AllocatorLike>,
     expansion_factor: usize,
-    toward_best: &impl Fn(&Candidate<S::Index, M::Score>, &Candidate<S::Index, M::Score>) -> bool,
-    toward_worst: &impl Fn(&Candidate<S::Index, M::Score>, &Candidate<S::Index, M::Score>) -> bool,
+    toward_best: &impl Fn(
+        &Candidate<Score::Index, Metric::Score>,
+        &Candidate<Score::Index, Metric::Score>,
+    ) -> bool,
+    toward_worst: &impl Fn(
+        &Candidate<Score::Index, Metric::Score>,
+        &Candidate<Score::Index, Metric::Score>,
+    ) -> bool,
 ) -> Result<(), Error>
 where
-    M: ScoringLike + ?Sized,
-    S: SearcherLike<M> + ?Sized,
+    Metric: MetricLike + ?Sized,
+    Score: SearcherLike<Metric> + ?Sized,
 {
     if staged.is_empty() {
         return Ok(());
     }
     scores.clear();
     scores.try_reserve(staged.len()).map_err(|_| Error::Alloc)?;
-    scores.resize(staged.len(), M::Score::default());
+    scores.resize(staged.len(), Metric::Score::default());
     searcher.score_nodes(query, table, staged, scores)?;
 
     for (&node, &score) in staged.iter().zip(scores.iter()) {
-        if saturated::<M, S>(searcher, score, expansion_factor) {
+        if saturated::<Metric, Score>(searcher, score, expansion_factor) {
             continue;
         }
         let candidate = Candidate { node, score };
@@ -850,15 +890,19 @@ where
 
 /// True when `score` cannot enter a full result set — the walk's admission and
 /// termination test.
-fn saturated<M, S>(searcher: &mut S, score: M::Score, expansion_factor: usize) -> bool
+fn saturated<Metric, Score>(
+    searcher: &mut Score,
+    score: Metric::Score,
+    expansion_factor: usize,
+) -> bool
 where
-    M: ScoringLike + ?Sized,
-    S: SearcherLike<M> + ?Sized,
+    Metric: MetricLike + ?Sized,
+    Score: SearcherLike<Metric> + ?Sized,
 {
     let results = &searcher.context().results;
     results.len() >= expansion_factor
         && match results.peek() {
-            Some(worst) => S::compare(score, worst.score) != Ordering::Greater,
+            Some(worst) => Score::compare(score, worst.score) != Ordering::Greater,
             None => false,
         }
 }
@@ -866,28 +910,28 @@ where
 /// Rank a score tile into `queries × k` matches, row-major and best-first per
 /// query, so `out[query * k + rank]` is that query's `rank`-th best node. The
 /// shared ranking every [`ScannerLike::scan`] is finished with.
-pub fn rank_tile<I: OffsetScalar, S: Copy>(
-    scores: &Scores2D<'_, S>,
+pub fn rank_tile<Index: IndexLike, Score: Copy + Default>(
+    scores: &Matrix<Score>,
     k: usize,
-    compare: impl Fn(S, S) -> Ordering,
-    out: &mut [Match<I, S>],
+    compare: impl Fn(Score, Score) -> Ordering,
+    out: &mut [Match<Index, Score>],
 ) -> Result<(), Error> {
-    if k == 0 || out.len() != scores.queries() * k {
+    if k == 0 || out.len() != scores.cols() * k {
         return Err(Error::Inconsistent);
     }
-    for query in 0..scores.queries() {
+    for query in 0..scores.cols() {
         let ranked = &mut out[query * k..query * k + k];
         let mut filled = 0usize;
-        for node in 0..scores.nodes() {
+        for node in 0..scores.rows() {
             let score = scores.get(node, query).ok_or(Error::Inconsistent)?;
             // The node position becomes `I` only when it wins a slot, so a losing
             // node costs no conversion.
             if filled < k {
-                let node = I::try_from(node).map_err(|_| Error::TooLarge)?;
+                let node = Index::try_from(node).map_err(|_| Error::TooLarge)?;
                 insert_at(ranked, filled, node, score, &compare);
                 filled += 1;
             } else if compare(score, ranked[k - 1].score) == Ordering::Greater {
-                let node = I::try_from(node).map_err(|_| Error::TooLarge)?;
+                let node = Index::try_from(node).map_err(|_| Error::TooLarge)?;
                 insert_at(ranked, k - 1, node, score, &compare);
             }
         }
@@ -897,12 +941,12 @@ pub fn rank_tile<I: OffsetScalar, S: Copy>(
 
 /// Insert `node` with `score` into the sorted prefix `out[..=end]`, shifting
 /// weaker entries right so the prefix stays best-first.
-fn insert_at<I: Copy, S: Copy>(
-    out: &mut [Match<I, S>],
+fn insert_at<Index: Copy, Score: Copy>(
+    out: &mut [Match<Index, Score>],
     end: usize,
-    node: I,
-    score: S,
-    compare: &impl Fn(S, S) -> Ordering,
+    node: Index,
+    score: Score,
+    compare: &impl Fn(Score, Score) -> Ordering,
 ) {
     let mut i = end;
     while i > 0 && compare(score, out[i - 1].score) == Ordering::Greater {
@@ -911,6 +955,12 @@ fn insert_at<I: Copy, S: Copy>(
     }
     out[i] = Match { node, score };
 }
+
+// The shared batch engine: shaped top-k over any scoring family, brute-force or
+// by walk. Backend-free except for ForkUnion, which carries the cross-query
+// fan-out, so every family reuses it without importing a sibling's backend.
+#[cfg(feature = "search")]
+pub(crate) mod batch;
 
 // Each metric family lives in its own module, grouped by how it reads a node's
 // value, and shares no code path with any other.
@@ -1027,15 +1077,12 @@ mod tests {
     }
 
     #[test]
-    fn scores2d_checks_its_shape() {
-        let mut cells = [0.0f32; 6];
-        let tile = Scores2D::new(&mut cells, 3, 2).unwrap();
-        assert_eq!((tile.nodes(), tile.queries()), (3, 2));
-        let mut wrong = [0.0f32; 5];
-        assert!(matches!(
-            Scores2D::new(&mut wrong, 3, 2),
-            Err(Error::Inconsistent)
-        ));
+    fn matrix_checks_its_shape() {
+        let tile = Matrix::<f32>::new(3, 2).unwrap();
+        assert_eq!((tile.rows(), tile.cols()), (3, 2));
+        assert_eq!(tile.get(2, 1), Some(0.0));
+        assert_eq!(tile.get(3, 0), None);
+        assert_eq!(tile.get(0, 2), None);
     }
 
     /// Ranking is direction-agnostic: the same tile ranked with a reversed
@@ -1045,8 +1092,9 @@ mod tests {
     fn rank_tile_honors_both_directions() {
         // Two queries, three nodes, node-major: node 0 scores [1, 9], node 1
         // [3, 7], node 2 [2, 8]. So query 0 sees [1, 3, 2] and query 1 [9, 7, 8].
-        let mut cells = [1.0f32, 9.0, 3.0, 7.0, 2.0, 8.0];
-        let tile = Scores2D::new(&mut cells, 3, 2).unwrap();
+        let cells = [1.0f32, 9.0, 3.0, 7.0, 2.0, 8.0];
+        let mut tile = Matrix::<f32>::new(3, 2).unwrap();
+        tile.as_mut_slice().copy_from_slice(&cells);
         let mut out = [Match {
             node: 0u32,
             score: 0.0f32,

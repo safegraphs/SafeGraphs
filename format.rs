@@ -14,7 +14,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use allocator_api2::alloc::{Allocator, Global};
+use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use allocator_api2::vec::Vec as AVec;
 
 use jsontape::{parse_in, Json, JsonError};
@@ -103,26 +103,26 @@ impl OffsetDType {
 /// The typed counterpart to [`OffsetDType`]: the concrete scalar an offset column
 /// stores, `u32` or `u64`, the same two widths that back a node index and a
 /// prefix-sum entry alike. A file declares the width at runtime as an
-/// [`OffsetDType`]; a searcher resolves the matching `OffsetScalar` from it and
+/// [`OffsetDType`]; a searcher resolves the matching `IndexLike` from it and
 /// traverses in that type, so the frontier and results stay as compact as the
 /// graph — a `u32` node paired with an `f32` score is eight bytes. `Into<u64>`
 /// widens a result only when it leaves the walk; the trait exists to seal the two
 /// legal scalars and to name which [`OffsetDType`] each one is.
-pub trait OffsetScalar: Copy + TryFrom<usize> + TryInto<usize> + Into<u64> + 'static {
+pub trait IndexLike: Copy + TryFrom<usize> + TryInto<usize> + Into<u64> + 'static {
     const OFFSET_DTYPE: OffsetDType;
 }
 
-impl OffsetScalar for u32 {
+impl IndexLike for u32 {
     const OFFSET_DTYPE: OffsetDType = OffsetDType::U32;
 }
 
-impl OffsetScalar for u64 {
+impl IndexLike for u64 {
     const OFFSET_DTYPE: OffsetDType = OffsetDType::U64;
 }
 
-/// The score-side twin of [`OffsetScalar::to_u64`]: a native metric accumulator
+/// The score-side twin of [`IndexLike::to_u64`]: a native metric accumulator
 /// widened to the one score type a runtime caller can name. Where a walk leaves
-/// the graph it widens its node through [`OffsetScalar`] and its score through
+/// the graph it widens its node through [`IndexLike`] and its score through
 /// this, so the erased boundary is `(u64, f64)` and nothing wider. Every native
 /// accumulator — `i32`, `u32`, `f32`, `f64` — fits exactly in `f64`'s mantissa, so
 /// this loses nothing today; a metric scoring past 2^53 is the only thing it could.
@@ -154,6 +154,23 @@ impl Widen for f64 {
     }
 }
 
+/// An edit distance counts operations, so it is bounded by the longer input's
+/// length and cannot approach the 2^53 this trait's contract worries about — a
+/// 9-petabyte string would have to fit in the value column first.
+impl Widen for usize {
+    fn widen(self) -> f64 {
+        self as f64
+    }
+}
+
+/// An alignment score is bounded by the longer input's length times the largest
+/// `i8` cost, so like [`usize`] it sits far inside the mantissa.
+impl Widen for isize {
+    fn widen(self) -> f64 {
+        self as f64
+    }
+}
+
 /// The prefix-sum buffer of an irregular column.
 #[derive(Clone, Copy)]
 pub struct IrregularOffsets {
@@ -177,20 +194,20 @@ pub enum ColumnLayout {
 /// indices. The dtype string lives in the header document, reachable through
 /// [`Table::dtype_name`].
 #[derive(Clone, Copy)]
-pub struct Column<E> {
-    pub dtype: E,
+pub struct Column<Element> {
+    pub dtype: Element,
     pub layout: ColumnLayout,
     pub values: ByteRange,
 }
 
 /// The bytes behind a file: a memory map, or an owned in-memory buffer. Both are
 /// just memory from an allocator — the OS mmap allocator, or `A`.
-enum Backing<A: Allocator = Global> {
+enum Backing<Allocator: AllocatorLike = Global> {
     Mapped(Mmap),
-    Owned(AVec<u8, A>),
+    Owned(AVec<u8, Allocator>),
 }
 
-impl<A: Allocator> Backing<A> {
+impl<Allocator: AllocatorLike> Backing<Allocator> {
     fn as_bytes(&self) -> &[u8] {
         match self {
             Backing::Mapped(mmap) => &mmap[..],
@@ -205,10 +222,10 @@ impl<A: Allocator> Backing<A> {
 /// copyable descriptors that point into it by offset, so buffers are handed out
 /// as zero-copy slices. Only the free-form `metadata` document allocates,
 /// through `A`.
-pub struct Table<A: Allocator = Global> {
+pub struct Table<Allocator: AllocatorLike = Global> {
     /// The bytes behind every buffer, kept alive for the whole handle so borrowed
     /// slices stay valid.
-    backing: Backing<A>,
+    backing: Backing<Allocator>,
 
     /// Byte offset of the data segment: the first byte past the padded header.
     /// Every column's `ByteRange` is relative to this.
@@ -216,7 +233,7 @@ pub struct Table<A: Allocator = Global> {
 
     /// The parsed header document, owned in `A`: the free-form `__metadata__`
     /// plus each column's descriptor and dtype string.
-    header: Json<A>,
+    header: Json<Allocator>,
 
     /// Node identity: a scalar key, or an irregular column of string keys.
     key: Column<StorageDType>,
@@ -267,7 +284,7 @@ impl From<JsonError> for Error {
 
 /// An element type parsed from a header dtype string. `StorageDType` collapses the
 /// semantic string to a storage width; `OffsetDType` keeps the two index widths.
-pub trait ElementType: Copy {
+pub trait ElementLike: Copy {
     fn from_dtype(text: &[u8]) -> Result<Self, Error>;
     fn size(self) -> usize;
     /// Byte length of a regular row of `width` elements. Whole-byte by default —
@@ -277,7 +294,7 @@ pub trait ElementType: Copy {
     }
 }
 
-impl ElementType for StorageDType {
+impl ElementLike for StorageDType {
     fn from_dtype(text: &[u8]) -> Result<Self, Error> {
         Ok(match text {
             b"u1x8" => StorageDType::Bin1,
@@ -300,7 +317,7 @@ impl ElementType for StorageDType {
     }
 }
 
-impl ElementType for OffsetDType {
+impl ElementLike for OffsetDType {
     fn from_dtype(text: &[u8]) -> Result<Self, Error> {
         Ok(match text {
             b"u32" => OffsetDType::U32,
@@ -318,14 +335,17 @@ fn to_usize(v: u64) -> Result<usize, Error> {
     usize::try_from(v).map_err(|_| Error::TooLarge)
 }
 
-fn field_usize<A: Allocator>(obj: &Json<A>, key: &'static str) -> Result<usize, Error> {
+fn field_usize<Allocator: AllocatorLike>(
+    obj: &Json<Allocator>,
+    key: &'static str,
+) -> Result<usize, Error> {
     let v = obj.get(key).ok_or(Error::MissingField(key))?;
     to_usize(v.as_u64().ok_or(Error::WrongType)?)
 }
 
-impl<E: ElementType> Column<E> {
-    fn from_json<A: Allocator>(obj: &Json<A>) -> Result<Self, Error> {
-        let dtype = E::from_dtype(
+impl<Element: ElementLike> Column<Element> {
+    fn from_json<Allocator: AllocatorLike>(obj: &Json<Allocator>) -> Result<Self, Error> {
+        let dtype = Element::from_dtype(
             obj.get("dtype")
                 .ok_or(Error::MissingField("dtype"))?
                 .as_str()
@@ -368,18 +388,18 @@ impl<E: ElementType> Column<E> {
     }
 }
 
-fn column_field<E: ElementType, A: Allocator>(
-    doc: &Json<A>,
+fn column_field<Element: ElementLike, Allocator: AllocatorLike>(
+    doc: &Json<Allocator>,
     name: &'static str,
-) -> Result<Column<E>, Error> {
+) -> Result<Column<Element>, Error> {
     let obj = doc.get(name).ok_or(Error::MissingField(name))?;
-    Column::<E>::from_json(obj)
+    Column::<Element>::from_json(obj)
 }
 
 impl Table<Global> {
     /// Memory-map a file read-only; pages fault in lazily. Metadata allocates in
     /// the global heap.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+    pub fn open<PathRef: AsRef<Path>>(path: PathRef) -> Result<Self, Error> {
         Self::open_in(path, Global)
     }
 
@@ -396,14 +416,17 @@ impl Table<Global> {
 
     /// Materialize a graph into the columnar form, in the global heap. The
     /// metadata object may come from any allocator.
-    pub fn build<G: GraphLike>(graph: &G, metadata: Option<&Json<Global>>) -> Result<Self, Error> {
+    pub fn build<Graph: GraphLike>(
+        graph: &Graph,
+        metadata: Option<&Json<Global>>,
+    ) -> Result<Self, Error> {
         Self::build_in(graph, metadata, Global)
     }
 }
 
-impl<A: Allocator + Clone> Table<A> {
+impl<Allocator: AllocatorLike + Clone> Table<Allocator> {
     /// Memory-map a file read-only, allocating the metadata document in `alloc`.
-    pub fn open_in<P: AsRef<Path>>(path: P, alloc: A) -> Result<Self, Error> {
+    pub fn open_in<PathRef: AsRef<Path>>(path: PathRef, alloc: Allocator) -> Result<Self, Error> {
         let file = File::open(path)?;
         // SAFETY: the mapping is read-only; the file must not be mutated
         // externally for the lifetime of this handle, per mmap's contract.
@@ -412,17 +435,17 @@ impl<A: Allocator + Clone> Table<A> {
     }
 
     /// Take ownership of an in-memory blob, allocating metadata in `alloc`.
-    pub fn from_owned(buffer: AVec<u8, A>, alloc: A) -> Result<Self, Error> {
+    pub fn from_owned(buffer: AVec<u8, Allocator>, alloc: Allocator) -> Result<Self, Error> {
         Self::from_backing(Backing::Owned(buffer), alloc)
     }
 
     /// Materialize a graph into the columnar form, allocating in `alloc`. The
     /// metadata object may come from any allocator `M`; it is serialized into the
     /// header.
-    pub fn build_in<G: GraphLike, M: Allocator>(
-        graph: &G,
-        metadata: Option<&Json<M>>,
-        alloc: A,
+    pub fn build_in<Graph: GraphLike, MetadataAllocator: AllocatorLike>(
+        graph: &Graph,
+        metadata: Option<&Json<MetadataAllocator>>,
+        alloc: Allocator,
     ) -> Result<Self, Error> {
         let blob = materialize(graph, metadata, alloc.clone())?;
         Self::from_backing(Backing::Owned(blob), alloc)
@@ -430,7 +453,7 @@ impl<A: Allocator + Clone> Table<A> {
 
     /// Shared parse over any backing: frame it, parse the header, extract the
     /// columns and metadata, then validate.
-    fn from_backing(backing: Backing<A>, alloc: A) -> Result<Self, Error> {
+    fn from_backing(backing: Backing<Allocator>, alloc: Allocator) -> Result<Self, Error> {
         let (data_start, header, key, value, neighbors) = {
             let bytes = backing.as_bytes();
             if bytes.get(..8) != Some(&MAGIC[..]) {
@@ -448,9 +471,9 @@ impl<A: Allocator + Clone> Table<A> {
             // Parse the header into an owned document.
             let header = &bytes[16..data_start];
             let doc = parse_in(header, alloc)?;
-            let key = column_field::<StorageDType, A>(&doc, "key")?;
-            let value = column_field::<StorageDType, A>(&doc, "value")?;
-            let neighbors = column_field::<OffsetDType, A>(&doc, "neighbors")?;
+            let key = column_field::<StorageDType, Allocator>(&doc, "key")?;
+            let value = column_field::<StorageDType, Allocator>(&doc, "value")?;
+            let neighbors = column_field::<OffsetDType, Allocator>(&doc, "neighbors")?;
             (data_start, doc, key, value, neighbors)
         };
 
@@ -467,7 +490,7 @@ impl<A: Allocator + Clone> Table<A> {
     }
 }
 
-impl<A: Allocator> Table<A> {
+impl<Allocator: AllocatorLike> Table<Allocator> {
     /// The bytes behind the file, mapped or in-memory.
     fn bytes(&self) -> &[u8] {
         self.backing.as_bytes()
@@ -482,11 +505,11 @@ impl<A: Allocator> Table<A> {
     }
 
     /// The free-form `__metadata__` object, if present.
-    pub fn metadata(&self) -> Option<&Json<A>> {
+    pub fn metadata(&self) -> Option<&Json<Allocator>> {
         self.header.get("__metadata__")
     }
 
-    pub fn metadata_get(&self, key: &str) -> Option<&Json<A>> {
+    pub fn metadata_get(&self, key: &str) -> Option<&Json<Allocator>> {
         self.metadata()?.get(key)
     }
 
@@ -540,7 +563,7 @@ impl<A: Allocator> Table<A> {
     }
 }
 
-impl<E: ElementType> Column<E> {
+impl<Element: ElementLike> Column<Element> {
     /// Number of nodes the column describes, derived from its own buffers.
     pub fn len(&self) -> usize {
         match self.layout {
@@ -565,17 +588,17 @@ impl<E: ElementType> Column<E> {
 }
 
 /// Reinterpret a byte slice as `&[T]`, refusing a wrong length or misalignment.
-pub fn cast<T: Copy>(bytes: &[u8]) -> Option<&[T]> {
-    let size = core::mem::size_of::<T>();
+pub fn cast<Value: Copy>(bytes: &[u8]) -> Option<&[Value]> {
+    let size = core::mem::size_of::<Value>();
     if size == 0 || !bytes.len().is_multiple_of(size) {
         return None;
     }
-    if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<T>()) {
+    if !(bytes.as_ptr() as usize).is_multiple_of(core::mem::align_of::<Value>()) {
         return None;
     }
     // SAFETY: the pointer is aligned for `T` and the length is a whole number of
     // `T`; `T: Copy` and the reader's numeric use make the bytes a valid value.
-    Some(unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const T, bytes.len() / size) })
+    Some(unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const Value, bytes.len() / size) })
 }
 
 /// A node's outgoing edges: node indices in this file, as `u32` or `u64`. An
@@ -609,15 +632,15 @@ impl<'a> NeighborList<'a> {
     /// table, so the width agrees and the walk reads its neighbors without a copy
     /// or a widen; the check is what makes a mismatched reader fail cleanly rather
     /// than reinterpret bytes.
-    pub fn as_slice<I: OffsetScalar>(&self) -> Option<&'a [I]> {
-        if self.dtype != I::OFFSET_DTYPE {
+    pub fn as_slice<Index: IndexLike>(&self) -> Option<&'a [Index]> {
+        if self.dtype != Index::OFFSET_DTYPE {
             return None;
         }
         cast(self.bytes)
     }
 }
 
-impl<A: Allocator> Table<A> {
+impl<Allocator: AllocatorLike> Table<Allocator> {
     /// The whole value buffer, contiguous, for a batch scan. Only meaningful for
     /// a regular value column; pair with [`GraphLike::value_shape`].
     pub fn value_buffer(&self) -> &[u8] {
@@ -690,7 +713,11 @@ impl<A: Allocator> Table<A> {
     }
 
     /// Raw bytes of node `node` in any column, regular or irregular.
-    fn node_bytes<E: ElementType>(&self, column: &Column<E>, node: usize) -> Option<&[u8]> {
+    fn node_bytes<Element: ElementLike>(
+        &self,
+        column: &Column<Element>,
+        node: usize,
+    ) -> Option<&[u8]> {
         match column.layout {
             ColumnLayout::Regular { width } => {
                 let per = column.dtype.row_bytes(width);
@@ -721,7 +748,11 @@ impl<A: Allocator> Table<A> {
     }
 
     /// Confirm one column's buffers fit the map and match `len` exactly.
-    fn check_layout<E: ElementType>(&self, column: &Column<E>, len: usize) -> Result<(), Error> {
+    fn check_layout<Element: ElementLike>(
+        &self,
+        column: &Column<Element>,
+        len: usize,
+    ) -> Result<(), Error> {
         match column.layout {
             ColumnLayout::Regular { width } => {
                 let per = column.dtype.row_bytes(width);
@@ -758,7 +789,7 @@ impl<A: Allocator> Table<A> {
     }
 }
 
-impl<A: Allocator> GraphLike for Table<A> {
+impl<Allocator: AllocatorLike> GraphLike for Table<Allocator> {
     fn len(&self) -> usize {
         self.key.len()
     }
@@ -848,12 +879,12 @@ pub trait GraphLike {
 }
 
 /// Iterator over a [`GraphLike`]'s nodes.
-pub struct GraphIter<'a, G: GraphLike> {
-    graph: &'a G,
+pub struct GraphIter<'a, Graph: GraphLike> {
+    graph: &'a Graph,
     node: usize,
 }
 
-impl<'a, G: GraphLike> Iterator for GraphIter<'a, G> {
+impl<'a, Graph: GraphLike> Iterator for GraphIter<'a, Graph> {
     type Item = Node<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -870,14 +901,17 @@ impl<'a, G: GraphLike> Iterator for GraphIter<'a, G> {
     }
 }
 
-fn push_bytes<A: Allocator>(v: &mut AVec<u8, A>, bytes: &[u8]) -> Result<(), Error> {
+fn push_bytes<Allocator: AllocatorLike>(
+    v: &mut AVec<u8, Allocator>,
+    bytes: &[u8],
+) -> Result<(), Error> {
     v.try_reserve(bytes.len()).map_err(|_| Error::Alloc)?;
     v.extend_from_slice(bytes);
     Ok(())
 }
 
-fn push_offset<A: Allocator>(
-    v: &mut AVec<u8, A>,
+fn push_offset<Allocator: AllocatorLike>(
+    v: &mut AVec<u8, Allocator>,
     dtype: OffsetDType,
     value: u64,
 ) -> Result<(), Error> {
@@ -907,16 +941,16 @@ fn reserve_span(cursor: &mut usize, len: usize, alignment: usize) -> Result<usiz
 
 /// Accumulates one column's on-disk buffers: concatenated values, and u64
 /// prefix-sum offsets when the column is irregular.
-struct ColumnBuilder<A: Allocator> {
+struct ColumnBuilder<Allocator: AllocatorLike> {
     dtype: StorageDType,
     width: Option<usize>,
-    values: AVec<u8, A>,
-    offsets: AVec<u8, A>,
+    values: AVec<u8, Allocator>,
+    offsets: AVec<u8, Allocator>,
     running: u64,
 }
 
-impl<A: Allocator + Clone> ColumnBuilder<A> {
-    fn new(dtype: StorageDType, width: Option<usize>, alloc: &A) -> Result<Self, Error> {
+impl<Allocator: AllocatorLike + Clone> ColumnBuilder<Allocator> {
+    fn new(dtype: StorageDType, width: Option<usize>, alloc: &Allocator) -> Result<Self, Error> {
         let mut offsets = AVec::new_in(alloc.clone());
         if width.is_none() {
             push_bytes(&mut offsets, &0u64.to_le_bytes())?;
@@ -962,8 +996,8 @@ impl<A: Allocator + Clone> ColumnBuilder<A> {
     }
 }
 
-fn reserve_offsets<A: Allocator + Clone>(
-    column: &ColumnBuilder<A>,
+fn reserve_offsets<Allocator: AllocatorLike + Clone>(
+    column: &ColumnBuilder<Allocator>,
     cursor: &mut usize,
     alignment: usize,
 ) -> Result<Option<usize>, Error> {
@@ -974,11 +1008,11 @@ fn reserve_offsets<A: Allocator + Clone>(
     }
 }
 
-fn write_column<A: Allocator>(
+fn write_column<Allocator: AllocatorLike>(
     header: &mut String,
     name: &str,
     dtype: &str,
-    column: &ColumnBuilder<A>,
+    column: &ColumnBuilder<Allocator>,
     off_start: Option<usize>,
     val_start: usize,
 ) {
@@ -998,8 +1032,8 @@ fn write_column<A: Allocator>(
     ));
 }
 
-fn write_buffer<A: Allocator>(
-    file: &mut AVec<u8, A>,
+fn write_buffer<Allocator: AllocatorLike>(
+    file: &mut AVec<u8, Allocator>,
     data_start: usize,
     start: usize,
     bytes: &[u8],
@@ -1012,15 +1046,15 @@ fn write_buffer<A: Allocator>(
 }
 
 /// Serialize a graph into a complete `.safegraphs` blob in `alloc`.
-fn materialize<G, M, A>(
-    graph: &G,
-    metadata: Option<&Json<M>>,
-    alloc: A,
-) -> Result<AVec<u8, A>, Error>
+fn materialize<Graph, MetadataAllocator, Allocator>(
+    graph: &Graph,
+    metadata: Option<&Json<MetadataAllocator>>,
+    alloc: Allocator,
+) -> Result<AVec<u8, Allocator>, Error>
 where
-    G: GraphLike,
-    M: Allocator,
-    A: Allocator + Clone,
+    Graph: GraphLike,
+    MetadataAllocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
 {
     let node_count = graph.len();
     let alignment = metadata
@@ -1056,7 +1090,7 @@ where
         OffsetDType::U64 => ("u64", StorageDType::Bin64),
     };
     let mut neighbors = ColumnBuilder::new(neighbor_storage, graph.neighbors_degree(), &alloc)?;
-    let mut scratch: AVec<u8, A> = AVec::new_in(alloc.clone());
+    let mut scratch: AVec<u8, Allocator> = AVec::new_in(alloc.clone());
     for i in 0..node_count {
         let list = graph.neighbors(i);
         if list.dtype == neighbor_dtype {
@@ -1133,7 +1167,7 @@ where
     let data_start = 16 + header_len;
     let total = data_start.checked_add(data_len).ok_or(Error::TooLarge)?;
 
-    let mut file: AVec<u8, A> = AVec::new_in(alloc);
+    let mut file: AVec<u8, Allocator> = AVec::new_in(alloc);
     file.try_reserve_exact(total).map_err(|_| Error::Alloc)?;
     file.extend_from_slice(&MAGIC);
     file.extend_from_slice(&(header_len as u64).to_le_bytes());
