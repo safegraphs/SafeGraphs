@@ -1,0 +1,9 @@
+# Normalize every text file to LF in the repository, and check it out as LF on every
+# platform, matching the sibling projects. Without this, line endings fall back to each
+# developer's `core.autocrlf`: a Windows checkout gets a CRLF worktree while rustfmt
+# writes LF, so `cargo fmt --check` rewrites whole files and the gates in
+# .githooks/pre-commit can never pass there. The hooks themselves are shell scripts, and
+# a CRLF one fails to run at all under Git Bash. `eol=lf` is the operative part —
+# `text=auto` alone still yields CRLF worktrees on Windows. Binary files stay untouched,
+# since Git still auto-detects them.
+* text=auto eol=lf

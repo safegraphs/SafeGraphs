@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# SafeGraphs commit-msg: the message contract, borrowed from the sibling projects.
+#
+#   1. The subject reads `<Verb>: <Capitalized summary>` with an approved verb, so the
+#      history reads as a changelog rather than a diary. Merge commits are exempt —
+#      Git writes their subject.
+#   2. No AI-assistant attribution: no bot `Co-authored-by` trailer, no "Generated
+#      with/by <assistant>", no vendor URL, no robot emoji. Authorship is the human
+#      who committed, whatever tooling helped them get there.
+#
+# Portability: bash 3.2 constructs only, so this runs under Git Bash on Windows. The
+# message file is stripped of CR before matching — an editor that writes CRLF would
+# otherwise leave a stray byte on every line — and the attribution scan runs under
+# `LC_ALL=C` so grep compares bytes and cannot fault on the emoji in its pattern.
+#
+# Bypass knowingly (you almost never should) with:  git commit --no-verify
+
+set -u
+
+message_file="$1"
+
+# Comment lines — git's scissors and helptext — never reach the final message.
+payload=$(tr -d '\r' < "$message_file" | grep -v '^#' || true)
+subject=$(printf '%s\n' "$payload" | grep -vE '^[[:space:]]*$' | head -1)
+
+failed=0
+
+case "$subject" in
+Merge*) ;;
+*)
+    if ! printf '%s\n' "$subject" |
+        grep -qE '^(Add|Break|Build|Chore|Docs|Fix|Improve|Make|Refactor|Release): [A-Z]'; then
+        echo "commit-msg: the subject must be '<Verb>: <Capitalized summary>' with an approved verb —"
+        echo "            Add Break Build Chore Docs Fix Improve Make Refactor Release."
+        echo "            Got: ${subject:-<empty>}"
+        failed=1
+    fi
+    ;;
+esac
+
+offenders=$(printf '%s\n' "$payload" | LC_ALL=C grep -inE \
+    'co-authored-by:.*(\[bot\]|\bbot\b|claude|chatgpt|gpt-[0-9]|openai|copilot|gemini|\bbard\b|cursor|codeium|devin)|generated (with|by).*\b(ai|llm|claude|chatgpt|gpt|copilot|gemini|cursor|anthropic|openai)\b|\b(anthropic|openai)\.com|claude\.ai|chatgpt\.com|claude-session|🤖' || true)
+if [ -n "$offenders" ]; then
+    echo "commit-msg: this message carries AI-assistant attribution — SafeGraphs history stays human-authored."
+    echo "            Offending lines:"
+    printf '%s\n' "$offenders" | head -8
+    failed=1
+fi
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Fix the subject or trailer and commit again. Bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0

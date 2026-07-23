@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# SafeGraphs pre-commit: house-style guards over staged changes, borrowed from the
+# sibling projects' hooks so one convention holds across the family.
+# Install once per clone with:  git config core.hooksPath .githooks
+# Bypass knowingly (you almost never should) with:  git commit --no-verify
+#
+# Every check but the macro ban inspects only the ADDED lines of a staged file, so
+# legacy code migrates on its own schedule while no new violation lands.
+#
+# Portability: this runs under Git Bash on Windows as well as any POSIX shell's bash,
+# so it stays within bash 3.2 (no `mapfile`, no `${var,,}`) and avoids process
+# substitution, whose `/dev/fd` plumbing is the flakiest part of MSYS. File lists are
+# fed to loops through a here-string, which also keeps the loop body in the current
+# shell so `failed` survives it. Diff output is stripped of CR before matching, so a
+# CRLF worktree cannot defeat the `$`-anchored patterns even if .gitattributes is
+# ignored.
+
+set -u
+
+failed=0
+
+# Rust must stay rustfmt-clean, respecting any checked-in rustfmt.toml. This is a
+# whole-crate check rather than a staged-hunk one: it is what catches an accidental
+# whole-file reformat riding along with a real change. Skips without cargo.
+if command -v cargo > /dev/null 2>&1; then
+    if git diff --cached --name-only --diff-filter=ACM -- '*.rs' | grep -q .; then
+        if ! cargo fmt --check > /dev/null 2>&1; then
+            echo "pre-commit: staged Rust changes are not rustfmt clean — run: cargo fmt"
+            failed=1
+        fi
+    fi
+fi
+
+staged=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+# `macro_rules!` definitions are banned outright, and unlike the style checks this one
+# reads the whole staged file: the crate has never held a macro, so there is no legacy
+# to grandfather. Generated code hides the type errors that generics surface, reads as
+# a second language on top of Rust, and defeats rust-analyzer. Every dispatch table is
+# written out by hand. Invoking a standard macro stays fine; defining one does not.
+while IFS= read -r file; do
+    case "$file" in
+    *.rs) ;;
+    *) continue ;;
+    esac
+    macro_hits=$(git show ":$file" | grep -n 'macro_rules!' || true)
+    if [ -n "$macro_hits" ]; then
+        echo "pre-commit: $file defines a \`macro_rules!\` — banned; write each impl out explicitly:"
+        printf '%s\n' "$macro_hits" | sed "s|^|  $file:|" | head -5
+        failed=1
+    fi
+done <<< "$staged"
+
+# Project-wide, every staged file: no decorative banner rulers and no formatter-disabling
+# directives. A staged line that is only dashes, equals, slashes, or hashes is a ruler and
+# is banned everywhere except Markdown, where a dash run is legal (horizontal rules, table
+# separators) and `###` opens a heading. Use a plain-text title, or `// region:` and
+# `// endregion:` at module scope, for a foldable section. Turning rustfmt off in-band is
+# banned too: the checked-in profile is the law, so a file formats clean as a whole rather
+# than fencing off regions the tool is told to skip. Every pattern is line-anchored, so
+# prose that merely names a directive, and a range like `0..=3`, never trip the check.
+while IFS= read -r file; do
+    added=$(git diff --cached --unified=0 -- "$file" | tr -d '\r' | grep '^+' | grep -v '^+++' || true)
+    if [ -z "$added" ]; then
+        continue
+    fi
+
+    case "$file" in
+    *.md | *.markdown) ;;
+    *)
+        rulers=$(printf '%s\n' "$added" |
+            grep -E '^\+[[:space:]]*(([#]+|//)?[[:space:]]*[-=]{3,}|/{4,}|#{3,})[[:space:]]*$' || true)
+        if [ -n "$rulers" ]; then
+            echo "pre-commit: $file adds a decorative banner ruler (banned outside Markdown):"
+            printf '%s\n' "$rulers" | head -5
+            failed=1
+        fi
+        ;;
+    esac
+
+    format_off=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*(//|#)!?\[?[[:space:]]*(rustfmt::skip|rustfmt[[:space:]]+(on|off))' || true)
+    if [ -n "$format_off" ]; then
+        echo "pre-commit: $file disables rustfmt in-band — the checked-in profile is the law:"
+        printf '%s\n' "$format_off" | head -5
+        failed=1
+    fi
+
+    # Prose uses a single space between sentences: a period, question mark, or exclamation
+    # followed by two-plus spaces and a capital is the double-space habit.
+    double_space=$(printf '%s\n' "$added" | grep -E '[.!?]  +[A-Z]' || true)
+    if [ -n "$double_space" ]; then
+        echo "pre-commit: $file double-spaces between sentences — use a single space after . ! ?:"
+        printf '%s\n' "$double_space" | head -5
+        failed=1
+    fi
+done <<< "$staged"
+
+if [ "$failed" -ne 0 ]; then
+    echo ""
+    echo "Staged changes violate the house style (see the reasons above). Fix and re-stage, or"
+    echo "bypass knowingly with: git commit --no-verify"
+    exit 1
+fi
+exit 0
