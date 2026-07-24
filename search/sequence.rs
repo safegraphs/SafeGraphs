@@ -29,8 +29,9 @@ use super::{
     walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
     TraversalContext,
 };
-use crate::{Error, GraphLike, IndexLike, OffsetDType, Table, Widen};
+use crate::{Error, IndexLike, OffsetDType, Table, TableView, Widen};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
+use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
 use stringtape::{BytesTapeView, CharsTapeView};
 use stringzilla::szs;
@@ -267,7 +268,7 @@ fn open_device(scope: ExecutionScope) -> Result<szs::DeviceScope, Error> {
 /// Borrow a table's variable-length value column as a tape, with no copy: the
 /// prefix sums and the concatenated bytes are already exactly what StringZilla
 /// wants. Fails only on a regular column, which has no offsets to borrow.
-fn value_tape(table: &Table<impl AllocatorLike>) -> Result<szs::AnyBytesTape<'_>, Error> {
+fn value_tape(table: TableView<'_>) -> Result<szs::AnyBytesTape<'_>, Error> {
     let (offset_bytes, dtype) = table.value_offsets().ok_or(Error::WrongType)?;
     let values = table.value_buffer();
     let expected = table.len() + 1;
@@ -436,7 +437,7 @@ where
 }
 
 /// The batch half of any sequence metric, owning its device and engine.
-pub struct SequenceScanner<Engine: EngineLike> {
+pub struct SequenceScanner<Engine: EngineLike, Allocator: AllocatorLike = Global> {
     device: szs::DeviceScope,
     engine: Engine,
     /// Unified memory the engine writes into, reallocated only when the batch
@@ -444,30 +445,36 @@ pub struct SequenceScanner<Engine: EngineLike> {
     /// layout, and it is query-major where the tile is node-major.
     matrix: Option<szs::UnifiedMat<Engine::Score>>,
     /// The crate-side node-major score tile, reused across batches.
-    tile: Matrix<Engine::Score>,
+    tile: Matrix<Engine::Score, Allocator>,
     /// Offset scratch for restating a query tape at the table's own offset
     /// width, since the engines refuse a mixed-width pair. Only the prefix sums
     /// are rebuilt; the query bytes are never copied.
-    offsets_narrow: Vec<u32>,
-    offsets_wide: Vec<u64>,
+    offsets_narrow: AVec<u32, Allocator>,
+    offsets_wide: AVec<u64, Allocator>,
+    alloc: Allocator,
 }
 
-impl<Engine: EngineLike> SequenceScanner<Engine> {
+impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceScanner<Engine, Allocator> {
     /// A scanner with `costs`, running on whatever `scope` names — the same
     /// engine serves CPU cores and a GPU alike, which is why the device is
-    /// owned here rather than exposed. No allocator crosses this signature:
-    /// the engine's score matrix lives in StringZilla's own unified memory,
-    /// which is not an `allocator_api2` allocator.
-    pub fn new(costs: Engine::Costs, scope: ExecutionScope) -> Result<Self, Error> {
+    /// owned here rather than exposed. The tile and offset scratch live in
+    /// `alloc`; the engine's own score matrix stays in StringZilla's unified
+    /// memory, which is the device's and not an `allocator_api2` allocator.
+    pub fn new(
+        costs: Engine::Costs,
+        scope: ExecutionScope,
+        alloc: Allocator,
+    ) -> Result<Self, Error> {
         let device = open_device(scope)?;
         let engine = Engine::build(&device, &costs)?;
         Ok(SequenceScanner {
             device,
             engine,
             matrix: None,
-            tile: Matrix::empty(),
-            offsets_narrow: Vec::new(),
-            offsets_wide: Vec::new(),
+            tile: Matrix::empty_in(alloc.clone()),
+            offsets_narrow: AVec::new_in(alloc.clone()),
+            offsets_wide: AVec::new_in(alloc.clone()),
+            alloc,
         })
     }
 
@@ -483,7 +490,8 @@ impl<Engine: EngineLike> SequenceScanner<Engine> {
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let mut tile = std::mem::take(&mut self.tile);
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
         let outcome = batch_scan::<SequenceMetric<Engine>, _>(
             self,
             queries,
@@ -499,12 +507,14 @@ impl<Engine: EngineLike> SequenceScanner<Engine> {
     }
 }
 
-impl<Engine: EngineLike> ScannerLike<SequenceMetric<Engine>> for SequenceScanner<Engine> {
+impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> ScannerLike<SequenceMetric<Engine>>
+    for SequenceScanner<Engine, Allocator>
+{
     fn scan(
         &mut self,
         queries: szs::AnyBytesTape<'_>,
-        table: &Table<impl AllocatorLike>,
-        scores: &mut Matrix<Engine::Score>,
+        table: TableView<'_>,
+        scores: &mut Matrix<Engine::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         let candidates = value_tape(table)?;
         let (query_count, node_count) = (tape_len(&queries), tape_len(&candidates));
@@ -584,8 +594,8 @@ pub struct SequenceSearcher<Engine: EngineLike, Index = u32, Allocator: Allocato
     /// One expansion's node values, gathered contiguously with their prefix sums
     /// so they can be handed over as a tape. Reused between expansions; the
     /// gather itself is unavoidable, since staged nodes are scattered.
-    staged_bytes: Vec<u8>,
-    staged_offsets: Vec<u32>,
+    staged_bytes: AVec<u8, Allocator>,
+    staged_offsets: AVec<u32, Allocator>,
     matrix: Option<szs::UnifiedMat<Engine::Score>>,
 }
 
@@ -606,9 +616,9 @@ impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
         Ok(SequenceSearcher {
             device,
             engine,
-            context: TraversalContext::new_in(expansion_factor, alloc)?,
-            staged_bytes: Vec::new(),
-            staged_offsets: Vec::new(),
+            context: TraversalContext::new_in(expansion_factor, alloc.clone())?,
+            staged_bytes: AVec::new_in(alloc.clone()),
+            staged_offsets: AVec::new_in(alloc.clone()),
             matrix: None,
         })
     }
@@ -628,7 +638,7 @@ impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
     fn score_nodes(
         &mut self,
         query: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: TableView<'_>,
         nodes: &[Index],
         out: &mut [Engine::Score],
     ) -> Result<(), Error> {
@@ -686,7 +696,7 @@ impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
         }
     }
 
-    fn search(&mut self, query: &[u8], table: &Table<impl AllocatorLike>) -> Result<(), Error> {
+    fn search(&mut self, query: &[u8], table: TableView<'_>) -> Result<(), Error> {
         walk::<SequenceMetric<Engine>, Self>(self, query, table)
     }
 }
@@ -700,8 +710,11 @@ pub struct SequenceSearch<Engine: EngineLike, Allocator: AllocatorLike = Global>
     costs: Engine::Costs,
     expansion_factor: usize,
     scope: ExecutionScope,
-    workers:
-        Workers<SequenceSearcher<Engine, u32, Allocator>, SequenceSearcher<Engine, u64, Allocator>>,
+    workers: Workers<
+        SequenceSearcher<Engine, u32, Allocator>,
+        SequenceSearcher<Engine, u64, Allocator>,
+        Allocator,
+    >,
     alloc: Allocator,
 }
 
@@ -733,12 +746,13 @@ impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceSearch<Engine
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
+        let table = table.view();
         let (costs, expansion_factor, scope) = (&self.costs, self.expansion_factor, self.scope);
-        match table.neighbors_column().dtype {
+        match table.neighbors_dtype() {
             OffsetDType::U32 => {
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U32(build_workers(1, || {
+                    self.workers = Workers::U32(build_workers(1, alloc.clone(), || {
                         SequenceSearcher::new(costs.clone(), expansion_factor, scope, alloc.clone())
                     })?);
                 }
@@ -753,7 +767,7 @@ impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceSearch<Engine
             OffsetDType::U64 => {
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U64(build_workers(1, || {
+                    self.workers = Workers::U64(build_workers(1, alloc.clone(), || {
                         SequenceSearcher::new(costs.clone(), expansion_factor, scope, alloc.clone())
                     })?);
                 }
@@ -775,7 +789,8 @@ impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceSearch<Engine
 
 /// Byte-level Levenshtein edit distance, smaller-is-better.
 pub type LevenshteinMetric = SequenceMetric<szs::LevenshteinDistances>;
-pub type LevenshteinScanner = SequenceScanner<szs::LevenshteinDistances>;
+pub type LevenshteinScanner<Allocator = Global> =
+    SequenceScanner<szs::LevenshteinDistances, Allocator>;
 pub type LevenshteinSearcher<Index = u32, Allocator = Global> =
     SequenceSearcher<szs::LevenshteinDistances, Index, Allocator>;
 pub type LevenshteinSearch<Allocator = Global> =
@@ -784,7 +799,8 @@ pub type LevenshteinSearch<Allocator = Global> =
 /// Codepoint-level Levenshtein over validated UTF-8, smaller-is-better: one
 /// multibyte character is one edit, not two.
 pub type LevenshteinUtf8Metric = SequenceMetric<szs::LevenshteinDistancesUtf8>;
-pub type LevenshteinUtf8Scanner = SequenceScanner<szs::LevenshteinDistancesUtf8>;
+pub type LevenshteinUtf8Scanner<Allocator = Global> =
+    SequenceScanner<szs::LevenshteinDistancesUtf8, Allocator>;
 pub type LevenshteinUtf8Searcher<Index = u32, Allocator = Global> =
     SequenceSearcher<szs::LevenshteinDistancesUtf8, Index, Allocator>;
 pub type LevenshteinUtf8Search<Allocator = Global> =
@@ -793,7 +809,8 @@ pub type LevenshteinUtf8Search<Allocator = Global> =
 /// Needleman-Wunsch global alignment score, larger-is-better and possibly
 /// negative.
 pub type NeedlemanWunschMetric = SequenceMetric<szs::NeedlemanWunschScores>;
-pub type NeedlemanWunschScanner = SequenceScanner<szs::NeedlemanWunschScores>;
+pub type NeedlemanWunschScanner<Allocator = Global> =
+    SequenceScanner<szs::NeedlemanWunschScores, Allocator>;
 pub type NeedlemanWunschSearcher<Index = u32, Allocator = Global> =
     SequenceSearcher<szs::NeedlemanWunschScores, Index, Allocator>;
 pub type NeedlemanWunschSearch<Allocator = Global> =
@@ -801,7 +818,8 @@ pub type NeedlemanWunschSearch<Allocator = Global> =
 
 /// Smith-Waterman local alignment score, larger-is-better and never negative.
 pub type SmithWatermanMetric = SequenceMetric<szs::SmithWatermanScores>;
-pub type SmithWatermanScanner = SequenceScanner<szs::SmithWatermanScores>;
+pub type SmithWatermanScanner<Allocator = Global> =
+    SequenceScanner<szs::SmithWatermanScores, Allocator>;
 pub type SmithWatermanSearcher<Index = u32, Allocator = Global> =
     SequenceSearcher<szs::SmithWatermanScores, Index, Allocator>;
 pub type SmithWatermanSearch<Allocator = Global> =
@@ -812,7 +830,7 @@ pub type SmithWatermanSearch<Allocator = Global> =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NeighborList, Shape};
+    use crate::{GraphLike, NeighborList, Shape};
 
     /// Three words on a fully connected triangle. Values are variable-length, so
     /// the column is irregular and has no `value_shape` at all — the property no
@@ -879,7 +897,8 @@ mod tests {
     fn scan_ranks_nearest_first() {
         let table = crate::Table::build(&Words, None).unwrap();
         let mut scanner =
-            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial).unwrap();
+            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
+                .unwrap();
 
         // "kitten": distance 0 to itself, 3 to "sitting", 1 to "mitten" — and the
         // ranking must put the SMALLEST distance first, unlike every dot metric.
@@ -957,7 +976,8 @@ mod tests {
         // is unambiguous — six class matches, no gaps — so its score is pinned.
         let table = crate::Table::build(&Words, None).unwrap();
         let mut scanner =
-            NeedlemanWunschScanner::new(AlignmentCosts::default(), ExecutionScope::Serial).unwrap();
+            NeedlemanWunschScanner::new(AlignmentCosts::default(), ExecutionScope::Serial, Global)
+                .unwrap();
 
         let mut offsets = [0u32; 2];
         let queries = query_tape(b"kitten", &mut offsets);
@@ -1001,7 +1021,8 @@ mod tests {
         // order. A local score never goes negative.
         let table = crate::Table::build(&Words, None).unwrap();
         let mut scanner =
-            SmithWatermanScanner::new(AlignmentCosts::default(), ExecutionScope::Serial).unwrap();
+            SmithWatermanScanner::new(AlignmentCosts::default(), ExecutionScope::Serial, Global)
+                .unwrap();
 
         let mut offsets = [0u32; 2];
         let queries = query_tape(b"kitt", &mut offsets);
@@ -1063,7 +1084,8 @@ mod tests {
 
         // Byte-level: "é" is two bytes, so "héllo" sits two edits from "hello".
         let mut byte_scanner =
-            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial).unwrap();
+            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
+                .unwrap();
         let mut offsets = [0u32; 2];
         let queries = query_tape("héllo".as_bytes(), &mut offsets);
         let (mut matches, mut distances, mut counts) = outputs(1, 2);
@@ -1074,9 +1096,12 @@ mod tests {
         assert_eq!(distances.row(0).unwrap(), &[0.0, 2.0]);
 
         // Codepoint-level: the very same pair is ONE edit, and the walk agrees.
-        let mut utf8_scanner =
-            LevenshteinUtf8Scanner::new(LevenshteinCosts::default(), ExecutionScope::Serial)
-                .unwrap();
+        let mut utf8_scanner = LevenshteinUtf8Scanner::new(
+            LevenshteinCosts::default(),
+            ExecutionScope::Serial,
+            Global,
+        )
+        .unwrap();
         let mut offsets = [0u32; 2];
         let queries = query_tape("héllo".as_bytes(), &mut offsets);
         utf8_scanner
@@ -1106,9 +1131,12 @@ mod tests {
         // The column claimed `utf8`; a query that is not is a type error, not a
         // garbage distance.
         let table = crate::Table::build(&Greetings, None).unwrap();
-        let mut scanner =
-            LevenshteinUtf8Scanner::new(LevenshteinCosts::default(), ExecutionScope::Serial)
-                .unwrap();
+        let mut scanner = LevenshteinUtf8Scanner::new(
+            LevenshteinCosts::default(),
+            ExecutionScope::Serial,
+            Global,
+        )
+        .unwrap();
         let mut offsets = [0u32; 2];
         let queries = query_tape(&[0xFF, 0xFE], &mut offsets);
         let (mut matches, mut distances, mut counts) = outputs(1, 2);
@@ -1151,7 +1179,8 @@ mod tests {
 
         let table = crate::Table::build(&Fixed, None).unwrap();
         let mut scanner =
-            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial).unwrap();
+            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
+                .unwrap();
         let mut offsets = [0u32; 2];
         let queries = query_tape(b"a", &mut offsets);
         let (mut matches, mut distances, mut counts) = outputs(1, 1);

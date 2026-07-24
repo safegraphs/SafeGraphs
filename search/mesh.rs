@@ -26,8 +26,9 @@ use super::{
     TraversalContext,
 };
 use crate::search::dense::matrix_view;
-use crate::{cast, Error, GraphLike, IndexLike, OffsetDType, Shape, Table};
+use crate::{cast, Error, IndexLike, OffsetDType, Shape, Table, TableView};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
+use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
@@ -128,7 +129,7 @@ where
 
 /// The cardinality of a mesh value column: `points`, requiring exactly three
 /// coordinates per point. The single shape check every entry point repeats.
-fn cloud_points(table: &Table<impl AllocatorLike>) -> Result<usize, Error> {
+fn cloud_points(table: TableView<'_>) -> Result<usize, Error> {
     match table.value_shape() {
         Some(Shape::Matrix(points, 3)) => Ok(points),
         _ => Err(Error::WrongType),
@@ -143,10 +144,11 @@ fn cloud_points(table: &Table<impl AllocatorLike>) -> Result<usize, Error> {
 /// geospatial the scanner carries no per-worker scratch.
 pub struct MeshScanner<Coordinate, Superpose, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
-    tile: Matrix<f64>,
+    tile: Matrix<f64, Allocator>,
+    scratch: AVec<(), Allocator>,
+    alloc: Allocator,
     coordinate: core::marker::PhantomData<fn() -> Coordinate>,
     superpose: core::marker::PhantomData<fn() -> Superpose>,
-    alloc: core::marker::PhantomData<fn() -> Allocator>,
 }
 
 impl<Coordinate, Superpose, Allocator> MeshScanner<Coordinate, Superpose, Allocator>
@@ -157,13 +159,14 @@ where
     /// NumKong's mesh kernels are CPU-only, so a GPU scope is refused.
     ///
     /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
-    pub fn new(scope: ExecutionScope, _alloc: Allocator) -> Result<Self, Error> {
+    pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         Ok(MeshScanner {
             pool: open_pool(scope)?,
-            tile: Matrix::empty(),
+            tile: Matrix::empty_in(alloc.clone()),
+            scratch: AVec::new_in(alloc.clone()),
+            alloc,
             coordinate: core::marker::PhantomData,
             superpose: core::marker::PhantomData,
-            alloc: core::marker::PhantomData,
         })
     }
 }
@@ -185,7 +188,8 @@ where
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let mut tile = std::mem::take(&mut self.tile);
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
         let outcome = batch_scan::<MeshMetric<Coordinate, Superpose>, _>(
             self,
             queries,
@@ -211,8 +215,8 @@ where
     fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &Table<impl AllocatorLike>,
-        scores: &mut Matrix<f64>,
+        table: TableView<'_>,
+        scores: &mut Matrix<f64, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         let points = cloud_points(table)?;
         let node_count = table.len();
@@ -236,14 +240,16 @@ where
         let tile = fu::SafePtr::new(scores.as_mut_ptr());
         let queries_ptr = fu::SyncConstPtr::new(&queries as *const nk::MatrixView<'_, Coordinate>);
         let failure = Mutex::new(None::<Error>);
-        let mut scratch = Vec::new();
-        scratch.resize(self.pool.threads_count(), ());
+        let threads = self.pool.threads_count();
+        while self.scratch.len() < threads {
+            self.scratch.push(());
+        }
 
         fu::fold_with_scratch(
             &mut self.pool,
             fu::ParallelRange::new(0..query_count),
             fu::DynamicScheduler,
-            scratch.as_mut_slice(),
+            self.scratch.as_mut_slice(),
             |_scratch, query_index, _prong| {
                 // SAFETY: the pointer targets a local held for the whole blocking
                 // fold and is only read; `node_clouds` is a shared read-only slice.
@@ -349,7 +355,7 @@ where
     fn score_nodes(
         &mut self,
         query: &[Coordinate],
-        table: &Table<impl AllocatorLike>,
+        table: TableView<'_>,
         nodes: &[Index],
         out: &mut [f64],
     ) -> Result<(), Error> {
@@ -376,11 +382,7 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(
-        &mut self,
-        query: &[Coordinate],
-        table: &Table<impl AllocatorLike>,
-    ) -> Result<(), Error> {
+    fn search(&mut self, query: &[Coordinate], table: TableView<'_>) -> Result<(), Error> {
         walk::<MeshMetric<Coordinate, Superpose>, Self>(self, query, table)
     }
 }
@@ -394,6 +396,7 @@ pub struct MeshSearch<Coordinate, Superpose, Allocator: AllocatorLike = Global> 
     workers: Workers<
         MeshSearcher<Coordinate, Superpose, u32, Allocator>,
         MeshSearcher<Coordinate, Superpose, u64, Allocator>,
+        Allocator,
     >,
     alloc: Allocator,
 }
@@ -431,13 +434,14 @@ where
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
+        let table = table.view();
         let threads = self.pool.threads_count();
         let expansion_factor = self.expansion_factor;
-        match table.neighbors_column().dtype {
+        match table.neighbors_dtype() {
             OffsetDType::U32 => {
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U32(build_workers(threads, || {
+                    self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
                         MeshSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -446,7 +450,7 @@ where
                 };
                 batch_search::<MeshMetric<Coordinate, Superpose>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -457,7 +461,7 @@ where
             OffsetDType::U64 => {
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U64(build_workers(threads, || {
+                    self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
                         MeshSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -466,7 +470,7 @@ where
                 };
                 batch_search::<MeshMetric<Coordinate, Superpose>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -540,7 +544,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> RotationalMeshScannerAny<Al
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let points = cloud_points(table)?;
+        let points = cloud_points(table.view())?;
         match self {
             RotationalMeshScannerAny::F64(s) => s.scan(
                 view(queries_bytes, points)?,
@@ -632,7 +636,7 @@ impl<Allocator: AllocatorLike + Clone + Send> RotationalMeshSearchAny<Allocator>
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let points = cloud_points(table)?;
+        let points = cloud_points(table.view())?;
         match self {
             RotationalMeshSearchAny::F64(s) => s.search(
                 view(queries_bytes, points)?,
@@ -680,7 +684,7 @@ fn view<Coordinate: nk::StorageElement>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NeighborList, Shape};
+    use crate::{GraphLike, NeighborList, Shape};
 
     /// Three point clouds of `points = 3`, plus a query. Node 1 is the query
     /// exactly (RMSD 0), node 0 is it shifted +5 on x (RMSD 5), node 2 shifted

@@ -21,7 +21,7 @@ use super::{
     walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
     TraversalContext,
 };
-use crate::{cast, Error, GraphLike, IndexLike, OffsetDType, Table, Widen};
+use crate::{cast, Error, IndexLike, OffsetDType, Table, TableView, Widen};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use core::cmp::Ordering;
 use forkunion as fu;
@@ -67,7 +67,7 @@ where
 /// logical elements. The byte buffer reinterprets as packed storage scalars, which
 /// [`matrix_view`] then unpacks by shape.
 pub(crate) fn value_view<Value>(
-    table: &Table<impl AllocatorLike>,
+    table: TableView<'_>,
     width: usize,
 ) -> Result<nk::MatrixView<'_, Value>, Error>
 where
@@ -82,10 +82,11 @@ where
 pub struct DotScanner<Value: nk::Dots + nk::Dot, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     packed: nk::DotsPackedMatrix<Value, Allocator>,
-    tile: Matrix<<Value as nk::Dot>::Output>,
+    tile: Matrix<<Value as nk::Dot>::Output, Allocator>,
+    alloc: Allocator,
 }
 
-impl<Value: nk::Dots + nk::Dot, Allocator: AllocatorLike> DotScanner<Value, Allocator> {
+impl<Value: nk::Dots + nk::Dot, Allocator: AllocatorLike + Clone> DotScanner<Value, Allocator> {
     /// A scanner over the workers `scope` names, the caller included, on a pool
     /// it builds and owns, its packed query in `alloc` — NumKong bridges every
     /// `allocator_api2` allocator into its own trait, so no adapter appears
@@ -97,8 +98,9 @@ impl<Value: nk::Dots + nk::Dot, Allocator: AllocatorLike> DotScanner<Value, Allo
         nk::capabilities::configure_thread();
         Ok(DotScanner {
             pool: open_pool(scope)?,
-            packed: nk::DotsPackedMatrix::empty_in(alloc),
-            tile: Matrix::empty(),
+            packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
+            tile: Matrix::empty_in(alloc.clone()),
+            alloc,
         })
     }
 }
@@ -127,7 +129,7 @@ where
 
 impl<Value, Allocator> DotScanner<Value, Allocator>
 where
-    Allocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
     Value: nk::Dot + nk::Dots + 'static,
     <Value as nk::Dot>::Output: Copy + Default + PartialOrd + Widen,
     DotScanner<Value, Allocator>: ScannerLike<DotMetric<Value>>,
@@ -142,7 +144,8 @@ where
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let mut tile = std::mem::take(&mut self.tile);
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
         let outcome = batch_scan::<DotMetric<Value>, _>(
             self,
             queries,
@@ -213,7 +216,7 @@ where
 
 impl<Metric, Value, Allocator> ScannerLike<Metric> for DotScanner<Value, Allocator>
 where
-    Allocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
     Value: nk::Dots
         + nk::Dot<Output = <Value as nk::Dots>::Accumulator>
         + Clone
@@ -227,8 +230,8 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: &Table<impl AllocatorLike>,
-        scores: &mut Matrix<Metric::Score>,
+        table: TableView<'_>,
+        scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
@@ -285,7 +288,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: &Table<impl AllocatorLike>,
+        table: TableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -309,11 +312,7 @@ where
         Ranking::Farthest.compare(a, b)
     }
 
-    fn search(
-        &mut self,
-        query: Metric::Query<'_>,
-        table: &Table<impl AllocatorLike>,
-    ) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
@@ -329,7 +328,8 @@ where
 pub struct DotSearch<Value: nk::Dot, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
-    workers: Workers<DotSearcher<Value, u32, Allocator>, DotSearcher<Value, u64, Allocator>>,
+    workers:
+        Workers<DotSearcher<Value, u32, Allocator>, DotSearcher<Value, u64, Allocator>, Allocator>,
     alloc: Allocator,
 }
 
@@ -370,13 +370,14 @@ where
         DotSearcher<Value, u32, Allocator>: SearcherLike<DotMetric<Value>, Index = u32> + Send,
         DotSearcher<Value, u64, Allocator>: SearcherLike<DotMetric<Value>, Index = u64> + Send,
     {
+        let table = table.view();
         let threads = self.pool.threads_count();
         let expansion_factor = self.expansion_factor;
-        match table.neighbors_column().dtype {
+        match table.neighbors_dtype() {
             OffsetDType::U32 => {
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U32(build_workers(threads, || {
+                    self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
                         DotSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -385,7 +386,7 @@ where
                 };
                 batch_search::<DotMetric<Value>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -396,7 +397,7 @@ where
             OffsetDType::U64 => {
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U64(build_workers(threads, || {
+                    self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
                         DotSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -405,7 +406,7 @@ where
                 };
                 batch_search::<DotMetric<Value>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -423,25 +424,29 @@ where
 pub struct EuclideanScanner<Value: nk::Dots + nk::Euclidean, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     packed: nk::DotsPackedMatrix<Value, Allocator>,
-    tile: Matrix<<Value as nk::Euclidean>::EuclideanOutput>,
+    tile: Matrix<<Value as nk::Euclidean>::EuclideanOutput, Allocator>,
+    alloc: Allocator,
 }
 
-impl<Value: nk::Dots + nk::Euclidean, Allocator: AllocatorLike> EuclideanScanner<Value, Allocator> {
+impl<Value: nk::Dots + nk::Euclidean, Allocator: AllocatorLike + Clone>
+    EuclideanScanner<Value, Allocator>
+{
     /// A scanner over the workers `scope` names, its packed query in `alloc`,
     /// uniform with [`DotScanner::new`].
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(EuclideanScanner {
             pool: open_pool(scope)?,
-            packed: nk::DotsPackedMatrix::empty_in(alloc),
-            tile: Matrix::empty(),
+            packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
+            tile: Matrix::empty_in(alloc.clone()),
+            alloc,
         })
     }
 }
 
 impl<Value, Allocator> EuclideanScanner<Value, Allocator>
 where
-    Allocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
     Value: nk::Euclidean + nk::Euclideans + 'static,
     <Value as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd + Widen,
     EuclideanScanner<Value, Allocator>: ScannerLike<EuclideanMetric<Value>>,
@@ -455,7 +460,8 @@ where
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let mut tile = std::mem::take(&mut self.tile);
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
         let outcome = batch_scan::<EuclideanMetric<Value>, _>(
             self,
             queries,
@@ -515,7 +521,7 @@ where
 
 impl<Metric, Value, Allocator> ScannerLike<Metric> for EuclideanScanner<Value, Allocator>
 where
-    Allocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
     Value: nk::Euclideans + nk::Euclidean + nk::Dots + Clone + Send + Sync + 'static,
     <Value as nk::Euclideans>::SpatialResult: Send + Sync,
     Metric: MetricLike<Score = <Value as nk::Euclideans>::SpatialResult> + ?Sized,
@@ -524,8 +530,8 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: &Table<impl AllocatorLike>,
-        scores: &mut Matrix<Metric::Score>,
+        table: TableView<'_>,
+        scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
@@ -581,7 +587,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: &Table<impl AllocatorLike>,
+        table: TableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -607,11 +613,7 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(
-        &mut self,
-        query: Metric::Query<'_>,
-        table: &Table<impl AllocatorLike>,
-    ) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
@@ -621,8 +623,11 @@ where
 pub struct EuclideanSearch<Value: nk::Euclidean, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
-    workers:
-        Workers<EuclideanSearcher<Value, u32, Allocator>, EuclideanSearcher<Value, u64, Allocator>>,
+    workers: Workers<
+        EuclideanSearcher<Value, u32, Allocator>,
+        EuclideanSearcher<Value, u64, Allocator>,
+        Allocator,
+    >,
     alloc: Allocator,
 }
 
@@ -664,13 +669,14 @@ where
         EuclideanSearcher<Value, u64, Allocator>:
             SearcherLike<EuclideanMetric<Value>, Index = u64> + Send,
     {
+        let table = table.view();
         let threads = self.pool.threads_count();
         let expansion_factor = self.expansion_factor;
-        match table.neighbors_column().dtype {
+        match table.neighbors_dtype() {
             OffsetDType::U32 => {
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U32(build_workers(threads, || {
+                    self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
                         EuclideanSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -679,7 +685,7 @@ where
                 };
                 batch_search::<EuclideanMetric<Value>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -690,7 +696,7 @@ where
             OffsetDType::U64 => {
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U64(build_workers(threads, || {
+                    self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
                         EuclideanSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -699,7 +705,7 @@ where
                 };
                 batch_search::<EuclideanMetric<Value>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -717,25 +723,29 @@ where
 pub struct AngularScanner<Value: nk::Dots + nk::Angular, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     packed: nk::DotsPackedMatrix<Value, Allocator>,
-    tile: Matrix<<Value as nk::Angular>::Output>,
+    tile: Matrix<<Value as nk::Angular>::Output, Allocator>,
+    alloc: Allocator,
 }
 
-impl<Value: nk::Dots + nk::Angular, Allocator: AllocatorLike> AngularScanner<Value, Allocator> {
+impl<Value: nk::Dots + nk::Angular, Allocator: AllocatorLike + Clone>
+    AngularScanner<Value, Allocator>
+{
     /// A scanner over the workers `scope` names, its packed query in `alloc`,
     /// uniform with [`DotScanner::new`].
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
         Ok(AngularScanner {
             pool: open_pool(scope)?,
-            packed: nk::DotsPackedMatrix::empty_in(alloc),
-            tile: Matrix::empty(),
+            packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
+            tile: Matrix::empty_in(alloc.clone()),
+            alloc,
         })
     }
 }
 
 impl<Value, Allocator> AngularScanner<Value, Allocator>
 where
-    Allocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
     Value: nk::Angular + nk::Angulars + 'static,
     <Value as nk::Angular>::Output: Copy + Default + PartialOrd + Widen,
     AngularScanner<Value, Allocator>: ScannerLike<AngularMetric<Value>>,
@@ -749,7 +759,8 @@ where
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
-        let mut tile = std::mem::take(&mut self.tile);
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
         let outcome = batch_scan::<AngularMetric<Value>, _>(
             self,
             queries,
@@ -809,7 +820,7 @@ where
 
 impl<Metric, Value, Allocator> ScannerLike<Metric> for AngularScanner<Value, Allocator>
 where
-    Allocator: AllocatorLike,
+    Allocator: AllocatorLike + Clone,
     Value: nk::Angulars + nk::Angular + nk::Dots + Clone + Send + Sync + 'static,
     <Value as nk::Angulars>::SpatialResult: Send + Sync,
     Metric: MetricLike<Score = <Value as nk::Angulars>::SpatialResult> + ?Sized,
@@ -818,8 +829,8 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: &Table<impl AllocatorLike>,
-        scores: &mut Matrix<Metric::Score>,
+        table: TableView<'_>,
+        scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
@@ -874,7 +885,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: &Table<impl AllocatorLike>,
+        table: TableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -898,11 +909,7 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(
-        &mut self,
-        query: Metric::Query<'_>,
-        table: &Table<impl AllocatorLike>,
-    ) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
@@ -912,8 +919,11 @@ where
 pub struct AngularSearch<Value: nk::Angular, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
-    workers:
-        Workers<AngularSearcher<Value, u32, Allocator>, AngularSearcher<Value, u64, Allocator>>,
+    workers: Workers<
+        AngularSearcher<Value, u32, Allocator>,
+        AngularSearcher<Value, u64, Allocator>,
+        Allocator,
+    >,
     alloc: Allocator,
 }
 
@@ -955,13 +965,14 @@ where
         AngularSearcher<Value, u64, Allocator>:
             SearcherLike<AngularMetric<Value>, Index = u64> + Send,
     {
+        let table = table.view();
         let threads = self.pool.threads_count();
         let expansion_factor = self.expansion_factor;
-        match table.neighbors_column().dtype {
+        match table.neighbors_dtype() {
             OffsetDType::U32 => {
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U32(build_workers(threads, || {
+                    self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
                         AngularSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -970,7 +981,7 @@ where
                 };
                 batch_search::<AngularMetric<Value>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -981,7 +992,7 @@ where
             OffsetDType::U64 => {
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U64(build_workers(threads, || {
+                    self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
                         AngularSearcher::new(expansion_factor, alloc.clone())
                     })?);
                 }
@@ -990,7 +1001,7 @@ where
                 };
                 batch_search::<AngularMetric<Value>, _>(
                     &mut self.pool,
-                    workers,
+                    workers.as_mut_slice(),
                     queries,
                     table,
                     matches,
@@ -1007,7 +1018,7 @@ where
 /// `*Any` hands to its typed scanner or searcher.
 pub(crate) fn view_from_bytes<'q, Value: nk::StorageElement>(
     queries: &'q [u8],
-    table: &Table<impl AllocatorLike>,
+    table: TableView<'_>,
 ) -> Result<nk::MatrixView<'q, Value>, Error> {
     let width = table.value_width().ok_or(Error::Inconsistent)?;
     matrix_view(cast(queries).ok_or(Error::WrongType)?, width)
@@ -1090,91 +1101,91 @@ impl<Allocator: AllocatorLike + Clone> DotScannerAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             DotScannerAny::F64(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::F32(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::Bf16(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::F16(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::E5M2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::E4M3(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::E3M2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::E2M3(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::I8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::I4x2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::U8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::U4x2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotScannerAny::U1x8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
@@ -1264,91 +1275,91 @@ impl<Allocator: AllocatorLike + Clone + Send> DotSearcherAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             DotSearcherAny::F64(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::F32(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::Bf16(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::F16(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::E5M2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::E4M3(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::E3M2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::E2M3(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::I8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::I4x2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::U8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::U4x2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             DotSearcherAny::U1x8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
@@ -1421,84 +1432,84 @@ impl<Allocator: AllocatorLike + Clone> EuclideanScannerAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             EuclideanScannerAny::F64(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::F32(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::Bf16(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::F16(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::E5M2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::E4M3(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::E3M2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::E2M3(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::I8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::I4x2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::U8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanScannerAny::U4x2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
@@ -1624,84 +1635,84 @@ impl<Allocator: AllocatorLike + Clone + Send> EuclideanSearcherAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             EuclideanSearcherAny::F64(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::F32(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::Bf16(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::F16(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::E5M2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::E4M3(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::E3M2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::E2M3(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::I8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::I4x2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::U8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             EuclideanSearcherAny::U4x2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
@@ -1774,84 +1785,84 @@ impl<Allocator: AllocatorLike + Clone> AngularScannerAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             AngularScannerAny::F64(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::F32(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::Bf16(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::F16(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::E5M2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::E4M3(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::E3M2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::E2M3(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::I8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::I4x2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::U8(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularScannerAny::U4x2(s) => s.scan(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
@@ -1967,84 +1978,84 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             AngularSearcherAny::F64(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::F32(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::Bf16(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::F16(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::E5M2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::E4M3(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::E3M2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::E2M3(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::I8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::I4x2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::U8(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
             AngularSearcherAny::U4x2(s) => s.search(
-                view_from_bytes(queries, table)?,
+                view_from_bytes(queries, table.view())?,
                 table,
                 matches,
                 distances,
@@ -2057,7 +2068,7 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NeighborList, OffsetDType, Shape};
+    use crate::{GraphLike, NeighborList, OffsetDType, Shape};
 
     /// Three nodes whose values are held in dtype `T` in a NumKong matrix, so one
     /// fixture serves every scalar — float, minifloat, integer, nibble, or packed
@@ -2737,7 +2748,7 @@ mod tests {
             <DotSearcher<i8, u64> as SearcherLike<DotMetric<i8>>>::search(
                 &mut searcher,
                 &query,
-                &table,
+                table.view(),
             ),
             Err(Error::WrongType)
         ));

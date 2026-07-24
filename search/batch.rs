@@ -17,8 +17,9 @@
 use super::{
     ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
 };
-use crate::{Error, GraphLike, Table, Widen};
-use allocator_api2::alloc::Allocator as AllocatorLike;
+use crate::{Error, TableView, Widen};
+use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
+use allocator_api2::vec::Vec as AVec;
 use forkunion as fu;
 use std::sync::OnceLock;
 
@@ -29,7 +30,7 @@ use std::sync::OnceLock;
 /// Returns the count found. Widening is monotonic, so ranking the widened scores is
 /// the native order. The shared tail of every batch scan.
 pub(crate) fn select_top_k<Score: Copy + Default + Widen>(
-    tile: &Matrix<Score>,
+    tile: &Matrix<Score, impl AllocatorLike + Clone>,
     col: usize,
     rows: usize,
     ranking: Ranking,
@@ -108,9 +109,9 @@ fn batch_shape(
 pub(crate) fn batch_scan<Metric, Scanner>(
     scanner: &mut Scanner,
     queries: Metric::Queries<'_>,
-    table: &Table<impl AllocatorLike>,
+    table: TableView<'_>,
     ranking: Ranking,
-    tile: &mut Matrix<Metric::Score>,
+    tile: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     matches: &mut Matrix<u64>,
     distances: &mut Matrix<f64>,
     counts: &mut [u64],
@@ -157,11 +158,12 @@ pub(crate) fn open_pool(scope: ExecutionScope) -> Result<fu::ThreadPool, Error> 
 
 /// Build `count` searchers from a fallible constructor, reserving up front so the
 /// whole set of per-thread contexts is either allocated or the batch fails cleanly.
-pub(crate) fn build_workers<Searcher>(
+pub(crate) fn build_workers<Searcher, Allocator: AllocatorLike>(
     count: usize,
+    alloc: Allocator,
     mut make: impl FnMut() -> Result<Searcher, Error>,
-) -> Result<Vec<Searcher>, Error> {
-    let mut workers = Vec::new();
+) -> Result<AVec<Searcher, Allocator>, Error> {
+    let mut workers = AVec::new_in(alloc);
     workers.try_reserve_exact(count).map_err(|_| Error::Alloc)?;
     for _ in 0..count {
         workers.push(make()?);
@@ -175,10 +177,10 @@ pub(crate) fn build_workers<Searcher>(
 /// so the lane starts [`Unresolved`](Workers::Unresolved); the first searched
 /// table settles it, and a table of the other width rebuilds it — cheap, since
 /// a leaf's scratch is empty until its first walk.
-pub(crate) enum Workers<Narrow, Wide> {
+pub(crate) enum Workers<Narrow, Wide, Allocator: AllocatorLike = Global> {
     Unresolved,
-    U32(Vec<Narrow>),
-    U64(Vec<Wide>),
+    U32(AVec<Narrow, Allocator>),
+    U64(AVec<Wide, Allocator>),
 }
 
 /// A read-only reference shareable across a fold's threads.
@@ -219,7 +221,7 @@ fn walk_one<Metric, Searcher>(
     worker: &mut Searcher,
     queries: &Metric::Queries<'_>,
     query_index: usize,
-    table: &Table<impl AllocatorLike>,
+    table: TableView<'_>,
     sink: &Sink,
 ) -> Result<(), Error>
 where
@@ -271,7 +273,7 @@ pub(crate) fn batch_search<Metric, Searcher>(
     pool: &mut fu::ThreadPool,
     workers: &mut [Searcher],
     queries: Metric::Queries<'_>,
-    table: &Table<impl AllocatorLike>,
+    table: TableView<'_>,
     matches: &mut Matrix<u64>,
     distances: &mut Matrix<f64>,
     counts: &mut [u64],
@@ -286,12 +288,11 @@ where
     batch_shape(query_count, matches, distances, counts)?;
 
     let sink = sink_over(matches, distances, counts);
-    // The query batch and the table are immutable for the whole blocking fold and
-    // only read by the tasks. The `impl Allocator` behind the table is not declared
-    // `Sync`, so share both through the read-only wrapper below rather than
-    // cascading a `Sync` bound up every signature.
+    // The query batch is immutable for the whole blocking fold and only read by
+    // the tasks; its backend view types declare no `Sync`, so it rides the
+    // read-only wrapper. The table needs nothing: a [`TableView`] is `Copy` and
+    // `Sync` by construction, so the closure just captures it.
     let queries_shared = ShareRead(&queries);
-    let table_shared = ShareRead(table);
     let failure = OnceLock::new();
 
     fu::fold_with_scratch(
@@ -304,7 +305,7 @@ where
                 worker,
                 queries_shared.read(),
                 query_index,
-                table_shared.read(),
+                table,
                 &sink,
             ) {
                 let _ = failure.set(error);
@@ -327,7 +328,7 @@ where
 pub(crate) fn batch_search_serial<Metric, Searcher>(
     worker: &mut Searcher,
     queries: Metric::Queries<'_>,
-    table: &Table<impl AllocatorLike>,
+    table: TableView<'_>,
     matches: &mut Matrix<u64>,
     distances: &mut Matrix<f64>,
     counts: &mut [u64],

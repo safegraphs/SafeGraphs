@@ -19,7 +19,7 @@ use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
 
-use crate::{Error, GraphLike, IndexLike};
+use crate::{Error, IndexLike};
 
 /// Where a functor's kernels run, and how wide — the single parallelism knob
 /// that crosses the API. Every functor's one constructor takes one of these;
@@ -603,8 +603,8 @@ pub trait ScannerLike<Metric: MetricLike + ?Sized> {
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: &crate::Table<impl AllocatorLike>,
-        scores: &mut Matrix<Metric::Score>,
+        table: crate::TableView<'_>,
+        scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error>;
 }
 
@@ -629,7 +629,7 @@ pub trait SearcherLike<Metric: MetricLike + ?Sized> {
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: &crate::Table<impl AllocatorLike>,
+        table: crate::TableView<'_>,
         nodes: &[Self::Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error>;
@@ -647,7 +647,7 @@ pub trait SearcherLike<Metric: MetricLike + ?Sized> {
     fn search(
         &mut self,
         query: Metric::Query<'_>,
-        table: &crate::Table<impl AllocatorLike>,
+        table: crate::TableView<'_>,
     ) -> Result<(), Error>;
 }
 
@@ -672,7 +672,7 @@ pub trait SearcherLike<Metric: MetricLike + ?Sized> {
 pub fn walk<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
-    table: &crate::Table<impl AllocatorLike>,
+    table: crate::TableView<'_>,
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
@@ -691,7 +691,7 @@ where
 fn walk_staged<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
-    table: &crate::Table<impl AllocatorLike>,
+    table: crate::TableView<'_>,
     staged: &mut AVec<Score::Index, impl AllocatorLike>,
     scores: &mut AVec<Metric::Score, impl AllocatorLike>,
 ) -> Result<(), Error>
@@ -862,7 +862,7 @@ where
 fn admit<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
-    table: &crate::Table<impl AllocatorLike>,
+    table: crate::TableView<'_>,
     staged: &AVec<Score::Index, impl AllocatorLike>,
     scores: &mut AVec<Metric::Score, impl AllocatorLike>,
     expansion_factor: usize,
@@ -924,7 +924,7 @@ where
 /// query, so `out[query * k + rank]` is that query's `rank`-th best node. The
 /// shared ranking every [`ScannerLike::scan`] is finished with.
 pub fn rank_tile<Index: IndexLike, Score: Copy + Default>(
-    scores: &Matrix<Score>,
+    scores: &Matrix<Score, impl AllocatorLike + Clone>,
     k: usize,
     compare: impl Fn(Score, Score) -> Ordering,
     out: &mut [Match<Index, Score>],

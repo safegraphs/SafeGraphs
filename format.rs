@@ -573,6 +573,206 @@ impl<Allocator: AllocatorLike + Clone> Table<Allocator> {
     }
 }
 
+/// The query-time read surface of a [`Table`], detached from its owner: the
+/// mapped bytes plus the three `Copy` column descriptors and the header's dtype
+/// strings, pre-extracted. `Copy + Send + Sync` by construction — a parallel
+/// fold's tasks capture it directly, and the allocator behind the owning table
+/// never appears — so the search layer speaks this type and stays free of both
+/// the allocator generic and any unsafe shareability assertion.
+#[derive(Clone, Copy)]
+pub struct TableView<'t> {
+    /// The complete file image; every [`ByteRange`] is relative to `data_start`.
+    bytes: &'t [u8],
+    data_start: usize,
+    key: Column<StorageDType>,
+    value: Column<StorageDType>,
+    neighbors: Column<OffsetDType>,
+    /// The header dtype strings, which the `Copy` descriptors cannot recover —
+    /// `f16`, `bf16`, and `u16` all collapse to one storage width.
+    key_dtype: &'t str,
+    value_dtype: &'t str,
+}
+
+impl<'t> TableView<'t> {
+    /// Number of nodes.
+    pub fn len(&self) -> usize {
+        self.key.len()
+    }
+
+    /// True when there are no nodes.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The value column's logical [`Shape`].
+    pub fn value_shape(&self) -> Option<Shape> {
+        Some(self.value.shape)
+    }
+
+    /// The value column's flat element width, for the rank-1 families.
+    pub fn value_width(&self) -> Option<usize> {
+        self.value_shape().and_then(Shape::width)
+    }
+
+    /// The neighbors column's fixed out-degree, or `None` if variable.
+    pub fn neighbors_degree(&self) -> Option<usize> {
+        match self.neighbors.layout {
+            ColumnLayout::Regular { width } => Some(width),
+            ColumnLayout::Irregular { .. } => None,
+        }
+    }
+
+    /// The neighbor index width, for a width resolver settling its lane.
+    pub fn neighbors_dtype(&self) -> OffsetDType {
+        self.neighbors.dtype
+    }
+
+    /// The mean out-degree, the walk's landmark budget.
+    pub fn mean_degree(&self) -> usize {
+        let nodes = self.len();
+        if nodes == 0 {
+            return 0;
+        }
+        let entries = self.neighbors.values.len / self.neighbors.dtype.size();
+        entries / nodes
+    }
+
+    /// Raw bytes of node `node`'s key.
+    pub fn key(&self, node: usize) -> &'t [u8] {
+        self.node_bytes(&self.key, node).unwrap_or(&[])
+    }
+
+    /// Raw bytes of node `node`'s value.
+    pub fn value(&self, node: usize) -> &'t [u8] {
+        self.node_bytes(&self.value, node).unwrap_or(&[])
+    }
+
+    /// Node `node`'s outgoing edges.
+    pub fn neighbors(&self, node: usize) -> NeighborList<'t> {
+        NeighborList::new(
+            self.node_bytes(&self.neighbors, node).unwrap_or(&[]),
+            self.neighbors.dtype,
+        )
+    }
+
+    /// The whole value buffer, contiguous, for a batch scan over a regular
+    /// column.
+    pub fn value_buffer(&self) -> &'t [u8] {
+        self.buffer(self.value.values)
+    }
+
+    /// The value column's prefix-sum buffer and its width, or `None` when the
+    /// column is regular and has no offsets at all.
+    pub fn value_offsets(&self) -> Option<(&'t [u8], OffsetDType)> {
+        match self.value.layout {
+            ColumnLayout::Regular { .. } => None,
+            ColumnLayout::Irregular { offsets } => {
+                Some((self.buffer(offsets.range), offsets.dtype))
+            }
+        }
+    }
+
+    /// The node whose key equals `key` byte-for-byte, by linear scan.
+    pub fn find_key(&self, key: &[u8]) -> Option<usize> {
+        (0..self.len()).find(|&node| self.node_bytes(&self.key, node) == Some(key))
+    }
+
+    /// Slice a validated buffer out of the data segment. Relies on the open-time
+    /// invariant that every stored `ByteRange` lies within the map, and degrades
+    /// to an empty slice rather than panicking if that were ever violated.
+    fn buffer(&self, range: ByteRange) -> &'t [u8] {
+        let start = self.data_start.wrapping_add(range.start);
+        let end = start.wrapping_add(range.len);
+        self.bytes.get(start..end).unwrap_or(&[])
+    }
+
+    /// Slice `len` bytes at `offset` within a column's values buffer, checking the
+    /// sub-range stays inside it.
+    fn subslice(&self, values: ByteRange, offset: usize, len: usize) -> Option<&'t [u8]> {
+        if offset.checked_add(len)? > values.len {
+            return None;
+        }
+        Some(self.buffer(ByteRange {
+            start: values.start.checked_add(offset)?,
+            len,
+        }))
+    }
+
+    /// The `[begin, end)` element indices of node `node` in an irregular column,
+    /// read from its prefix-sum buffer and checked monotonic.
+    fn node_span(&self, offsets: IrregularOffsets, node: usize) -> Option<(usize, usize)> {
+        let element_size = offsets.dtype.size();
+        let offset_bytes = self.buffer(offsets.range);
+        let read = |i: usize| -> Option<usize> {
+            let slot = offset_bytes.get(
+                i.checked_mul(element_size)?
+                    ..i.checked_mul(element_size)?.checked_add(element_size)?,
+            )?;
+            match offsets.dtype {
+                OffsetDType::U32 => Some(u32::from_le_bytes(slot.try_into().ok()?) as usize),
+                OffsetDType::U64 => to_usize(u64::from_le_bytes(slot.try_into().ok()?)).ok(),
+            }
+        };
+        let begin = read(node)?;
+        let end = read(node.checked_add(1)?)?;
+        if begin > end {
+            None
+        } else {
+            Some((begin, end))
+        }
+    }
+
+    /// Raw bytes of node `node` in any column, regular or irregular.
+    fn node_bytes<Element: ElementLike>(
+        &self,
+        column: &Column<Element>,
+        node: usize,
+    ) -> Option<&'t [u8]> {
+        match column.layout {
+            ColumnLayout::Regular { width } => {
+                let per = column.dtype.row_bytes(width);
+                self.subslice(column.values, node.checked_mul(per)?, per)
+            }
+            ColumnLayout::Irregular { offsets } => {
+                let element_size = column.dtype.size();
+                let (begin, end) = self.node_span(offsets, node)?;
+                let offset = begin.checked_mul(element_size)?;
+                let len = end.checked_sub(begin)?.checked_mul(element_size)?;
+                self.subslice(column.values, offset, len)
+            }
+        }
+    }
+}
+
+/// A view is a [`GraphLike`] too, so anything a producer's graph can do — a
+/// rebuild through [`Table::build`] included — a borrowed view can.
+impl GraphLike for TableView<'_> {
+    fn len(&self) -> usize {
+        TableView::len(self)
+    }
+    fn key_dtype(&self) -> &str {
+        self.key_dtype
+    }
+    fn value_dtype(&self) -> &str {
+        self.value_dtype
+    }
+    fn value_shape(&self) -> Option<Shape> {
+        TableView::value_shape(self)
+    }
+    fn neighbors_degree(&self) -> Option<usize> {
+        TableView::neighbors_degree(self)
+    }
+    fn key(&self, node: usize) -> &[u8] {
+        TableView::key(self, node)
+    }
+    fn value(&self, node: usize) -> &[u8] {
+        TableView::value(self, node)
+    }
+    fn neighbors(&self, node: usize) -> NeighborList<'_> {
+        TableView::neighbors(self, node)
+    }
+}
+
 impl<Allocator: AllocatorLike> Table<Allocator> {
     /// The bytes behind the file, mapped or in-memory.
     fn bytes(&self) -> &[u8] {
@@ -629,6 +829,31 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
 
     pub fn neighbors_column(&self) -> &Column<OffsetDType> {
         &self.neighbors
+    }
+
+    /// Borrow the query-time read surface as a [`TableView`] — `Copy`, `Send`,
+    /// and `Sync` regardless of this table's allocator, so parallel code takes
+    /// the view and the owner stays behind.
+    pub fn view(&self) -> TableView<'_> {
+        TableView {
+            key_dtype: self.dtype_name("key").unwrap_or(""),
+            value_dtype: self.dtype_name("value").unwrap_or(""),
+            ..self.columns_view()
+        }
+    }
+
+    /// The data-only view the table's own accessors delegate through — no
+    /// header lookups, so per-node delegation costs nothing.
+    fn columns_view(&self) -> TableView<'_> {
+        TableView {
+            bytes: self.bytes(),
+            data_start: self.data_start,
+            key: self.key,
+            value: self.value,
+            neighbors: self.neighbors,
+            key_dtype: "",
+            value_dtype: "",
+        }
     }
 
     /// The mean out-degree: total neighbor entries divided by node count. For a
@@ -1110,11 +1335,21 @@ fn write_column<Allocator: AllocatorLike>(
 ) {
     header.push_str(&format!(",\"{name}\":{{\"dtype\":\"{dtype}\""));
     match off_start {
-        Some(off) => header.push_str(&format!(
-            ",\"offsets_dtype\":\"u64\",\"offsets_start\":{},\"offsets_length\":{}",
-            off,
-            column.offsets.len()
-        )),
+        // An irregular column carries its prefix sums — and, when its logical
+        // shape is a ragged `Matrix`, that shape too, or a reader would parse
+        // the column back as `Scalar` and lose the fixed inner axis. A plain
+        // irregular sequence stays shapeless: absent means `Scalar`, so old
+        // files and new writers agree byte for byte.
+        Some(off) => {
+            header.push_str(&format!(
+                ",\"offsets_dtype\":\"u64\",\"offsets_start\":{},\"offsets_length\":{}",
+                off,
+                column.offsets.len()
+            ));
+            if let Shape::Matrix(rows, cols) = shape {
+                header.push_str(&format!(",\"shape\":[{rows},{cols}]"));
+            }
+        }
         // A `Matrix` row serializes both axes so the reader recovers the logical
         // shape, not just the flat byte width; everything else is a scalar width.
         None => match shape {
