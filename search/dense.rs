@@ -195,11 +195,6 @@ where
     }
 }
 
-/// Higher score ranks first, and a NaN sinks rather than poisoning the order.
-fn larger_first<Score: PartialOrd>(a: Score, b: Score) -> Ordering {
-    a.partial_cmp(&b).unwrap_or(Ordering::Less)
-}
-
 /// Inner-product similarity over any NumKong scalar, accumulated in that scalar's
 /// native dot output — `i32` for `i8`, `u32` for `u8`, `f64` for `f32`, `f32` for
 /// every half and minifloat. One generic marker replaces a struct per dtype: the
@@ -237,7 +232,7 @@ where
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
-        let width = table.value_shape().ok_or(Error::Inconsistent)?;
+        let width = table.value_width().ok_or(Error::Inconsistent)?;
         let query_view: nk::MatrixView<Value> = queries.into();
         let values = value_view::<Value>(table, width)?;
 
@@ -311,7 +306,7 @@ where
     }
 
     fn compare(a: Metric::Score, b: Metric::Score) -> Ordering {
-        larger_first(a, b)
+        Ranking::Farthest.compare(a, b)
     }
 
     fn search(
@@ -420,11 +415,6 @@ where
             }
         }
     }
-}
-
-/// Smaller distance ranks first; a NaN sinks rather than poisoning the order.
-fn smaller_first<Score: PartialOrd>(a: Score, b: Score) -> Ordering {
-    b.partial_cmp(&a).unwrap_or(Ordering::Less)
 }
 
 /// The batch half of every Euclidean metric. Same shape as [`DotScanner`] — a
@@ -539,7 +529,7 @@ where
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
-        let width = table.value_shape().ok_or(Error::Inconsistent)?;
+        let width = table.value_width().ok_or(Error::Inconsistent)?;
         let query_view: nk::MatrixView<Value> = queries.into();
         let values = value_view::<Value>(table, width)?;
 
@@ -614,7 +604,7 @@ where
     }
 
     fn compare(a: Metric::Score, b: Metric::Score) -> Ordering {
-        smaller_first(a, b)
+        Ranking::Nearest.compare(a, b)
     }
 
     fn search(
@@ -833,7 +823,7 @@ where
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
-        let width = table.value_shape().ok_or(Error::Inconsistent)?;
+        let width = table.value_width().ok_or(Error::Inconsistent)?;
         let query_view: nk::MatrixView<Value> = queries.into();
         let values = value_view::<Value>(table, width)?;
 
@@ -905,7 +895,7 @@ where
     }
 
     fn compare(a: Metric::Score, b: Metric::Score) -> Ordering {
-        smaller_first(a, b)
+        Ranking::Nearest.compare(a, b)
     }
 
     fn search(
@@ -1019,7 +1009,7 @@ pub(crate) fn view_from_bytes<'q, Value: nk::StorageElement>(
     queries: &'q [u8],
     table: &Table<impl AllocatorLike>,
 ) -> Result<nk::MatrixView<'q, Value>, Error> {
-    let width = table.value_shape().ok_or(Error::Inconsistent)?;
+    let width = table.value_width().ok_or(Error::Inconsistent)?;
     matrix_view(cast(queries).ok_or(Error::WrongType)?, width)
 }
 
@@ -2067,7 +2057,7 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NeighborList, OffsetDType};
+    use crate::{NeighborList, OffsetDType, Shape};
 
     /// Three nodes whose values are held in dtype `T` in a NumKong matrix, so one
     /// fixture serves every scalar — float, minifloat, integer, nibble, or packed
@@ -2127,9 +2117,9 @@ mod tests {
         fn value_dtype(&self) -> &str {
             self.dtype
         }
-        fn value_shape(&self) -> Option<usize> {
+        fn value_shape(&self) -> Option<Shape> {
             // The logical column count the matrix already knows.
-            Some(self.values.shape()[1])
+            Some(Shape::Vector(self.values.shape()[1]))
         }
         fn neighbors_degree(&self) -> Option<usize> {
             Some(self.degree)
@@ -2569,8 +2559,8 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "i8"
         }
-        fn value_shape(&self) -> Option<usize> {
-            Some(2)
+        fn value_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(2))
         }
         fn neighbors_degree(&self) -> Option<usize> {
             Some(2)
@@ -2850,8 +2840,8 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "i8"
         }
-        fn value_shape(&self) -> Option<usize> {
-            Some(2)
+        fn value_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(2))
         }
         fn neighbors_degree(&self) -> Option<usize> {
             Some(3)

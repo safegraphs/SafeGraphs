@@ -179,13 +179,66 @@ pub struct IrregularOffsets {
 }
 
 /// How a column's rows sit in its values buffer. Regular or irregular, never
-/// both.
+/// both. This is the __byte layout__; the __logical shape__ a metric reads is
+/// [`Shape`], carried separately so a regular `points × 3` cloud and a ragged
+/// `[*, dim]` multi-vector each state their axes without changing addressing.
 #[derive(Clone, Copy)]
 pub enum ColumnLayout {
     /// Regular rows of `width` elements. `width` is 1 for a scalar column.
     Regular { width: usize },
     /// Irregular rows addressed by a prefix-sum offsets buffer.
     Irregular { offsets: IrregularOffsets },
+}
+
+/// The logical shape of one value row, threaded next to the dtype so every
+/// metric reads its shape the way it reads its scalar type. An axis of `0` marks
+/// the dimension that __resizes per node__ (ragged); every other axis is fixed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// A single element per row. Byte layout is `Regular { width: 1 }`.
+    Scalar,
+    /// `cols` elements per row — the dense vector or the geospatial pair.
+    /// Byte layout is `Regular { width: cols }`.
+    Vector(usize),
+    /// `rows × cols` per node. `rows == 0` is the ragged case: the row count
+    /// varies per node (maxsim `[*, dim]`), so the byte layout is `Irregular`
+    /// and the reader recovers the count from the row's byte extent ÷ `cols`.
+    /// A fixed `rows > 0` (mesh `[points, 3]`) is `Regular { width: rows*cols }`.
+    Matrix(usize, usize),
+}
+
+impl Shape {
+    /// The flat element count of a fixed row, or `None` when an axis is ragged.
+    /// This is what a regular byte layout needs; a ragged shape has no fixed
+    /// row and returns `None`, which the builder reads as "irregular".
+    pub const fn regular_width(self) -> Option<usize> {
+        match self {
+            Shape::Scalar => Some(1),
+            Shape::Vector(cols) => Some(cols),
+            Shape::Matrix(0, _) => None,
+            Shape::Matrix(rows, cols) => Some(rows * cols),
+        }
+    }
+
+    /// The flat width for the vector-shaped families (dense, binary, geospatial),
+    /// or `None` for anything with a second axis. These metrics never see a
+    /// `Matrix` column, so a `Matrix` here is a mismatch they reject.
+    pub const fn width(self) -> Option<usize> {
+        match self {
+            Shape::Scalar => Some(1),
+            Shape::Vector(cols) => Some(cols),
+            Shape::Matrix(..) => None,
+        }
+    }
+
+    /// The inner (fixed) axis of a `Matrix` — `3` for a mesh cloud, `dim` for a
+    /// maxsim multi-vector. `None` for the vector-shaped families.
+    pub const fn inner(self) -> Option<usize> {
+        match self {
+            Shape::Matrix(_, cols) => Some(cols),
+            _ => None,
+        }
+    }
 }
 
 /// One column: an element type, a layout, and its values buffer. `E` is the
@@ -197,6 +250,8 @@ pub enum ColumnLayout {
 pub struct Column<Element> {
     pub dtype: Element,
     pub layout: ColumnLayout,
+    /// The logical shape a metric reads, orthogonal to the byte `layout`.
+    pub shape: Shape,
     pub values: ByteRange,
 }
 
@@ -343,6 +398,30 @@ fn field_usize<Allocator: AllocatorLike>(
     to_usize(v.as_u64().ok_or(Error::WrongType)?)
 }
 
+/// Parse a column's `"shape"`: absent is [`Shape::Scalar`], a bare number `w` is
+/// [`Shape::Vector`]`(w)`, a two-element array `[rows, cols]` is
+/// [`Shape::Matrix`] (a leading `0` marking the ragged axis). A one-element
+/// array `[w]` reads as `Vector(w)`, so a producer may always emit an array.
+fn shape_from_json<Allocator: AllocatorLike>(obj: &Json<Allocator>) -> Result<Shape, Error> {
+    let Some(value) = obj.get("shape") else {
+        return Ok(Shape::Scalar);
+    };
+    if let Some(scalar) = value.as_u64() {
+        return Ok(Shape::Vector(to_usize(scalar)?));
+    }
+    let axes = value.as_array().ok_or(Error::WrongType)?;
+    match axes.len() {
+        1 => Ok(Shape::Vector(to_usize(
+            axes[0].as_u64().ok_or(Error::WrongType)?,
+        )?)),
+        2 => Ok(Shape::Matrix(
+            to_usize(axes[0].as_u64().ok_or(Error::WrongType)?)?,
+            to_usize(axes[1].as_u64().ok_or(Error::WrongType)?)?,
+        )),
+        _ => Err(Error::Inconsistent),
+    }
+}
+
 impl<Element: ElementLike> Column<Element> {
     fn from_json<Allocator: AllocatorLike>(obj: &Json<Allocator>) -> Result<Self, Error> {
         let dtype = Element::from_dtype(
@@ -358,6 +437,11 @@ impl<Element: ElementLike> Column<Element> {
             len: field_usize(obj, "values_length")?,
         };
 
+        // The logical shape: absent -> Scalar; a bare number -> Vector; a
+        // two-element array `[rows, cols]` -> Matrix (rows 0 marks the ragged
+        // axis). Threaded next to the dtype for every metric to read.
+        let shape = shape_from_json(obj)?;
+
         let layout = match obj.get("offsets_dtype") {
             Some(offset_dtype) => {
                 let offset_dtype = offset_dtype.as_str().ok_or(Error::WrongType)?;
@@ -371,18 +455,17 @@ impl<Element: ElementLike> Column<Element> {
                     },
                 }
             }
-            None => {
-                let width = match obj.get("shape") {
-                    Some(v) => to_usize(v.as_u64().ok_or(Error::WrongType)?)?,
-                    None => 1,
-                };
-                ColumnLayout::Regular { width }
-            }
+            // A regular byte layout needs a fixed row width; a ragged shape over
+            // a column that declared no offsets is a malformed header.
+            None => ColumnLayout::Regular {
+                width: shape.regular_width().ok_or(Error::Inconsistent)?,
+            },
         };
 
         Ok(Column {
             dtype,
             layout,
+            shape,
             values,
         })
     }
@@ -802,11 +885,8 @@ impl<Allocator: AllocatorLike> GraphLike for Table<Allocator> {
         self.dtype_name("value").unwrap_or("")
     }
 
-    fn value_shape(&self) -> Option<usize> {
-        match self.value.layout {
-            ColumnLayout::Regular { width } => Some(width),
-            ColumnLayout::Irregular { .. } => None,
-        }
+    fn value_shape(&self) -> Option<Shape> {
+        Some(self.value.shape)
     }
 
     fn neighbors_degree(&self) -> Option<usize> {
@@ -855,8 +935,19 @@ pub trait GraphLike {
     fn key_dtype(&self) -> &str;
     fn value_dtype(&self) -> &str;
 
-    /// The value column's fixed shape, or None for variable-length values.
-    fn value_shape(&self) -> Option<usize>;
+    /// The value column's logical [`Shape`], or None if the producer declares
+    /// none. Rank-2 families (mesh, maxsim) read the second axis from it; the
+    /// vector-shaped families call [`value_width`](GraphLike::value_width).
+    fn value_shape(&self) -> Option<Shape>;
+
+    /// The value column's flat element width for the vector-shaped families
+    /// (dense, binary, geospatial), or None for a scalar-less / rank-2 column.
+    /// A provided method over [`value_shape`](GraphLike::value_shape) so those
+    /// families keep reading a single `usize`.
+    fn value_width(&self) -> Option<usize> {
+        self.value_shape().and_then(Shape::width)
+    }
+
     /// The neighbors column's fixed out-degree, or None if variable.
     fn neighbors_degree(&self) -> Option<usize>;
 
@@ -1013,6 +1104,7 @@ fn write_column<Allocator: AllocatorLike>(
     name: &str,
     dtype: &str,
     column: &ColumnBuilder<Allocator>,
+    shape: Shape,
     off_start: Option<usize>,
     val_start: usize,
 ) {
@@ -1023,7 +1115,12 @@ fn write_column<Allocator: AllocatorLike>(
             off,
             column.offsets.len()
         )),
-        None => header.push_str(&format!(",\"shape\":{}", column.width.unwrap_or(1))),
+        // A `Matrix` row serializes both axes so the reader recovers the logical
+        // shape, not just the flat byte width; everything else is a scalar width.
+        None => match shape {
+            Shape::Matrix(rows, cols) => header.push_str(&format!(",\"shape\":[{rows},{cols}]")),
+            _ => header.push_str(&format!(",\"shape\":{}", column.width.unwrap_or(1))),
+        },
     }
     header.push_str(&format!(
         ",\"values_start\":{},\"values_length\":{}}}",
@@ -1074,7 +1171,11 @@ where
 
     let value_dtype = graph.value_dtype();
     let value_storage = StorageDType::from_dtype(value_dtype.as_bytes())?;
-    let mut value = ColumnBuilder::new(value_storage, graph.value_shape(), &alloc)?;
+    let mut value = ColumnBuilder::new(
+        value_storage,
+        graph.value_shape().and_then(Shape::regular_width),
+        &alloc,
+    )?;
     for i in 0..node_count {
         value.push_row(graph.value(i))?;
     }
@@ -1140,6 +1241,7 @@ where
         "key",
         key_dtype,
         &key,
+        Shape::Vector(key.width.unwrap_or(1)),
         key_offsets_start,
         key_values_start,
     );
@@ -1148,6 +1250,7 @@ where
         "value",
         value_dtype,
         &value,
+        graph.value_shape().unwrap_or(Shape::Scalar),
         value_offsets_start,
         value_values_start,
     );
@@ -1156,6 +1259,7 @@ where
         "neighbors",
         neighbor_dtype_name,
         &neighbors,
+        Shape::Vector(neighbors.width.unwrap_or(1)),
         neighbor_offsets_start,
         neighbor_values_start,
     );
@@ -1219,8 +1323,8 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "f32"
         }
-        fn value_shape(&self) -> Option<usize> {
-            Some(self.dim)
+        fn value_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(self.dim))
         }
         fn neighbors_degree(&self) -> Option<usize> {
             Some(self.degree)
@@ -1268,7 +1372,7 @@ mod tests {
     fn round_trip_regular() {
         let table = Table::build(&toy(), None).unwrap();
         assert_eq!(table.len(), 3);
-        assert_eq!(table.value_shape(), Some(2));
+        assert_eq!(table.value_shape(), Some(Shape::Vector(2)));
         assert_eq!(table.key(1), &20u64.to_le_bytes()[..]);
 
         let mut expected = Vec::new();

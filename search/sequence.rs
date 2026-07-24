@@ -812,7 +812,7 @@ pub type SmithWatermanSearch<Allocator = Global> =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NeighborList;
+    use crate::{NeighborList, Shape};
 
     /// Three words on a fully connected triangle. Values are variable-length, so
     /// the column is irregular and has no `value_shape` at all — the property no
@@ -831,7 +831,7 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "utf8"
         }
-        fn value_shape(&self) -> Option<usize> {
+        fn value_shape(&self) -> Option<Shape> {
             None
         }
         fn neighbors_degree(&self) -> Option<usize> {
@@ -1030,7 +1030,7 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "utf8"
         }
-        fn value_shape(&self) -> Option<usize> {
+        fn value_shape(&self) -> Option<Shape> {
             None
         }
         fn neighbors_degree(&self) -> Option<usize> {
@@ -1132,8 +1132,8 @@ mod tests {
             fn value_dtype(&self) -> &str {
                 "i8"
             }
-            fn value_shape(&self) -> Option<usize> {
-                Some(2)
+            fn value_shape(&self) -> Option<Shape> {
+                Some(Shape::Vector(2))
             }
             fn neighbors_degree(&self) -> Option<usize> {
                 Some(0)

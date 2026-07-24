@@ -61,6 +61,19 @@ impl Ranking {
             Ranking::Farthest => a > b,
         }
     }
+
+    /// Order two native scores best-first under this direction — the comparator
+    /// every family's `SearcherLike::compare` and `rank_tile` hand to the pool.
+    /// Generic over the metric's own `Score`, so it runs on unwidened values; a
+    /// `NaN` sinks (`Ordering::Less`) rather than poisoning the order. This is the
+    /// one home for what was a per-file `smaller_first`/`larger_first`.
+    pub fn compare<Score: PartialOrd>(self, a: Score, b: Score) -> Ordering {
+        let ordered = match self {
+            Ranking::Nearest => b.partial_cmp(&a),
+            Ranking::Farthest => a.partial_cmp(&b),
+        };
+        ordered.unwrap_or(Ordering::Less)
+    }
 }
 
 /// A scored result. The node is the table's own index type `I`, `u32` or `u64`,
@@ -972,6 +985,7 @@ pub mod dense;
 pub mod geospatial;
 #[cfg(feature = "search")]
 pub mod maxsim;
+pub mod mesh;
 #[cfg(feature = "search")]
 pub mod sequence;
 

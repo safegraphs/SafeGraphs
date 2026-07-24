@@ -30,11 +30,6 @@ use forkunion as fu;
 use numkong as nk;
 use std::sync::Mutex;
 
-/// Smaller distance ranks first; a NaN sinks rather than poisoning the order.
-fn smaller_first<Score: PartialOrd>(a: Score, b: Score) -> Ordering {
-    b.partial_cmp(&a).unwrap_or(Ordering::Less)
-}
-
 // region: Kernel seam
 
 /// The seam between the shared geospatial machinery and one NumKong kernel: a
@@ -122,7 +117,7 @@ fn coordinate_columns<Coordinate: nk::StorageElement + Copy>(
     node_latitudes: &mut AVec<Coordinate, impl AllocatorLike>,
     node_longitudes: &mut AVec<Coordinate, impl AllocatorLike>,
 ) -> Result<usize, Error> {
-    if table.value_shape() != Some(2) {
+    if table.value_width() != Some(2) {
         return Err(Error::WrongType);
     }
     let scalars: &[Coordinate] = cast(table.value_buffer()).ok_or(Error::WrongType)?;
@@ -470,7 +465,7 @@ where
     }
 
     fn compare(a: Coordinate, b: Coordinate) -> Ordering {
-        smaller_first(a, b)
+        Ranking::Nearest.compare(a, b)
     }
 
     fn search(
@@ -819,7 +814,7 @@ impl<Allocator: AllocatorLike + Clone + Send> VincentySearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::NeighborList;
+    use crate::{NeighborList, Shape};
 
     /// Three cities on a fully connected triangle, coordinates in radians:
     /// London, Paris, New York. Every metric below queries from Berlin, which
@@ -853,8 +848,8 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "f64"
         }
-        fn value_shape(&self) -> Option<usize> {
-            Some(2)
+        fn value_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(2))
         }
         fn neighbors_degree(&self) -> Option<usize> {
             Some(2)
@@ -1068,8 +1063,8 @@ mod tests {
             fn value_dtype(&self) -> &str {
                 "f64"
             }
-            fn value_shape(&self) -> Option<usize> {
-                Some(3)
+            fn value_shape(&self) -> Option<Shape> {
+                Some(Shape::Vector(3))
             }
             fn neighbors_degree(&self) -> Option<usize> {
                 Some(0)

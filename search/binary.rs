@@ -28,12 +28,6 @@ use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
 
-/// Best-first for a distance: `Greater` means `a` is the nearer, so a smaller score
-/// outranks a larger one. Both bit metrics rank this way.
-fn smaller_first<Score: PartialOrd>(a: Score, b: Score) -> Ordering {
-    b.partial_cmp(&a).unwrap_or(Ordering::Less)
-}
-
 // region: Hamming
 
 /// The batch half of the Hamming metric. Structurally the [`AngularScanner`] of the
@@ -156,7 +150,7 @@ where
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
-        let width = table.value_shape().ok_or(Error::Inconsistent)?;
+        let width = table.value_width().ok_or(Error::Inconsistent)?;
         let query_view: nk::MatrixView<Value> = queries.into();
         let values = value_view::<Value>(table, width)?;
 
@@ -228,7 +222,7 @@ where
     }
 
     fn compare(a: Metric::Score, b: Metric::Score) -> Ordering {
-        smaller_first(a, b)
+        Ranking::Nearest.compare(a, b)
     }
 
     fn search(
@@ -548,7 +542,7 @@ where
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
         // the table's value column, and its row count the tile's query count.
-        let width = table.value_shape().ok_or(Error::Inconsistent)?;
+        let width = table.value_width().ok_or(Error::Inconsistent)?;
         let query_view: nk::MatrixView<Value> = queries.into();
         let values = value_view::<Value>(table, width)?;
 
@@ -619,7 +613,7 @@ where
     }
 
     fn compare(a: Metric::Score, b: Metric::Score) -> Ordering {
-        smaller_first(a, b)
+        Ranking::Nearest.compare(a, b)
     }
 
     fn search(
@@ -814,7 +808,7 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{NeighborList, OffsetDType};
+    use crate::{NeighborList, OffsetDType, Shape};
 
     /// Three nested 8-bit nodes `11111111 ⊃ 11110000 ⊃ 10000000`, packed as `u1x8`,
     /// fully connected at degree two. Against the query `11111110`, node 0 is nearest
@@ -848,8 +842,8 @@ mod tests {
         fn value_dtype(&self) -> &str {
             "u1x8"
         }
-        fn value_shape(&self) -> Option<usize> {
-            Some(self.values.shape()[1])
+        fn value_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(self.values.shape()[1]))
         }
         fn neighbors_degree(&self) -> Option<usize> {
             Some(self.degree)
