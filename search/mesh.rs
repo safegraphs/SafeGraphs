@@ -20,7 +20,7 @@
 //! no per-element broadcast, so the scan aligns one query cloud against each node
 //! cloud into one tile cell, fanning queries across the owned pool.
 
-use super::batch::{batch_scan, batch_search, build_workers, open_pool, Workers};
+use super::batch::{batch_scan, batch_search, build_workers, open_pool, ShareRead, Workers};
 use super::{
     walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
     TraversalContext,
@@ -28,11 +28,10 @@ use super::{
 use crate::search::dense::matrix_view;
 use crate::{cast, Error, IndexLike, OffsetDType, Shape, Table, TableView};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
-use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 // region: Superposition seam
 
@@ -145,7 +144,6 @@ fn cloud_points(table: TableView<'_>) -> Result<usize, Error> {
 pub struct MeshScanner<Coordinate, Superpose, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     tile: Matrix<f64, Allocator>,
-    scratch: AVec<(), Allocator>,
     alloc: Allocator,
     coordinate: core::marker::PhantomData<fn() -> Coordinate>,
     superpose: core::marker::PhantomData<fn() -> Superpose>,
@@ -163,7 +161,6 @@ where
         Ok(MeshScanner {
             pool: open_pool(scope)?,
             tile: Matrix::empty_in(alloc.clone()),
-            scratch: AVec::new_in(alloc.clone()),
             alloc,
             coordinate: core::marker::PhantomData,
             superpose: core::marker::PhantomData,
@@ -235,77 +232,60 @@ where
             return Err(Error::Inconsistent);
         }
 
-        // Fan queries across the pool: each task aligns its query cloud against
-        // every node cloud, scattering RMSDs into its own strided tile column.
-        let tile = fu::SafePtr::new(scores.as_mut_ptr());
-        let queries_ptr = fu::SyncConstPtr::new(&queries as *const nk::MatrixView<'_, Coordinate>);
-        let failure = Mutex::new(None::<Error>);
-        let threads = self.pool.threads_count();
-        while self.scratch.len() < threads {
-            self.scratch.push(());
-        }
+        // Fan NODES across the pool: the tile is node-major, so each task owns
+        // its node's contiguous row by exclusive borrow — the borrow checker
+        // proves the disjointness, and a superposition is per-pair anyway, so
+        // no batch length is at stake. No per-worker scratch either: the task
+        // reads shared slices and writes its own row.
+        let mut rows: Vec<&mut [f64]> = Vec::new();
+        rows.try_reserve_exact(node_count)
+            .map_err(|_| Error::Alloc)?;
+        rows.extend(scores.as_mut_slice().chunks_mut(query_count.max(1)));
+        let queries_shared = ShareRead(&queries);
+        let failure = OnceLock::new();
 
-        fu::fold_with_scratch(
-            &mut self.pool,
-            fu::ParallelRange::new(0..query_count),
-            fu::DynamicScheduler,
-            self.scratch.as_mut_slice(),
-            |_scratch, query_index, _prong| {
-                // SAFETY: the pointer targets a local held for the whole blocking
-                // fold and is only read; `node_clouds` is a shared read-only slice.
-                let queries = unsafe { queries_ptr.get(0) };
-                let outcome = scan_one_query::<Coordinate, Superpose>(
-                    queries,
-                    query_index,
-                    node_clouds,
-                    points,
-                    &tile,
-                    node_count,
-                    query_count,
-                );
-                if let Err(error) = outcome {
-                    if let Ok(mut slot) = failure.lock() {
-                        slot.get_or_insert(error);
-                    }
-                }
-            },
-        );
+        fu::ParallelSliceMut::new(&mut rows).for_each_dynamic(&mut self.pool, |row, prong| {
+            let queries = queries_shared.read();
+            let outcome = scan_one_node::<Coordinate, Superpose>(
+                queries,
+                node_clouds,
+                prong.task_index,
+                points,
+                row,
+            );
+            if let Err(error) = outcome {
+                let _ = failure.set(error);
+            }
+        });
 
         match failure.into_inner() {
-            Ok(Some(error)) => Err(error),
-            Ok(None) => Ok(()),
-            Err(poison) => poison.into_inner().map_or(Ok(()), Err),
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
 
-/// One query's superposition against every node — the body of the scan's
-/// fan-out task. The tile is node-major, so this query's cells sit `query_count`
-/// apart; every write index is unique to `query_index`, which is what makes the
-/// concurrent `SafePtr` writes disjoint.
-#[allow(clippy::too_many_arguments)]
-fn scan_one_query<Coordinate, Superpose>(
+/// One node's superposition against every query — the body of the scan's
+/// fan-out task, handed the node's contiguous tile row by exclusive borrow.
+fn scan_one_node<Coordinate, Superpose>(
     queries: &nk::MatrixView<'_, Coordinate>,
-    query_index: usize,
     node_clouds: &[Coordinate],
+    node: usize,
     points: usize,
-    tile: &fu::SafePtr<f64>,
-    node_count: usize,
-    query_count: usize,
+    row: &mut [f64],
 ) -> Result<(), Error>
 where
     Coordinate: nk::StorageElement + Copy + Default + 'static,
     Superpose: SuperposeLike<Coordinate>,
 {
-    let query = <nk::MatrixView<'_, Coordinate> as QueryBatchLike<
-        MeshMetric<Coordinate, Superpose>,
-    >>::query(queries, query_index)
-    .ok_or(Error::Inconsistent)?;
     let stride = points * 3;
-    for node in 0..node_count {
-        let cloud = &node_clouds[node * stride..node * stride + stride];
-        let rmsd = Superpose::rmsd(query, cloud, points).ok_or(Error::Inconsistent)?;
-        *tile.get_mut_at(node * query_count + query_index) = rmsd;
+    let cloud = &node_clouds[node * stride..node * stride + stride];
+    for (query_index, cell) in row.iter_mut().enumerate() {
+        let query = <nk::MatrixView<'_, Coordinate> as QueryBatchLike<
+            MeshMetric<Coordinate, Superpose>,
+        >>::query(queries, query_index)
+        .ok_or(Error::Inconsistent)?;
+        *cell = Superpose::rmsd(query, cloud, points).ok_or(Error::Inconsistent)?;
     }
     Ok(())
 }

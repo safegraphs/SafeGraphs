@@ -16,7 +16,7 @@
 //! pool with per-worker broadcast scratch, the same schedule the batch walk
 //! uses.
 
-use super::batch::{batch_scan, batch_search, build_workers, open_pool, Workers};
+use super::batch::{batch_scan, batch_search, build_workers, open_pool, ShareRead, Workers};
 use super::{
     walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
     TraversalContext,
@@ -28,7 +28,7 @@ use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
 // region: Kernel seam
 
@@ -287,81 +287,88 @@ where
                 .push(BroadcastScratch::new_in(self.alloc.clone()));
         }
 
-        // Fan queries across the pool: each worker broadcasts its query against
-        // the shared node columns in one kernel call, then scatters the result
-        // row into its own — strided, disjoint — tile column.
+        // Fan node CHUNKS across the pool: each task owns a contiguous block of
+        // tile rows by exclusive borrow — the borrow checker proves the
+        // disjointness, so the fan-out carries no raw tile pointer. Per query
+        // the task runs one kernel call over its whole node sub-range, so the
+        // batch length stays a chunk, not a query count: a single-query scan
+        // still feeds the SIMD lanes full spans. Four chunks per worker give
+        // the dynamic schedule slack to balance.
+        let chunk_nodes = node_count.div_ceil(threads.max(1) * 4).max(1);
+        let mut row_chunks: Vec<&mut [Coordinate]> = Vec::new();
+        row_chunks
+            .try_reserve_exact(node_count.div_ceil(chunk_nodes))
+            .map_err(|_| Error::Alloc)?;
+        row_chunks.extend(scores.as_mut_slice().chunks_mut(chunk_nodes * query_count));
         let (node_latitudes, node_longitudes) = (&self.node_latitudes, &self.node_longitudes);
-        let tile = fu::SafePtr::new(scores.as_mut_ptr());
-        let queries_ptr = fu::SyncConstPtr::new(&queries as *const nk::MatrixView<'_, Coordinate>);
-        let failure = Mutex::new(None::<Error>);
+        let queries_shared = ShareRead(&queries);
+        let failure = OnceLock::new();
 
         fu::fold_with_scratch(
             &mut self.pool,
-            fu::ParallelRange::new(0..query_count),
+            fu::ParallelSliceMut::new(&mut row_chunks),
             fu::DynamicScheduler,
             self.workers.as_mut_slice(),
-            |worker, query_index, _prong| {
-                // SAFETY: the pointer targets a local held for the whole blocking
-                // fold and is only read.
-                let queries = unsafe { queries_ptr.get(0) };
-                let outcome = scan_one_query::<Kernel, Coordinate>(
+            |worker, chunk, prong| {
+                let queries = queries_shared.read();
+                let start = prong.task_index * chunk_nodes;
+                let outcome = scan_node_chunk::<Kernel, Coordinate>(
                     worker,
                     queries,
-                    query_index,
-                    node_latitudes,
-                    node_longitudes,
-                    &tile,
+                    &node_latitudes[start..],
+                    &node_longitudes[start..],
+                    chunk,
                     query_count,
                 );
                 if let Err(error) = outcome {
-                    if let Ok(mut slot) = failure.lock() {
-                        slot.get_or_insert(error);
-                    }
+                    let _ = failure.set(error);
                 }
             },
         );
 
         match failure.into_inner() {
-            Ok(Some(error)) => Err(error),
-            Ok(None) => Ok(()),
-            Err(poison) => poison.into_inner().map_or(Ok(()), Err),
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
 
-/// One query's broadcast, kernel call, and scatter — the body of the scan's
-/// fan-out task. The tile is node-major, so this query's cells sit
-/// `query_count` apart; every write index is unique to `query_index`, which is
-/// what makes the concurrent `SafePtr` writes disjoint.
-fn scan_one_query<Kernel, Coordinate>(
+/// One node chunk's whole block of tile rows — the body of the scan's fan-out
+/// task. Per query: broadcast the query across the chunk, one kernel call over
+/// the chunk's node sub-range, then write that query's column of the owned
+/// block — strided, but exclusively borrowed, so every write is safe.
+fn scan_node_chunk<Kernel, Coordinate>(
     worker: &mut BroadcastScratch<Coordinate, impl AllocatorLike + Clone>,
     queries: &nk::MatrixView<'_, Coordinate>,
-    query_index: usize,
     node_latitudes: &[Coordinate],
     node_longitudes: &[Coordinate],
-    tile: &fu::SafePtr<Coordinate>,
+    chunk: &mut [Coordinate],
     query_count: usize,
 ) -> Result<(), Error>
 where
     Kernel: KernelLike<Coordinate>,
     Coordinate: nk::StorageElement + Copy + Default + 'static,
 {
-    let query = <nk::MatrixView<'_, Coordinate> as QueryBatchLike<
-        GeospatialMetric<Kernel, Coordinate>,
-    >>::query(queries, query_index)
-    .ok_or(Error::Inconsistent)?;
-    let node_count = node_latitudes.len();
-    worker.broadcast(query[0], query[1], node_count)?;
-    Kernel::distances(
-        &worker.query_latitudes,
-        &worker.query_longitudes,
-        node_latitudes,
-        node_longitudes,
-        &mut worker.distances,
-    )
-    .ok_or(Error::Inconsistent)?;
-    for (node, &distance) in worker.distances.iter().enumerate() {
-        *tile.get_mut_at(node * query_count + query_index) = distance;
+    let chunk_nodes = chunk.len() / query_count.max(1);
+    let node_latitudes = &node_latitudes[..chunk_nodes];
+    let node_longitudes = &node_longitudes[..chunk_nodes];
+    for query_index in 0..query_count {
+        let query = <nk::MatrixView<'_, Coordinate> as QueryBatchLike<
+            GeospatialMetric<Kernel, Coordinate>,
+        >>::query(queries, query_index)
+        .ok_or(Error::Inconsistent)?;
+        worker.broadcast(query[0], query[1], chunk_nodes)?;
+        Kernel::distances(
+            &worker.query_latitudes,
+            &worker.query_longitudes,
+            node_latitudes,
+            node_longitudes,
+            &mut worker.distances,
+        )
+        .ok_or(Error::Inconsistent)?;
+        for (node, &distance) in worker.distances.iter().enumerate() {
+            chunk[node * query_count + query_index] = distance;
+        }
     }
     Ok(())
 }

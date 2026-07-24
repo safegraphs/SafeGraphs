@@ -189,7 +189,7 @@ pub(crate) enum Workers<Narrow, Wide, Allocator: AllocatorLike = Global> {
 /// for the entire blocking fold — the one `unsafe impl` below is the single place
 /// this crate asserts cross-thread shareability instead of scattering pointer
 /// casts at every capture site.
-struct ShareRead<'a, Referent: ?Sized>(&'a Referent);
+pub(crate) struct ShareRead<'a, Referent: ?Sized>(pub(crate) &'a Referent);
 unsafe impl<Referent: ?Sized> Sync for ShareRead<'_, Referent> {}
 unsafe impl<Referent: ?Sized> Send for ShareRead<'_, Referent> {}
 
@@ -197,7 +197,7 @@ impl<'a, Referent: ?Sized> ShareRead<'a, Referent> {
     /// Accessor rather than a public field, so a closure captures the wrapper —
     /// which is the `Sync` assertion — and not the bare inner reference, which
     /// edition-2021 disjoint capture would otherwise pluck out.
-    fn read(&self) -> &'a Referent {
+    pub(crate) fn read(&self) -> &'a Referent {
         self.0
     }
 }
