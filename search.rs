@@ -985,6 +985,7 @@ pub mod dense;
 pub mod geospatial;
 #[cfg(feature = "search")]
 pub mod maxsim;
+#[cfg(feature = "search")]
 pub mod mesh;
 #[cfg(feature = "search")]
 pub mod sequence;
