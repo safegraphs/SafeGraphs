@@ -52,7 +52,17 @@ stringzilla = { git = "https://github.com/ashvardanian/StringZilla", features = 
 ], optional = true }
 
 # ForkUnion structured parallelism, fanning scans across queries and shards.
-forkunion = { git = "https://github.com/ashvardanian/ForkUnion", optional = true }
+# Declared from the registry for the same reason as `stringtape`, and with sharper
+# consequences: NumKong and StringZilla both declare `forkunion = "3.0"` there, and
+# the crate carries `links = "forkunion"`. A git source here is a second, distinct
+# package claiming the same native library, which Cargo refuses to resolve at all.
+forkunion = { version = "3.0", optional = true }
+
+# Argument parsing and glob expansion for the `sg` binary alone — the library
+# stays free of both. `clap`'s derive is an attribute macro on our types, not a
+# `macro_rules!` definition, so it sits outside the crate's macro ban.
+clap = { version = "4", features = ["derive"], optional = true }
+glob = { version = "0.3", optional = true }
 
 [features]
 # The default build only reads and unpacks files: mmap, header parse, and
@@ -62,6 +72,14 @@ default = []
 # Scan and A* over the graph, with every scoring kernel: pulls NumKong,
 # StringZilla, and ForkUnion.
 search = ["dep:numkong", "dep:stringzilla", "dep:forkunion"]
+
+# The `sg` command-line front end over `search/dispatch.rs`.
+cli = ["search", "dep:clap", "dep:glob"]
+
+[[bin]]
+name = "sg"
+path = "cli.rs"
+required-features = ["cli"]
 
 [profile.release]
 opt-level = 3

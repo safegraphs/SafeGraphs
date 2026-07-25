@@ -343,6 +343,38 @@ pub enum Error {
     Alloc,
 }
 
+/// A short, caller-facing reason.
+/// Every front end needs this — without it each one hand-rolls the same match —
+/// and it is what lets `?` compose with `Box<dyn Error>` and `anyhow` alike.
+/// Context that would need a position or a path stays with the caller, which is
+/// the one that knows it.
+impl core::fmt::Display for Error {
+    fn fmt(&self, out: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::Io(inner) => write!(out, "{inner}"),
+            Error::BadMagic => out.write_str("not a .safegraphs file"),
+            Error::Truncated => out.write_str("file ends inside a buffer it declares"),
+            Error::Json(inner) => write!(out, "header is not valid JSON: {inner:?}"),
+            Error::MissingField(field) => write!(out, "header is missing {field}"),
+            Error::UnknownMetric => out.write_str("no metric family answers to that name"),
+            Error::UnknownDType => out.write_str("no storage width answers to that dtype"),
+            Error::WrongType => out.write_str("the column's dtype or shape does not suit this use"),
+            Error::TooLarge => out.write_str("a declared size does not fit this platform"),
+            Error::Inconsistent => out.write_str("the header and its buffers disagree"),
+            Error::Alloc => out.write_str("allocation failed"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(inner) => Some(inner),
+            _ => None,
+        }
+    }
+}
+
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Error::Io(e)

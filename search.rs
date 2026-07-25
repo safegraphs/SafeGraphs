@@ -1005,6 +1005,11 @@ pub mod sequence;
 #[cfg(feature = "search")]
 pub mod dispatch;
 
+// Query batches arrive as JSON and leave in a column's own dtype, so the encoder
+// needs NumKong's `f16`/`bf16` — the same gate the families sit behind.
+#[cfg(feature = "search")]
+pub mod queries;
+
 #[cfg(test)]
 mod tests {
     use super::*;
