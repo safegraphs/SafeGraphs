@@ -105,6 +105,8 @@ where
     }
 }
 
+// endregion: Superposition seam
+
 // region: Metric
 
 /// A mesh metric: a fixed-cardinality point cloud per node, an RMSD score, and a
@@ -130,10 +132,17 @@ where
 /// coordinates per point. The single shape check every entry point repeats.
 fn cloud_points(table: TableView<'_>) -> Result<usize, Error> {
     match table.value_shape() {
-        Some(Shape::Matrix(points, 3)) => Ok(points),
+        // `Matrix(0, 3)` is the crate's ragged sentinel, not a zero-point cloud,
+        // and a superposition needs at least three points — the floor every
+        // `MeshAlignment` kernel enforces through its SVD. Checking both here
+        // turns what would be an opaque `Inconsistent` on every node/query pair
+        // into one `WrongType` at the shape boundary, where the mistake is.
+        Some(Shape::Matrix(points, 3)) if points >= 3 => Ok(points),
         _ => Err(Error::WrongType),
     }
 }
+
+// endregion: Metric
 
 // region: Scanner
 
@@ -158,6 +167,7 @@ where
     ///
     /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
+        nk::capabilities::configure_thread();
         Ok(MeshScanner {
             pool: open_pool(scope)?,
             tile: Matrix::empty_in(alloc.clone()),
@@ -290,6 +300,8 @@ where
     Ok(())
 }
 
+// endregion: Scanner
+
 // region: Searcher
 
 /// The traversal half of any mesh metric: owns the reusable scratch and scores
@@ -309,6 +321,7 @@ where
     ///
     /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
+        nk::capabilities::configure_thread();
         Ok(MeshSearcher {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
             marker: core::marker::PhantomData,
@@ -462,6 +475,8 @@ where
     }
 }
 
+// endregion: Searcher
+
 // region: Metric aliases
 
 /// Kabsch superposition — rotation + translation, nearest-first RMSD.
@@ -485,34 +500,52 @@ pub type SimilarityMeshScanner<Coordinate, Allocator = Global> =
 pub type SimilarityMeshSearch<Coordinate, Allocator = Global> =
     MeshSearch<Coordinate, SimilaritySuperpose, Allocator>;
 
+// endregion: Metric aliases
+
 // region: Runtime dtype dispatch
 
-/// A Kabsch scanner chosen from a file's value dtype string — clouds come in the
-/// four coordinate dtypes NumKong's `mesh.h` ships.
-pub enum RotationalMeshScannerAny<Allocator: AllocatorLike = Global> {
-    F64(RotationalMeshScanner<f64, Allocator>),
-    F32(RotationalMeshScanner<f32, Allocator>),
-    F16(RotationalMeshScanner<nk::f16, Allocator>),
-    Bf16(RotationalMeshScanner<nk::bf16, Allocator>),
+/// A mesh scanner chosen from a file's value dtype string — clouds come in the
+/// four coordinate dtypes NumKong's `mesh.h` ships. Generic over the
+/// superposition, so one enum serves all three: the dtype axis is this type's
+/// business, and which invariants to factor out stays the marker's.
+pub enum MeshScannerAny<Superpose, Allocator: AllocatorLike = Global> {
+    F64(MeshScanner<f64, Superpose, Allocator>),
+    F32(MeshScanner<f32, Superpose, Allocator>),
+    F16(MeshScanner<nk::f16, Superpose, Allocator>),
+    Bf16(MeshScanner<nk::bf16, Superpose, Allocator>),
 }
 
-impl<Allocator: AllocatorLike + Clone + Send + Sync> RotationalMeshScannerAny<Allocator> {
+/// Raw-RMSD scanner over every coordinate dtype.
+pub type RigidMeshScannerAny<Allocator = Global> = MeshScannerAny<RigidSuperpose, Allocator>;
+/// Kabsch scanner over every coordinate dtype.
+pub type RotationalMeshScannerAny<Allocator = Global> =
+    MeshScannerAny<RotationalSuperpose, Allocator>;
+/// Umeyama scanner over every coordinate dtype.
+pub type SimilarityMeshScannerAny<Allocator = Global> =
+    MeshScannerAny<SimilaritySuperpose, Allocator>;
+
+impl<Superpose, Allocator> MeshScannerAny<Superpose, Allocator>
+where
+    Superpose:
+        SuperposeLike<f64> + SuperposeLike<f32> + SuperposeLike<nk::f16> + SuperposeLike<nk::bf16>,
+    Allocator: AllocatorLike + Clone + Send + Sync,
+{
     pub fn new(dtype: &str, scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => RotationalMeshScannerAny::F64(RotationalMeshScanner::new(scope, alloc)?),
-            "f32" => RotationalMeshScannerAny::F32(RotationalMeshScanner::new(scope, alloc)?),
-            "f16" => RotationalMeshScannerAny::F16(RotationalMeshScanner::new(scope, alloc)?),
-            "bf16" => RotationalMeshScannerAny::Bf16(RotationalMeshScanner::new(scope, alloc)?),
+            "f64" => Self::F64(MeshScanner::new(scope, alloc)?),
+            "f32" => Self::F32(MeshScanner::new(scope, alloc)?),
+            "f16" => Self::F16(MeshScanner::new(scope, alloc)?),
+            "bf16" => Self::Bf16(MeshScanner::new(scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
 
     pub fn dtype(&self) -> &'static str {
         match self {
-            RotationalMeshScannerAny::F64(_) => "f64",
-            RotationalMeshScannerAny::F32(_) => "f32",
-            RotationalMeshScannerAny::F16(_) => "f16",
-            RotationalMeshScannerAny::Bf16(_) => "bf16",
+            Self::F64(_) => "f64",
+            Self::F32(_) => "f32",
+            Self::F16(_) => "f16",
+            Self::Bf16(_) => "bf16",
         }
     }
 
@@ -526,28 +559,28 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> RotationalMeshScannerAny<Al
     ) -> Result<(), Error> {
         let points = cloud_points(table.view())?;
         match self {
-            RotationalMeshScannerAny::F64(s) => s.scan(
+            Self::F64(s) => s.scan(
                 view(queries_bytes, points)?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
-            RotationalMeshScannerAny::F32(s) => s.scan(
+            Self::F32(s) => s.scan(
                 view(queries_bytes, points)?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
-            RotationalMeshScannerAny::F16(s) => s.scan(
+            Self::F16(s) => s.scan(
                 view(queries_bytes, points)?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
-            RotationalMeshScannerAny::Bf16(s) => s.scan(
+            Self::Bf16(s) => s.scan(
                 view(queries_bytes, points)?,
                 table,
                 matches,
@@ -558,16 +591,30 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> RotationalMeshScannerAny<Al
     }
 }
 
-/// A Kabsch searcher chosen from a file's value dtype string — the walk twin of
-/// [`RotationalMeshScannerAny`].
-pub enum RotationalMeshSearchAny<Allocator: AllocatorLike = Global> {
-    F64(RotationalMeshSearch<f64, Allocator>),
-    F32(RotationalMeshSearch<f32, Allocator>),
-    F16(RotationalMeshSearch<nk::f16, Allocator>),
-    Bf16(RotationalMeshSearch<nk::bf16, Allocator>),
+/// A mesh searcher chosen from a file's value dtype string — the walk twin of
+/// [`MeshScannerAny`], generic over the superposition for the same reason.
+pub enum MeshSearchAny<Superpose, Allocator: AllocatorLike = Global> {
+    F64(MeshSearch<f64, Superpose, Allocator>),
+    F32(MeshSearch<f32, Superpose, Allocator>),
+    F16(MeshSearch<nk::f16, Superpose, Allocator>),
+    Bf16(MeshSearch<nk::bf16, Superpose, Allocator>),
 }
 
-impl<Allocator: AllocatorLike + Clone + Send> RotationalMeshSearchAny<Allocator> {
+/// Raw-RMSD searcher over every coordinate dtype.
+pub type RigidMeshSearchAny<Allocator = Global> = MeshSearchAny<RigidSuperpose, Allocator>;
+/// Kabsch searcher over every coordinate dtype.
+pub type RotationalMeshSearchAny<Allocator = Global> =
+    MeshSearchAny<RotationalSuperpose, Allocator>;
+/// Umeyama searcher over every coordinate dtype.
+pub type SimilarityMeshSearchAny<Allocator = Global> =
+    MeshSearchAny<SimilaritySuperpose, Allocator>;
+
+impl<Superpose, Allocator> MeshSearchAny<Superpose, Allocator>
+where
+    Superpose:
+        SuperposeLike<f64> + SuperposeLike<f32> + SuperposeLike<nk::f16> + SuperposeLike<nk::bf16>,
+    Allocator: AllocatorLike + Clone + Send + Sync,
+{
     pub fn new(
         dtype: &str,
         expansion_factor: usize,
@@ -575,36 +622,20 @@ impl<Allocator: AllocatorLike + Clone + Send> RotationalMeshSearchAny<Allocator>
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => RotationalMeshSearchAny::F64(RotationalMeshSearch::new(
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
-            "f32" => RotationalMeshSearchAny::F32(RotationalMeshSearch::new(
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
-            "f16" => RotationalMeshSearchAny::F16(RotationalMeshSearch::new(
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
-            "bf16" => RotationalMeshSearchAny::Bf16(RotationalMeshSearch::new(
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
+            "f64" => Self::F64(MeshSearch::new(expansion_factor, scope, alloc)?),
+            "f32" => Self::F32(MeshSearch::new(expansion_factor, scope, alloc)?),
+            "f16" => Self::F16(MeshSearch::new(expansion_factor, scope, alloc)?),
+            "bf16" => Self::Bf16(MeshSearch::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
 
     pub fn dtype(&self) -> &'static str {
         match self {
-            RotationalMeshSearchAny::F64(_) => "f64",
-            RotationalMeshSearchAny::F32(_) => "f32",
-            RotationalMeshSearchAny::F16(_) => "f16",
-            RotationalMeshSearchAny::Bf16(_) => "bf16",
+            Self::F64(_) => "f64",
+            Self::F32(_) => "f32",
+            Self::F16(_) => "f16",
+            Self::Bf16(_) => "bf16",
         }
     }
 
@@ -618,28 +649,28 @@ impl<Allocator: AllocatorLike + Clone + Send> RotationalMeshSearchAny<Allocator>
     ) -> Result<(), Error> {
         let points = cloud_points(table.view())?;
         match self {
-            RotationalMeshSearchAny::F64(s) => s.search(
+            Self::F64(s) => s.search(
                 view(queries_bytes, points)?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
-            RotationalMeshSearchAny::F32(s) => s.search(
+            Self::F32(s) => s.search(
                 view(queries_bytes, points)?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
-            RotationalMeshSearchAny::F16(s) => s.search(
+            Self::F16(s) => s.search(
                 view(queries_bytes, points)?,
                 table,
                 matches,
                 distances,
                 counts,
             ),
-            RotationalMeshSearchAny::Bf16(s) => s.search(
+            Self::Bf16(s) => s.search(
                 view(queries_bytes, points)?,
                 table,
                 matches,
@@ -660,6 +691,8 @@ fn view<Coordinate: nk::StorageElement>(
 ) -> Result<nk::MatrixView<'_, Coordinate>, Error> {
     matrix_view(cast(bytes).ok_or(Error::WrongType)?, points * 3)
 }
+
+// endregion: Runtime dtype dispatch
 
 #[cfg(test)]
 mod tests {
