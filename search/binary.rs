@@ -5,9 +5,10 @@
 //! only the kernel and the scalar differ.
 //!
 //! [`nk::Hammings`] and [`nk::Jaccards`], the packed scan kernels, ship for `u1x8`
-//! alone, and a scan and a walk must agree, so each family instantiates the one bit
-//! type. The runtime dispatchers still take the full `*Any` shape of the dense
-//! families, so a bit type added upstream is one arm here.
+//! alone; the single-pair kernels reach further — `u8` Hamming over whole-byte
+//! elements, `u16`/`u32` weighted Jaccard over count vectors — and those dtypes
+//! get pairwise-scanned arms through [`SetPairScanner`], scoring with the very
+//! kernel the walk uses, so scan and walk agree on every dtype either way.
 //!
 //! The packing-aware [`matrix_view`]/[`value_view`] scan primitive is reused from
 //! `dense`, and the shaped [`batch_scan`]/[`batch_search`] top-k from the shared
@@ -342,14 +343,264 @@ where
 /// dispatcher this needs no scratch of its own.
 ///
 /// [`DotScannerAny`]: crate::search::dense::DotScannerAny
-pub enum HammingScannerAny<Allocator: AllocatorLike = Global> {
-    U1x8(HammingScanner<nk::u1x8, Allocator>),
+// region: Pairwise set scanner
+
+/// The seam for the set dtypes NumKong ships __no packed kernel__ for — `u8`
+/// Hamming and the `u16`/`u32` weighted Jaccard: one distance per pair, the
+/// very kernel the walk uses, so a pairwise scan and a walk agree exactly.
+pub trait SetKernelLike<Value>: 'static {
+    /// The kernel's native output: `u32` for Hamming counts, `f32` for Jaccard.
+    type Output: Copy + Default + PartialOrd + Widen + Send + Sync;
+
+    /// The distance between two equal-length rows. `None` is a length
+    /// mismatch, which the callers turn into [`Error::Inconsistent`].
+    fn distance(query: &[Value], node: &[Value]) -> Option<Self::Output>;
 }
 
-impl<Allocator: AllocatorLike + Clone> HammingScannerAny<Allocator> {
+/// Element-wise Hamming — the count of differing elements.
+pub struct HammingKernel;
+
+impl<Value: nk::Hamming + 'static> SetKernelLike<Value> for HammingKernel
+where
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+{
+    type Output = <Value as nk::Hamming>::Output;
+
+    fn distance(query: &[Value], node: &[Value]) -> Option<Self::Output> {
+        <Value as nk::Hamming>::hamming(query, node)
+    }
+}
+
+/// Weighted Jaccard over count vectors — zero if and only if identical.
+pub struct JaccardKernel;
+
+impl<Value: nk::Jaccard + 'static> SetKernelLike<Value> for JaccardKernel
+where
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+{
+    type Output = <Value as nk::Jaccard>::Output;
+
+    fn distance(query: &[Value], node: &[Value]) -> Option<Self::Output> {
+        <Value as nk::Jaccard>::jaccard(query, node)
+    }
+}
+
+/// The batch half for the pairwise set dtypes: no packed form exists, so the
+/// scan fans __nodes__ across the owned pool, each task exclusively borrowing
+/// its node's contiguous tile row — the same safe shape as the mesh scan — and
+/// scoring every query with the walk's own single-pair kernel.
+pub struct SetPairScanner<Kernel: SetKernelLike<Value>, Value, Allocator: AllocatorLike = Global> {
+    pool: fu::ThreadPool,
+    tile: Matrix<<Kernel as SetKernelLike<Value>>::Output, Allocator>,
+    alloc: Allocator,
+    kernel: core::marker::PhantomData<fn() -> Kernel>,
+}
+
+impl<Kernel, Value, Allocator> SetPairScanner<Kernel, Value, Allocator>
+where
+    Kernel: SetKernelLike<Value>,
+    Allocator: AllocatorLike + Clone,
+{
+    /// A scanner over the workers `scope` names, its tile in `alloc`, uniform
+    /// with [`DotScanner::new`].
+    ///
+    /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
+    pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
+        Ok(SetPairScanner {
+            pool: open_pool(scope)?,
+            tile: Matrix::empty_in(alloc.clone()),
+            alloc,
+            kernel: core::marker::PhantomData,
+        })
+    }
+}
+
+/// Fill a node-major tile with pairwise set distances — the shared body of
+/// both kernels' `ScannerLike` impls.
+fn scan_pairwise_tile<Kernel, Value>(
+    pool: &mut fu::ThreadPool,
+    queries: nk::MatrixView<'_, Value>,
+    table: TableView<'_>,
+    scores: &mut Matrix<Kernel::Output, impl AllocatorLike + Clone>,
+) -> Result<(), Error>
+where
+    Kernel: SetKernelLike<Value>,
+    Value: nk::StorageElement + Copy + Default + Send + Sync + 'static,
+{
+    use super::batch::ShareRead;
+    use std::sync::OnceLock;
+
+    let width = table.value_width().ok_or(Error::WrongType)?;
+    let node_values: &[Value] = cast(table.value_buffer()).ok_or(Error::WrongType)?;
+    let node_count = table.len();
+    if node_values.len() != node_count * width {
+        return Err(Error::Inconsistent);
+    }
+    let query_count = queries.shape().first().copied().unwrap_or(0);
+    if queries.shape().get(1) != Some(&width)
+        || query_count != scores.cols()
+        || node_count != scores.rows()
+    {
+        return Err(Error::Inconsistent);
+    }
+
+    let mut rows: Vec<&mut [Kernel::Output]> = Vec::new();
+    rows.try_reserve_exact(node_count)
+        .map_err(|_| Error::Alloc)?;
+    rows.extend(scores.as_mut_slice().chunks_mut(query_count.max(1)));
+    let queries_shared = ShareRead(&queries);
+    let failure = OnceLock::new();
+
+    fu::ParallelSliceMut::new(&mut rows).for_each_dynamic(pool, |row, prong| {
+        let queries = queries_shared.read();
+        let node = &node_values[prong.task_index * width..prong.task_index * width + width];
+        for (query_index, cell) in row.iter_mut().enumerate() {
+            let Some(storage) = queries.as_packed_slice() else {
+                let _ = failure.set(Error::Inconsistent);
+                return;
+            };
+            let query = &storage[query_index * width..query_index * width + width];
+            match Kernel::distance(query, node) {
+                Some(distance) => *cell = distance,
+                None => {
+                    let _ = failure.set(Error::Inconsistent);
+                    return;
+                }
+            }
+        }
+    });
+
+    match failure.into_inner() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+impl<Metric, Value, Allocator> ScannerLike<Metric>
+    for SetPairScanner<HammingKernel, Value, Allocator>
+where
+    Value: nk::Hamming + nk::StorageElement + Copy + Default + Send + Sync + 'static,
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    Metric: MetricLike<Score = <Value as nk::Hamming>::Output> + ?Sized,
+    for<'a> Metric::Queries<'a>: Into<nk::MatrixView<'a, Value>>,
+    Allocator: AllocatorLike + Clone + Send + Sync,
+{
+    fn scan(
+        &mut self,
+        queries: Metric::Queries<'_>,
+        table: TableView<'_>,
+        scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
+    ) -> Result<(), Error> {
+        scan_pairwise_tile::<HammingKernel, Value>(&mut self.pool, queries.into(), table, scores)
+    }
+}
+
+impl<Metric, Value, Allocator> ScannerLike<Metric>
+    for SetPairScanner<JaccardKernel, Value, Allocator>
+where
+    Value: nk::Jaccard + nk::StorageElement + Copy + Default + Send + Sync + 'static,
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    Metric: MetricLike<Score = <Value as nk::Jaccard>::Output> + ?Sized,
+    for<'a> Metric::Queries<'a>: Into<nk::MatrixView<'a, Value>>,
+    Allocator: AllocatorLike + Clone + Send + Sync,
+{
+    fn scan(
+        &mut self,
+        queries: Metric::Queries<'_>,
+        table: TableView<'_>,
+        scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
+    ) -> Result<(), Error> {
+        scan_pairwise_tile::<JaccardKernel, Value>(&mut self.pool, queries.into(), table, scores)
+    }
+}
+
+impl<Value, Allocator> SetPairScanner<HammingKernel, Value, Allocator>
+where
+    Value: nk::Hamming + nk::StorageElement + Copy + Default + Send + Sync + 'static,
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    Allocator: AllocatorLike + Clone + Send + Sync,
+{
+    /// Batch brute-force top-k, nearest-first, uniform with
+    /// [`HammingScanner::scan`].
+    pub fn scan(
+        &mut self,
+        queries: nk::MatrixView<'_, Value>,
+        table: &Table<impl AllocatorLike>,
+        matches: &mut Matrix<u64>,
+        distances: &mut Matrix<f64>,
+        counts: &mut [u64],
+    ) -> Result<(), Error> {
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
+        let outcome = batch_scan::<HammingMetric<Value>, _>(
+            self,
+            queries,
+            table,
+            Ranking::Nearest,
+            &mut tile,
+            matches,
+            distances,
+            counts,
+        );
+        self.tile = tile;
+        outcome
+    }
+}
+
+impl<Value, Allocator> SetPairScanner<JaccardKernel, Value, Allocator>
+where
+    Value: nk::Jaccard + nk::StorageElement + Copy + Default + Send + Sync + 'static,
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    Allocator: AllocatorLike + Clone + Send + Sync,
+{
+    /// Batch brute-force top-k, nearest-first, uniform with
+    /// [`JaccardScanner::scan`].
+    pub fn scan(
+        &mut self,
+        queries: nk::MatrixView<'_, Value>,
+        table: &Table<impl AllocatorLike>,
+        matches: &mut Matrix<u64>,
+        distances: &mut Matrix<f64>,
+        counts: &mut [u64],
+    ) -> Result<(), Error> {
+        let table = table.view();
+        let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
+        let outcome = batch_scan::<JaccardMetric<Value>, _>(
+            self,
+            queries,
+            table,
+            Ranking::Nearest,
+            &mut tile,
+            matches,
+            distances,
+            counts,
+        );
+        self.tile = tile;
+        outcome
+    }
+}
+
+/// Element-wise Hamming over whole-byte elements, the pairwise-scanned arm.
+pub type HammingPairScanner<Value, Allocator = Global> =
+    SetPairScanner<HammingKernel, Value, Allocator>;
+/// Weighted Jaccard over count vectors, the pairwise-scanned arms.
+pub type JaccardPairScanner<Value, Allocator = Global> =
+    SetPairScanner<JaccardKernel, Value, Allocator>;
+
+// endregion: Pairwise set scanner
+
+pub enum HammingScannerAny<Allocator: AllocatorLike = Global> {
+    U1x8(HammingScanner<nk::u1x8, Allocator>),
+    /// `u8` ships no packed kernel, so its arm scans pairwise — exact, just
+    /// not through `DotsPackedMatrix`.
+    U8(HammingPairScanner<u8, Allocator>),
+}
+
+impl<Allocator: AllocatorLike + Clone + Send + Sync> HammingScannerAny<Allocator> {
     pub fn new(dtype: &str, scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         Ok(match dtype {
             "u1x8" => HammingScannerAny::U1x8(HammingScanner::new(scope, alloc)?),
+            "u8" => HammingScannerAny::U8(HammingPairScanner::new(scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -357,6 +608,7 @@ impl<Allocator: AllocatorLike + Clone> HammingScannerAny<Allocator> {
     pub fn dtype(&self) -> &'static str {
         match self {
             HammingScannerAny::U1x8(_) => "u1x8",
+            HammingScannerAny::U8(_) => "u8",
         }
     }
 
@@ -378,6 +630,13 @@ impl<Allocator: AllocatorLike + Clone> HammingScannerAny<Allocator> {
                 distances,
                 counts,
             ),
+            HammingScannerAny::U8(scanner) => scanner.scan(
+                view_from_bytes(queries, table.view())?,
+                table,
+                matches,
+                distances,
+                counts,
+            ),
         }
     }
 }
@@ -387,6 +646,7 @@ impl<Allocator: AllocatorLike + Clone> HammingScannerAny<Allocator> {
 /// [`DotSearcherAny`]: crate::search::dense::DotSearcherAny
 pub enum HammingSearcherAny<Allocator: AllocatorLike = Global> {
     U1x8(HammingSearch<nk::u1x8, Allocator>),
+    U8(HammingSearch<u8, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
@@ -398,6 +658,7 @@ impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
     ) -> Result<Self, Error> {
         Ok(match dtype {
             "u1x8" => HammingSearcherAny::U1x8(HammingSearch::new(expansion_factor, scope, alloc)?),
+            "u8" => HammingSearcherAny::U8(HammingSearch::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -405,6 +666,7 @@ impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
     pub fn dtype(&self) -> &'static str {
         match self {
             HammingSearcherAny::U1x8(_) => "u1x8",
+            HammingSearcherAny::U8(_) => "u8",
         }
     }
 
@@ -418,6 +680,13 @@ impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             HammingSearcherAny::U1x8(search) => search.search(
+                view_from_bytes(queries, table.view())?,
+                table,
+                matches,
+                distances,
+                counts,
+            ),
+            HammingSearcherAny::U8(search) => search.search(
                 view_from_bytes(queries, table.view())?,
                 table,
                 matches,
@@ -733,12 +1002,17 @@ where
 /// The Jaccard twin of [`HammingScannerAny`]: runtime dispatch, `u1x8` the one arm.
 pub enum JaccardScannerAny<Allocator: AllocatorLike = Global> {
     U1x8(JaccardScanner<nk::u1x8, Allocator>),
+    /// The weighted count-vector arms scan pairwise — no packed kernel ships.
+    U16(JaccardPairScanner<u16, Allocator>),
+    U32(JaccardPairScanner<u32, Allocator>),
 }
 
-impl<Allocator: AllocatorLike + Clone> JaccardScannerAny<Allocator> {
+impl<Allocator: AllocatorLike + Clone + Send + Sync> JaccardScannerAny<Allocator> {
     pub fn new(dtype: &str, scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         Ok(match dtype {
             "u1x8" => JaccardScannerAny::U1x8(JaccardScanner::new(scope, alloc)?),
+            "u16" => JaccardScannerAny::U16(JaccardPairScanner::new(scope, alloc)?),
+            "u32" => JaccardScannerAny::U32(JaccardPairScanner::new(scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -746,6 +1020,8 @@ impl<Allocator: AllocatorLike + Clone> JaccardScannerAny<Allocator> {
     pub fn dtype(&self) -> &'static str {
         match self {
             JaccardScannerAny::U1x8(_) => "u1x8",
+            JaccardScannerAny::U16(_) => "u16",
+            JaccardScannerAny::U32(_) => "u32",
         }
     }
 
@@ -765,6 +1041,20 @@ impl<Allocator: AllocatorLike + Clone> JaccardScannerAny<Allocator> {
                 distances,
                 counts,
             ),
+            JaccardScannerAny::U16(scanner) => scanner.scan(
+                view_from_bytes(queries, table.view())?,
+                table,
+                matches,
+                distances,
+                counts,
+            ),
+            JaccardScannerAny::U32(scanner) => scanner.scan(
+                view_from_bytes(queries, table.view())?,
+                table,
+                matches,
+                distances,
+                counts,
+            ),
         }
     }
 }
@@ -772,6 +1062,8 @@ impl<Allocator: AllocatorLike + Clone> JaccardScannerAny<Allocator> {
 /// The Jaccard twin of [`HammingSearcherAny`]: runtime dispatch over a batch walk.
 pub enum JaccardSearcherAny<Allocator: AllocatorLike = Global> {
     U1x8(JaccardSearch<nk::u1x8, Allocator>),
+    U16(JaccardSearch<u16, Allocator>),
+    U32(JaccardSearch<u32, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
@@ -783,6 +1075,8 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
     ) -> Result<Self, Error> {
         Ok(match dtype {
             "u1x8" => JaccardSearcherAny::U1x8(JaccardSearch::new(expansion_factor, scope, alloc)?),
+            "u16" => JaccardSearcherAny::U16(JaccardSearch::new(expansion_factor, scope, alloc)?),
+            "u32" => JaccardSearcherAny::U32(JaccardSearch::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -790,6 +1084,8 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
     pub fn dtype(&self) -> &'static str {
         match self {
             JaccardSearcherAny::U1x8(_) => "u1x8",
+            JaccardSearcherAny::U16(_) => "u16",
+            JaccardSearcherAny::U32(_) => "u32",
         }
     }
 
@@ -803,6 +1099,20 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
     ) -> Result<(), Error> {
         match self {
             JaccardSearcherAny::U1x8(search) => search.search(
+                view_from_bytes(queries, table.view())?,
+                table,
+                matches,
+                distances,
+                counts,
+            ),
+            JaccardSearcherAny::U16(search) => search.search(
+                view_from_bytes(queries, table.view())?,
+                table,
+                matches,
+                distances,
+                counts,
+            ),
+            JaccardSearcherAny::U32(search) => search.search(
                 view_from_bytes(queries, table.view())?,
                 table,
                 matches,
@@ -977,6 +1287,193 @@ mod tests {
             .unwrap();
         assert_eq!(walked.row(0).unwrap(), &[0, 1, 2]);
         assert_eq!(walked_scores.row(0).unwrap()[0], 0.125);
+    }
+
+    /// Three `u8` count vectors on the triangle: node 1 equals the query, node
+    /// 0 differs in one element, node 2 in all four — covering the pairwise
+    /// `u8` Hamming arm and the `u32` weighted Jaccard arm, whose scans reuse
+    /// the walk's own single-pair kernels.
+    struct Counts;
+
+    const COUNT_ROWS: [[u8; 4]; 3] = [[3, 1, 4, 1], [3, 1, 4, 2], [9, 9, 9, 9]];
+    const COUNT_QUERY: [u8; 4] = [3, 1, 4, 2];
+
+    impl GraphLike for Counts {
+        fn len(&self) -> usize {
+            3
+        }
+        fn key_dtype(&self) -> &str {
+            "u64"
+        }
+        fn value_dtype(&self) -> &str {
+            "u8"
+        }
+        fn value_shape(&self) -> Option<crate::Shape> {
+            Some(crate::Shape::Vector(4))
+        }
+        fn neighbors_degree(&self) -> Option<usize> {
+            Some(2)
+        }
+        fn key(&self, i: usize) -> &[u8] {
+            const KEYS: [[u8; 8]; 3] = [
+                (10u64).to_le_bytes(),
+                (20u64).to_le_bytes(),
+                (30u64).to_le_bytes(),
+            ];
+            &KEYS[i]
+        }
+        fn value(&self, i: usize) -> &[u8] {
+            &COUNT_ROWS[i]
+        }
+        fn neighbors(&self, i: usize) -> NeighborList<'_> {
+            const ADJACENCY: [[u8; 8]; 3] = [
+                [1, 0, 0, 0, 2, 0, 0, 0],
+                [0, 0, 0, 0, 2, 0, 0, 0],
+                [0, 0, 0, 0, 1, 0, 0, 0],
+            ];
+            NeighborList::new(&ADJACENCY[i], OffsetDType::U32)
+        }
+    }
+
+    #[test]
+    fn pairwise_arms_scan_and_walk_agree() {
+        let table = Table::build(&Counts, None).unwrap();
+        let mut matches = Matrix::<u64>::new(1, 3).unwrap();
+        let mut distances = Matrix::<f64>::new(1, 3).unwrap();
+        let mut counts = [0u64; 1];
+
+        // The erased path exercises the raw-bytes entry the callers use.
+        let mut scanner =
+            HammingScannerAny::new(table.value_dtype(), ExecutionScope::Serial, Global).unwrap();
+        assert_eq!(scanner.dtype(), "u8");
+        scanner
+            .scan(
+                &COUNT_QUERY,
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        assert_eq!(counts, [3]);
+        assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
+        assert_eq!(distances.row(0).unwrap(), &[0.0, 1.0, 4.0]);
+
+        let mut searcher =
+            HammingSearcherAny::new(table.value_dtype(), 3, ExecutionScope::Serial, Global)
+                .unwrap();
+        searcher
+            .search(
+                &COUNT_QUERY,
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
+        assert_eq!(distances.row(0).unwrap(), &[0.0, 1.0, 4.0]);
+    }
+
+    /// The same triangle as `u32` counts, for the weighted Jaccard arms.
+    struct WideCounts;
+
+    const WIDE_ROWS: [[u32; 4]; 3] = [[3, 1, 4, 1], [3, 1, 4, 2], [9, 9, 9, 9]];
+    const WIDE_QUERY: [u32; 4] = [3, 1, 4, 2];
+
+    impl GraphLike for WideCounts {
+        fn len(&self) -> usize {
+            3
+        }
+        fn key_dtype(&self) -> &str {
+            "u64"
+        }
+        fn value_dtype(&self) -> &str {
+            "u32"
+        }
+        fn value_shape(&self) -> Option<crate::Shape> {
+            Some(crate::Shape::Vector(4))
+        }
+        fn neighbors_degree(&self) -> Option<usize> {
+            Some(2)
+        }
+        fn key(&self, i: usize) -> &[u8] {
+            const KEYS: [[u8; 8]; 3] = [
+                (10u64).to_le_bytes(),
+                (20u64).to_le_bytes(),
+                (30u64).to_le_bytes(),
+            ];
+            &KEYS[i]
+        }
+        fn value(&self, i: usize) -> &[u8] {
+            let row = &WIDE_ROWS[i];
+            // SAFETY: reinterpret the contiguous `[u32; 4]` as its bytes.
+            unsafe {
+                core::slice::from_raw_parts(row.as_ptr() as *const u8, core::mem::size_of_val(row))
+            }
+        }
+        fn neighbors(&self, i: usize) -> NeighborList<'_> {
+            const ADJACENCY: [[u8; 8]; 3] = [
+                [1, 0, 0, 0, 2, 0, 0, 0],
+                [0, 0, 0, 0, 2, 0, 0, 0],
+                [0, 0, 0, 0, 1, 0, 0, 0],
+            ];
+            NeighborList::new(&ADJACENCY[i], OffsetDType::U32)
+        }
+    }
+
+    #[test]
+    fn weighted_jaccard_u32_scan_and_walk_agree() {
+        // Weighted Jaccard against `[3,1,4,2]`: node 1 is identical — distance
+        // zero — node 0 near, node 2 far. Scan and walk agree exactly.
+        let table = Table::build(&WideCounts, None).unwrap();
+        let query_bytes = {
+            // SAFETY: reinterpret the contiguous `[u32; 4]` query as its bytes.
+            unsafe {
+                core::slice::from_raw_parts(
+                    WIDE_QUERY.as_ptr() as *const u8,
+                    core::mem::size_of_val(&WIDE_QUERY),
+                )
+            }
+        };
+        let mut matches = Matrix::<u64>::new(1, 3).unwrap();
+        let mut distances = Matrix::<f64>::new(1, 3).unwrap();
+        let mut counts = [0u64; 1];
+
+        let mut scanner =
+            JaccardScannerAny::new(table.value_dtype(), ExecutionScope::Serial, Global).unwrap();
+        assert_eq!(scanner.dtype(), "u32");
+        scanner
+            .scan(
+                query_bytes,
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        assert_eq!(counts, [3]);
+        assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
+        let scanned = distances.row(0).unwrap().to_vec();
+        assert!(
+            scanned[0].abs() < 1e-6,
+            "identical vectors diverge: {scanned:?}"
+        );
+
+        let mut searcher =
+            JaccardSearcherAny::new(table.value_dtype(), 3, ExecutionScope::Serial, Global)
+                .unwrap();
+        searcher
+            .search(
+                query_bytes,
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
+        assert_eq!(distances.row(0).unwrap(), &scanned[..]);
     }
 
     #[test]
