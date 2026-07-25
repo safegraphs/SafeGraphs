@@ -80,6 +80,17 @@ impl StorageDType {
     pub const fn row_bytes(self, width: usize) -> usize {
         (width * self.bits()).div_ceil(8)
     }
+
+    /// [`row_bytes`](StorageDType::row_bytes) for a width that has not yet been
+    /// validated — `None` when `width * bits()` would overflow. Header parsing
+    /// goes through this; the per-node hot path keeps the infallible form, since
+    /// by then `check_layout` has proven the width against the real file size.
+    pub const fn checked_row_bytes(self, width: usize) -> Option<usize> {
+        match width.checked_mul(self.bits()) {
+            Some(bits) => Some(bits.div_ceil(8)),
+            None => None,
+        }
+    }
 }
 
 /// Width of a node index or prefix-sum entry. Unsigned, since offsets and node
@@ -216,7 +227,12 @@ impl Shape {
             Shape::Scalar => Some(1),
             Shape::Vector(cols) => Some(cols),
             Shape::Matrix(0, _) => None,
-            Shape::Matrix(rows, cols) => Some(rows * cols),
+            // A corrupt header can name a `Matrix` no real file could back, so
+            // the product is checked: `None` here becomes `Error::Inconsistent`
+            // at parse time rather than a wrapped width that silently
+            // mis-describes the column — or, in a debug build, a panic while
+            // merely opening an untrusted file.
+            Shape::Matrix(rows, cols) => rows.checked_mul(cols),
         }
     }
 
@@ -312,6 +328,8 @@ pub enum Error {
     Json(JsonError),
     /// A required field, such as a column or one of its buffers, is absent.
     MissingField(&'static str),
+    /// A metric name is not one the router recognizes.
+    UnknownMetric,
     /// A dtype string is not one the width table recognizes.
     UnknownDType,
     /// A JSON value was not the shape the schema expects.
@@ -344,8 +362,18 @@ pub trait ElementLike: Copy {
     fn size(self) -> usize;
     /// Byte length of a regular row of `width` elements. Whole-byte by default —
     /// only [`StorageDType`] overrides it to pack sub-byte elements tight.
+    ///
+    /// Call this only once the width has been proven against a real buffer;
+    /// header parsing goes through [`checked_row_bytes`](ElementLike::checked_row_bytes).
     fn row_bytes(self, width: usize) -> usize {
         width * self.size()
+    }
+
+    /// [`row_bytes`](ElementLike::row_bytes) for a width straight out of a
+    /// header, before anything has vetted it — `None` when the product would
+    /// overflow, so a corrupt file yields an error instead of a wrapped length.
+    fn checked_row_bytes(self, width: usize) -> Option<usize> {
+        width.checked_mul(self.size())
     }
 }
 
@@ -369,6 +397,10 @@ impl ElementLike for StorageDType {
 
     fn row_bytes(self, width: usize) -> usize {
         StorageDType::row_bytes(self, width)
+    }
+
+    fn checked_row_bytes(self, width: usize) -> Option<usize> {
+        StorageDType::checked_row_bytes(self, width)
     }
 }
 
@@ -444,6 +476,17 @@ impl<Element: ElementLike> Column<Element> {
 
         let layout = match obj.get("offsets_dtype") {
             Some(offset_dtype) => {
+                // Offset-addressed rows may be shapeless (`Scalar` — a tape of
+                // variable-length strings) or ragged (`Matrix(0, cols)` — rows of
+                // fixed-width tuples, a varying number of them). What they may
+                // never carry is a __fixed__ shape: `Vector(n)` or
+                // `Matrix(rows > 0, _)` claims a constant row width this layout
+                // contradicts, and a metric trusting the shape alone would
+                // mis-stride the buffer — `mesh` reads `value_buffer()` at
+                // `points * 3` strides on exactly that strength.
+                if !matches!(shape, Shape::Scalar | Shape::Matrix(0, _)) {
+                    return Err(Error::Inconsistent);
+                }
                 let offset_dtype = offset_dtype.as_str().ok_or(Error::WrongType)?;
                 ColumnLayout::Irregular {
                     offsets: IrregularOffsets {
@@ -730,6 +773,8 @@ impl<'t> TableView<'t> {
     ) -> Option<&'t [u8]> {
         match column.layout {
             ColumnLayout::Regular { width } => {
+                // Safe to use the infallible form: a `TableView` only exists
+                // after `check_layout` proved this width against the buffer.
                 let per = column.dtype.row_bytes(width);
                 self.subslice(column.values, node.checked_mul(per)?, per)
             }
@@ -876,8 +921,14 @@ impl<Element: ElementLike> Column<Element> {
     pub fn len(&self) -> usize {
         match self.layout {
             ColumnLayout::Regular { width } => {
-                let per = self.dtype.row_bytes(width);
-                self.values.len.checked_div(per).unwrap_or(0)
+                // Derived from the header before `check_layout` has vetted the
+                // width, so the row length is computed checked: an overflowing
+                // width describes no rows at all, which the layout check then
+                // rejects.
+                match self.dtype.checked_row_bytes(width) {
+                    Some(per) => self.values.len.checked_div(per).unwrap_or(0),
+                    None => 0,
+                }
             }
             ColumnLayout::Irregular { offsets } => {
                 let element_size = offsets.dtype.size();
@@ -921,9 +972,11 @@ pub struct NeighborList<'a> {
 }
 
 impl<'a> NeighborList<'a> {
-    /// Wrap raw neighbor bytes tagged with their index width. Used by the reader
-    /// and, across the crate, by search tests building fixtures.
-    pub(crate) fn new(bytes: &'a [u8], dtype: OffsetDType) -> Self {
+    /// Wrap raw neighbor bytes tagged with their index width. Public because
+    /// [`GraphLike::neighbors`] returns one: a producer outside this crate has to
+    /// build the list it yields, so a private constructor would leave the trait
+    /// unimplementable.
+    pub fn new(bytes: &'a [u8], dtype: OffsetDType) -> Self {
         NeighborList { bytes, dtype }
     }
 
@@ -1028,6 +1081,8 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     ) -> Option<&[u8]> {
         match column.layout {
             ColumnLayout::Regular { width } => {
+                // Safe to use the infallible form: a `TableView` only exists
+                // after `check_layout` proved this width against the buffer.
                 let per = column.dtype.row_bytes(width);
                 self.subslice(column.values, node.checked_mul(per)?, per)
             }
@@ -1063,7 +1118,13 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     ) -> Result<(), Error> {
         match column.layout {
             ColumnLayout::Regular { width } => {
-                let per = column.dtype.row_bytes(width);
+                // The width is still untrusted here — this is the gate that
+                // proves it against the real buffer — so the row length is
+                // computed checked rather than wrapped.
+                let per = column
+                    .dtype
+                    .checked_row_bytes(width)
+                    .ok_or(Error::TooLarge)?;
                 if per.checked_mul(len) != Some(column.values.len) {
                     return Err(Error::Inconsistent);
                 }
@@ -1354,7 +1415,11 @@ fn write_column<Allocator: AllocatorLike>(
         // shape, not just the flat byte width; everything else is a scalar width.
         None => match shape {
             Shape::Matrix(rows, cols) => header.push_str(&format!(",\"shape\":[{rows},{cols}]")),
-            _ => header.push_str(&format!(",\"shape\":{}", column.width.unwrap_or(1))),
+            // An absent `shape` reads back as `Scalar`, so writing nothing is
+            // what makes a scalar column round-trip as itself instead of
+            // returning as `Vector(1)`.
+            Shape::Scalar => {}
+            Shape::Vector(cols) => header.push_str(&format!(",\"shape\":{cols}")),
         },
     }
     header.push_str(&format!(

@@ -36,13 +36,14 @@ pub(crate) fn select_top_k<Score: Copy + Default + Widen>(
     ranking: Ranking,
     nodes_out: &mut [u64],
     scores_out: &mut [f64],
-) -> usize {
+) -> Result<usize, Error> {
     let k = nodes_out.len();
     let mut filled = 0usize;
     for row in 0..rows {
-        let Some(score) = tile.get(row, col) else {
-            continue;
-        };
+        // A missing cell means the tile was reshaped for a different scan;
+        // fail the batch rather than silently under-filling `counts`, matching
+        // `rank_tile`'s handling of the same mismatch.
+        let score = tile.get(row, col).ok_or(Error::Inconsistent)?;
         let score = score.widen();
         if filled < k {
             insert_pair(nodes_out, scores_out, filled, row as u64, score, ranking);
@@ -54,7 +55,7 @@ pub(crate) fn select_top_k<Score: Copy + Default + Widen>(
     for slot in nodes_out.iter_mut().skip(filled) {
         *slot = u64::MAX;
     }
-    filled
+    Ok(filled)
 }
 
 /// Insert `(node, score)` into the sorted prefix `..=end` of two parallel arrays,
@@ -135,7 +136,7 @@ where
             ranking,
             matches.row_mut(query).ok_or(Error::Inconsistent)?,
             distances.row_mut(query).ok_or(Error::Inconsistent)?,
-        ) as u64;
+        )? as u64;
     }
     Ok(())
 }
