@@ -54,25 +54,35 @@ pub enum Ranking {
 }
 
 impl Ranking {
-    /// Does `a` outrank `b` under this direction?
+    /// Does `a` outrank `b` under this direction? Routed through
+    /// [`compare`](Ranking::compare) so the two ranking paths — `insert_at` and
+    /// `insert_pair` — cannot drift apart on how they treat a `NaN`.
     pub fn outranks(self, a: f64, b: f64) -> bool {
-        match self {
-            Ranking::Nearest => a < b,
-            Ranking::Farthest => a > b,
-        }
+        self.compare(a, b) == Ordering::Greater
     }
 
     /// Order two native scores best-first under this direction — the comparator
     /// every family's `SearcherLike::compare` and `rank_tile` hand to the pool.
+    /// `Greater` means __`a` is the better match__: a priority comparator, not a
+    /// natural ordering, so a caller sorting with it wants `.reverse()`.
     /// Generic over the metric's own `Score`, so it runs on unwidened values; a
     /// `NaN` sinks (`Ordering::Less`) rather than poisoning the order. This is the
     /// one home for what was a per-file `smaller_first`/`larger_first`.
     pub fn compare<Score: PartialOrd>(self, a: Score, b: Score) -> Ordering {
-        let ordered = match self {
-            Ranking::Nearest => b.partial_cmp(&a),
-            Ranking::Farthest => a.partial_cmp(&b),
-        };
-        ordered.unwrap_or(Ordering::Less)
+        match a.partial_cmp(&b) {
+            Some(natural) => match self {
+                Ranking::Nearest => natural.reverse(),
+                Ranking::Farthest => natural,
+            },
+            // Incomparable means one side is a `NaN`. Testing `b` against itself
+            // says which: if `b` is comparable then `a` is the `NaN` and loses;
+            // otherwise `b` is, and any `a` — finite or not — outranks it. A
+            // single rule in both directions is what stops a `NaN` from taking a
+            // top-k slot no later value can evict, and from leaving the ranked
+            // prefix unsorted around it.
+            None if b.partial_cmp(&b).is_some() => Ordering::Less,
+            None => Ordering::Greater,
+        }
     }
 }
 
