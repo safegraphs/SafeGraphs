@@ -462,6 +462,22 @@ fn field_usize<Allocator: AllocatorLike>(
     to_usize(v.as_u64().ok_or(Error::WrongType)?)
 }
 
+/// The buffer alignment `__metadata__` declares: a power of two, 4096 when
+/// absent, and never below 64. Validated before it is floored, so a small
+/// non-power of two is an error rather than a silent 64.
+fn declared_alignment<Allocator: AllocatorLike>(
+    metadata: Option<&Json<Allocator>>,
+) -> Result<usize, Error> {
+    let Some(value) = metadata.and_then(|object| object.get("alignment")) else {
+        return Ok(4096);
+    };
+    let value = to_usize(value.as_u64().ok_or(Error::WrongType)?)?;
+    if !value.is_power_of_two() {
+        return Err(Error::Inconsistent);
+    }
+    Ok(value.max(64))
+}
+
 /// Parse a column's `"shape"`: absent is [`Shape::Scalar`], a bare number `w` is
 /// [`Shape::Vector`]`(w)`, a two-element array `[rows, cols]` is
 /// [`Shape::Matrix`] (a leading `0` marking the ragged axis). A one-element
@@ -679,9 +695,24 @@ impl<'t> TableView<'t> {
         self.len() == 0
     }
 
-    /// The value column's logical [`Shape`].
+    /// The key column's dtype string, as the header spells it.
+    pub fn key_dtype(&self) -> &'t str {
+        self.key_dtype
+    }
+
+    /// The value column's dtype string, as the header spells it.
+    pub fn value_dtype(&self) -> &'t str {
+        self.value_dtype
+    }
+
+    /// The key column's logical [`Shape`], `None` for a shapeless ragged column.
+    pub fn key_shape(&self) -> Option<Shape> {
+        declared_shape(&self.key)
+    }
+
+    /// The value column's logical [`Shape`], `None` for a shapeless ragged column.
     pub fn value_shape(&self) -> Option<Shape> {
-        Some(self.value.shape)
+        declared_shape(&self.value)
     }
 
     /// The value column's flat element width, for the rank-1 families.
@@ -833,6 +864,9 @@ impl GraphLike for TableView<'_> {
     fn value_dtype(&self) -> &str {
         self.value_dtype
     }
+    fn key_shape(&self) -> Option<Shape> {
+        TableView::key_shape(self)
+    }
     fn value_shape(&self) -> Option<Shape> {
         TableView::value_shape(self)
     }
@@ -873,13 +907,10 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
         self.metadata()?.get(key)
     }
 
-    /// Declared buffer alignment, defaulting to 4096 and floored at 64.
+    /// Declared buffer alignment: a power of two, 4096 when absent, 64 at least.
+    /// Opening the file proved it, so this cannot fail here.
     pub fn alignment(&self) -> usize {
-        self.metadata_get("alignment")
-            .and_then(|v| v.as_u64())
-            .and_then(|v| usize::try_from(v).ok())
-            .unwrap_or(4096)
-            .max(64)
+        declared_alignment(self.metadata()).unwrap_or(4096)
     }
 
     pub fn expansion(&self) -> Option<u64> {
@@ -920,7 +951,10 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     }
 
     /// The data-only view the table's own accessors delegate through — no
-    /// header lookups, so per-node delegation costs nothing.
+    /// header lookups, so per-node delegation costs nothing. It carries no dtype
+    /// strings, so `key_dtype` and `value_dtype` go to [`dtype_name`] instead.
+    ///
+    /// [`dtype_name`]: Table::dtype_name
     fn columns_view(&self) -> TableView<'_> {
         TableView {
             bytes: self.bytes(),
@@ -939,12 +973,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     /// graph index seeds about `connectivity` — no magic constant, since the
     /// figure is read from the graph itself.
     pub fn mean_degree(&self) -> usize {
-        let nodes = self.len();
-        if nodes == 0 {
-            return 0;
-        }
-        let entries = self.neighbors.values.len / self.neighbors.dtype.size();
-        entries / nodes
+        self.columns_view().mean_degree()
     }
 }
 
@@ -975,6 +1004,16 @@ impl<Element: ElementLike> Column<Element> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// A column's shape as a producer would declare it: `None` when the rows are
+/// ragged and carry no fixed axis at all, so `None` means the same thing on both
+/// sides of [`GraphLike`] and a rebuild picks the layout the file already has.
+fn declared_shape<Element: ElementLike>(column: &Column<Element>) -> Option<Shape> {
+    match (column.layout, column.shape) {
+        (ColumnLayout::Irregular { .. }, Shape::Scalar) => None,
+        _ => Some(column.shape),
     }
 }
 
@@ -1037,7 +1076,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     /// The whole value buffer, contiguous, for a batch scan. Only meaningful for
     /// a regular value column; pair with [`GraphLike::value_shape`].
     pub fn value_buffer(&self) -> &[u8] {
-        self.buffer(self.value.values)
+        self.columns_view().value_buffer()
     }
 
     /// The value column's prefix-sum buffer and its width, or `None` when the
@@ -1047,93 +1086,22 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     /// prefix sums plus concatenated bytes — and a sequence metric can hand that
     /// pair to its backend with no copy, provided it can reach both halves.
     pub fn value_offsets(&self) -> Option<(&[u8], OffsetDType)> {
-        match self.value.layout {
-            ColumnLayout::Regular { .. } => None,
-            ColumnLayout::Irregular { offsets } => {
-                Some((self.buffer(offsets.range), offsets.dtype))
-            }
-        }
+        self.columns_view().value_offsets()
     }
 
     /// The node whose key equals `key` byte-for-byte, by linear scan.
     pub fn find_key(&self, key: &[u8]) -> Option<usize> {
-        (0..self.len()).find(|&node| self.node_bytes(&self.key, node) == Some(key))
+        self.columns_view().find_key(key)
     }
 
-    /// Slice a validated buffer out of the data segment. Relies on the open-time
-    /// invariant that every stored `ByteRange` lies within the map, and degrades
-    /// to an empty slice rather than panicking if that were ever violated.
-    fn buffer(&self, range: ByteRange) -> &[u8] {
-        let start = self.data_start.wrapping_add(range.start);
-        let end = start.wrapping_add(range.len);
-        self.bytes().get(start..end).unwrap_or(&[])
-    }
-
-    /// Slice `len` bytes at `offset` within a column's values buffer, checking the
-    /// sub-range stays inside it.
-    fn subslice(&self, values: ByteRange, offset: usize, len: usize) -> Option<&[u8]> {
-        if offset.checked_add(len)? > values.len {
-            return None;
-        }
-        Some(self.buffer(ByteRange {
-            start: values.start.checked_add(offset)?,
-            len,
-        }))
-    }
-
-    /// The `[begin, end)` element indices of node `node` in an irregular column,
-    /// read from its prefix-sum buffer and checked monotonic.
-    fn node_span(&self, offsets: IrregularOffsets, node: usize) -> Option<(usize, usize)> {
-        let element_size = offsets.dtype.size();
-        let offset_bytes = self.buffer(offsets.range);
-        let read = |i: usize| -> Option<usize> {
-            let slot = offset_bytes.get(
-                i.checked_mul(element_size)?
-                    ..i.checked_mul(element_size)?.checked_add(element_size)?,
-            )?;
-            match offsets.dtype {
-                OffsetDType::U32 => Some(u32::from_le_bytes(slot.try_into().ok()?) as usize),
-                OffsetDType::U64 => to_usize(u64::from_le_bytes(slot.try_into().ok()?)).ok(),
-            }
-        };
-        let begin = read(node)?;
-        let end = read(node.checked_add(1)?)?;
-        if begin > end {
-            None
-        } else {
-            Some((begin, end))
-        }
-    }
-
-    /// Raw bytes of node `node` in any column, regular or irregular.
-    fn node_bytes<Element: ElementLike>(
-        &self,
-        column: &Column<Element>,
-        node: usize,
-    ) -> Option<&[u8]> {
-        match column.layout {
-            ColumnLayout::Regular { width } => {
-                // Safe to use the infallible form: a `TableView` only exists
-                // after `check_layout` proved this width against the buffer.
-                let per = column.dtype.row_bytes(width);
-                self.subslice(column.values, node.checked_mul(per)?, per)
-            }
-            ColumnLayout::Irregular { offsets } => {
-                let element_size = column.dtype.size();
-                let (begin, end) = self.node_span(offsets, node)?;
-                let offset = begin.checked_mul(element_size)?;
-                let len = end.checked_sub(begin)?.checked_mul(element_size)?;
-                self.subslice(column.values, offset, len)
-            }
-        }
-    }
-
-    /// Check every buffer lies within the map and the columns agree on shape.
+    /// Check every buffer lies within the map on its declared alignment, and
+    /// that the columns agree on node count.
     fn validate(&self) -> Result<(), Error> {
+        let alignment = declared_alignment(self.metadata())?;
         let len = self.key.len();
-        self.check_layout(&self.key, len)?;
-        self.check_layout(&self.value, len)?;
-        self.check_layout(&self.neighbors, len)?;
+        self.check_layout(&self.key, len, alignment)?;
+        self.check_layout(&self.value, len, alignment)?;
+        self.check_layout(&self.neighbors, len, alignment)?;
         if let Some(declared) = self.metadata_get("nodes").and_then(|v| v.as_u64()) {
             if usize::try_from(declared).ok() != Some(len) {
                 return Err(Error::Inconsistent);
@@ -1147,6 +1115,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
         &self,
         column: &Column<Element>,
         len: usize,
+        alignment: usize,
     ) -> Result<(), Error> {
         match column.layout {
             ColumnLayout::Regular { width } => {
@@ -1162,7 +1131,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
                 }
             }
             ColumnLayout::Irregular { offsets } => {
-                self.check_buffer(offsets.range)?;
+                self.check_buffer(offsets.range, alignment)?;
                 let expected = len
                     .checked_add(1)
                     .and_then(|count| count.checked_mul(offsets.dtype.size()))
@@ -1172,11 +1141,15 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
                 }
             }
         }
-        self.check_buffer(column.values)
+        self.check_buffer(column.values, alignment)
     }
 
-    /// Confirm a buffer's end falls within the mapped file.
-    fn check_buffer(&self, range: ByteRange) -> Result<(), Error> {
+    /// Confirm a buffer begins on the declared alignment and ends within the
+    /// mapped file.
+    fn check_buffer(&self, range: ByteRange, alignment: usize) -> Result<(), Error> {
+        if !range.start.is_multiple_of(alignment) {
+            return Err(Error::Inconsistent);
+        }
         let end = self
             .data_start
             .checked_add(range.start)
@@ -1203,30 +1176,28 @@ impl<Allocator: AllocatorLike> GraphLike for Table<Allocator> {
         self.dtype_name("value").unwrap_or("")
     }
 
+    fn key_shape(&self) -> Option<Shape> {
+        declared_shape(&self.key)
+    }
+
     fn value_shape(&self) -> Option<Shape> {
-        Some(self.value.shape)
+        declared_shape(&self.value)
     }
 
     fn neighbors_degree(&self) -> Option<usize> {
-        match self.neighbors.layout {
-            ColumnLayout::Regular { width } => Some(width),
-            ColumnLayout::Irregular { .. } => None,
-        }
+        self.columns_view().neighbors_degree()
     }
 
     fn key(&self, node: usize) -> &[u8] {
-        self.node_bytes(&self.key, node).unwrap_or(&[])
+        self.columns_view().key(node)
     }
 
     fn value(&self, node: usize) -> &[u8] {
-        self.node_bytes(&self.value, node).unwrap_or(&[])
+        self.columns_view().value(node)
     }
 
     fn neighbors(&self, node: usize) -> NeighborList<'_> {
-        NeighborList::new(
-            self.node_bytes(&self.neighbors, node).unwrap_or(&[]),
-            self.neighbors.dtype,
-        )
+        self.columns_view().neighbors(node)
     }
 }
 
@@ -1252,6 +1223,16 @@ pub trait GraphLike {
     /// Header dtype strings for the payload columns, e.g. "u64", "f16".
     fn key_dtype(&self) -> &str;
     fn value_dtype(&self) -> &str;
+
+    /// The key column's logical [`Shape`], or `None` for ragged keys of no fixed
+    /// width. Defaults to a scalar key, and to ragged for `utf8`, which is what a
+    /// producer of variable-length string keys wants without saying so.
+    fn key_shape(&self) -> Option<Shape> {
+        match self.key_dtype() {
+            "utf8" => None,
+            _ => Some(Shape::Scalar),
+        }
+    }
 
     /// The value column's logical [`Shape`], or None if the producer declares
     /// none. Rank-2 families (mesh, maxsim) read the second axis from it; the
@@ -1379,7 +1360,8 @@ impl<Allocator: AllocatorLike + Clone> ColumnBuilder<Allocator> {
             // elements tight, so the length is checked against that, never against
             // a per-element size the packing would make fractional.
             Some(width) => {
-                if bytes.len() != self.dtype.row_bytes(width) {
+                let row = self.dtype.checked_row_bytes(width).ok_or(Error::TooLarge)?;
+                if bytes.len() != row {
                     return Err(Error::Inconsistent);
                 }
                 push_bytes(&mut self.values, bytes)?;
@@ -1486,17 +1468,16 @@ where
     Allocator: AllocatorLike + Clone,
 {
     let node_count = graph.len();
-    let alignment = metadata
-        .and_then(|object| object.get("alignment"))
-        .and_then(|v| v.as_u64())
-        .and_then(|v| usize::try_from(v).ok())
-        .unwrap_or(4096)
-        .max(64);
+    let alignment = declared_alignment(metadata)?;
 
     let key_dtype = graph.key_dtype();
     let key_storage = StorageDType::from_dtype(key_dtype.as_bytes())?;
-    let key_width = if key_dtype == "utf8" { None } else { Some(1) };
-    let mut key = ColumnBuilder::new(key_storage, key_width, &alloc)?;
+    let key_shape = graph.key_shape();
+    let mut key = ColumnBuilder::new(
+        key_storage,
+        key_shape.and_then(Shape::regular_width),
+        &alloc,
+    )?;
     for i in 0..node_count {
         key.push_row(graph.key(i))?;
     }
@@ -1573,7 +1554,7 @@ where
         "key",
         key_dtype,
         &key,
-        Shape::Vector(key.width.unwrap_or(1)),
+        key_shape.unwrap_or(Shape::Scalar),
         key_offsets_start,
         key_values_start,
     );
@@ -1747,5 +1728,118 @@ mod tests {
             .map(|node| (node.key.len(), node.value.len(), node.neighbors.len()))
             .collect();
         assert_eq!(shapes, vec![(8, 8, 2), (8, 8, 2), (8, 8, 2)]);
+    }
+
+    /// A ragged value column, the layout every sequence metric reads. Rebuilding
+    /// one is what a shape of `None` on both sides of the trait makes possible.
+    struct RaggedValues;
+
+    impl GraphLike for RaggedValues {
+        fn len(&self) -> usize {
+            3
+        }
+        fn key_dtype(&self) -> &str {
+            "u64"
+        }
+        fn value_dtype(&self) -> &str {
+            "utf8"
+        }
+        fn value_shape(&self) -> Option<Shape> {
+            None
+        }
+        fn neighbors_degree(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn key(&self, i: usize) -> &[u8] {
+            const KEYS: [[u8; 8]; 3] = [
+                (10u64).to_le_bytes(),
+                (20u64).to_le_bytes(),
+                (30u64).to_le_bytes(),
+            ];
+            &KEYS[i]
+        }
+        fn value(&self, i: usize) -> &[u8] {
+            const WORDS: [&[u8]; 3] = [b"kitten", b"sitting", b"mitten"];
+            WORDS[i]
+        }
+        fn neighbors(&self, i: usize) -> NeighborList<'_> {
+            const ROWS: [[u8; 4]; 3] = [[1, 0, 0, 0], [2, 0, 0, 0], [0, 0, 0, 0]];
+            NeighborList::new(&ROWS[i], OffsetDType::U32)
+        }
+    }
+
+    #[test]
+    fn a_ragged_value_column_rebuilds() {
+        let table = Table::build(&RaggedValues, None).unwrap();
+        assert_eq!(table.value_shape(), None);
+        assert_eq!(table.value(1), b"sitting");
+
+        let rebuilt = Table::build(&table, None).unwrap();
+        assert_eq!(rebuilt.value_shape(), None);
+        assert_eq!(rebuilt.value(0), b"kitten");
+        assert_eq!(rebuilt.value(2), b"mitten");
+        assert_eq!(rebuilt.as_bytes(), table.as_bytes());
+    }
+
+    /// Fixed-width `utf8` keys, the layout a rebuild used to turn ragged because
+    /// it read the dtype string rather than the declared shape.
+    struct FixedKeys;
+
+    impl GraphLike for FixedKeys {
+        fn len(&self) -> usize {
+            2
+        }
+        fn key_dtype(&self) -> &str {
+            "utf8"
+        }
+        fn key_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(8))
+        }
+        fn value_dtype(&self) -> &str {
+            "f32"
+        }
+        fn value_shape(&self) -> Option<Shape> {
+            Some(Shape::Vector(1))
+        }
+        fn neighbors_degree(&self) -> Option<usize> {
+            Some(1)
+        }
+        fn key(&self, i: usize) -> &[u8] {
+            const KEYS: [&[u8; 8]; 2] = [b"wiki-1m\0", b"deep-1b\0"];
+            KEYS[i]
+        }
+        fn value(&self, _i: usize) -> &[u8] {
+            &[0, 0, 128, 63]
+        }
+        fn neighbors(&self, i: usize) -> NeighborList<'_> {
+            const ROWS: [[u8; 4]; 2] = [[1, 0, 0, 0], [0, 0, 0, 0]];
+            NeighborList::new(&ROWS[i], OffsetDType::U32)
+        }
+    }
+
+    #[test]
+    fn a_fixed_width_key_column_stays_fixed_through_a_rebuild() {
+        let table = Table::build(&FixedKeys, None).unwrap();
+        assert_eq!(table.key_shape(), Some(Shape::Vector(8)));
+        assert_eq!(table.key(0), b"wiki-1m\0");
+
+        let rebuilt = Table::build(&table, None).unwrap();
+        assert_eq!(rebuilt.key_shape(), Some(Shape::Vector(8)));
+        assert_eq!(rebuilt.key(1), b"deep-1b\0");
+        assert_eq!(rebuilt.as_bytes(), table.as_bytes());
+    }
+
+    /// An alignment that is not a power of two is refused, whether it is above
+    /// the floor or below it, rather than coerced to 64.
+    #[test]
+    fn a_bad_alignment_is_refused() {
+        for alignment in ["96", "3"] {
+            let metadata = format!("{{\"alignment\":{alignment}}}");
+            let document = parse_in(metadata.as_bytes(), Global).unwrap();
+            assert!(matches!(
+                Table::build(&toy(), Some(&document)),
+                Err(Error::Inconsistent)
+            ));
+        }
     }
 }

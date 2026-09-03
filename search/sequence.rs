@@ -267,8 +267,13 @@ fn open_device(scope: ExecutionScope) -> Result<szs::DeviceScope, Error> {
 
 /// Borrow a table's variable-length value column as a tape, with no copy: the
 /// prefix sums and the concatenated bytes are already exactly what StringZilla
-/// wants. Fails only on a regular column, which has no offsets to borrow.
+/// wants. Fails on a regular column, which has no offsets to borrow, and on any
+/// column that is not `utf8`, since a row start counts elements and a tape
+/// slices bytes — the two agree only at one byte per element.
 fn value_tape(table: TableView<'_>) -> Result<szs::AnyBytesTape<'_>, Error> {
+    if table.value_dtype() != "utf8" {
+        return Err(Error::WrongType);
+    }
     let (offset_bytes, dtype) = table.value_offsets().ok_or(Error::WrongType)?;
     let values = table.value_buffer();
     let expected = table.len() + 1;
@@ -1146,38 +1151,44 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scan_refuses_a_regular_column() {
-        // A fixed-width column has no offsets, so there is no tape to borrow.
-        struct Fixed;
-        impl GraphLike for Fixed {
-            fn len(&self) -> usize {
-                1
-            }
-            fn key_dtype(&self) -> &str {
-                "u64"
-            }
-            fn value_dtype(&self) -> &str {
-                "i8"
-            }
-            fn value_shape(&self) -> Option<Shape> {
-                Some(Shape::Vector(2))
-            }
-            fn neighbors_degree(&self) -> Option<usize> {
-                Some(0)
-            }
-            fn key(&self, _i: usize) -> &[u8] {
-                &[0; 8]
-            }
-            fn value(&self, _i: usize) -> &[u8] {
-                &[1, 2]
-            }
-            fn neighbors(&self, _i: usize) -> NeighborList<'_> {
-                NeighborList::new(&[], OffsetDType::U32)
-            }
-        }
+    /// A one-node graph whose value column the caller shapes, for the two ways a
+    /// column can fail to be a tape.
+    struct OneNode {
+        dtype: &'static str,
+        shape: Option<Shape>,
+    }
 
-        let table = crate::Table::build(&Fixed, None).unwrap();
+    impl GraphLike for OneNode {
+        fn len(&self) -> usize {
+            1
+        }
+        fn key_dtype(&self) -> &str {
+            "u64"
+        }
+        fn value_dtype(&self) -> &str {
+            self.dtype
+        }
+        fn value_shape(&self) -> Option<Shape> {
+            self.shape
+        }
+        fn neighbors_degree(&self) -> Option<usize> {
+            Some(0)
+        }
+        fn key(&self, _i: usize) -> &[u8] {
+            &[0; 8]
+        }
+        fn value(&self, _i: usize) -> &[u8] {
+            &[1, 2]
+        }
+        fn neighbors(&self, _i: usize) -> NeighborList<'_> {
+            NeighborList::new(&[], OffsetDType::U32)
+        }
+    }
+
+    /// Scanning `graph` must fail with [`Error::WrongType`], whichever guard
+    /// catches it.
+    fn expect_wrong_type(graph: &OneNode) {
+        let table = crate::Table::build(graph, None).unwrap();
         let mut scanner =
             LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
                 .unwrap();
@@ -1188,5 +1199,24 @@ mod tests {
             scanner.scan(queries, &table, &mut matches, &mut distances, &mut counts),
             Err(Error::WrongType)
         ));
+    }
+
+    /// A fixed-width column has no offsets, so there is no tape to borrow.
+    #[test]
+    fn scan_refuses_a_regular_column() {
+        expect_wrong_type(&OneNode {
+            dtype: "utf8",
+            shape: Some(Shape::Vector(2)),
+        });
+    }
+
+    /// A ragged column of anything but bytes has row starts counting elements
+    /// where a tape slices bytes, so the two disagree.
+    #[test]
+    fn scan_refuses_a_non_utf8_column() {
+        expect_wrong_type(&OneNode {
+            dtype: "u16",
+            shape: None,
+        });
     }
 }
