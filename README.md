@@ -27,13 +27,14 @@ The second is optimal for distributing billion-scale indexes.
 __Easy to Traverse & Evaluate__.
 Optimal search indexes are asymptotically hard to build.
 But it doesn't mean analyzing or evaluating them should be equally hard.
-This repository comes with built-in extensions for greedy graph traversals using some common metrics and the A* algorithm.
+This repository comes with built-in extensions for greedy graph traversals using some common metrics.
+The walk is best-first over the metric itself — the degenerate A* whose path cost is zero — restarting from fresh landmarks whenever a frontier drains before the result pool fills.
 
 __Least Machinery__.
 A format cannot know a consumer's page size, its storage device, or whether it will scan or walk, and the layer above knows all three.
 So SafeGraphs stores rows as the producer declared them and adds no layout machinery of its own: no per-entry padding, no block framing, no reordering.
 A producer that wants every row to land inside one page picks a `shape` whose row divides it; one that would rather spend the loads leaves it alone.
-Either way an entry can straddle a page or a device sector, and how to handle that split read is the consumer's call, made where the access pattern is actually known.
+Either way a row can straddle a page or a device sector, and how to handle that split read is the consumer's call, made where the access pattern is actually known.
 
 ## File Structure
 
@@ -48,7 +49,7 @@ There are no layers and no hierarchy, so a node's edges are simply its outgoing 
 
 ### Monolith
 
-For datasets up to roughly 100M nodes, a single `.safegraphs` file holds everything.
+A single `.safegraphs` file holds everything: the schema, the keys, the payloads, and the graph.
 
 ```
 ┌────────────────────────────────────┐
@@ -60,25 +61,26 @@ For datasets up to roughly 100M nodes, a single `.safegraphs` file holds everyth
 │  - __metadata__                    │
 │  - key / value / neighbors schema  │
 ├────────────────────────────────────┤
-│ Data: key offsets, if any          │
+│ Data: key offsets, if ragged       │
 ├────────────────────────────────────┤
-│ Data: key values                   │
+│ Data: key data                     │
 ├────────────────────────────────────┤
-│ Data: value offsets, if any        │
+│ Data: value offsets, if ragged     │
 ├────────────────────────────────────┤
-│ Data: value values                 │
+│ Data: value data                   │
 ├────────────────────────────────────┤
-│ Data: neighbors offsets, if any    │
+│ Data: neighbors offsets, if ragged │
 ├────────────────────────────────────┤
-│ Data: neighbors values             │
+│ Data: neighbors data               │
 └────────────────────────────────────┘
 ```
 
 An 8-byte magic and a `u64` header size keep everything 8-byte aligned from the first byte and let tools sniff the file type.
 All integers are little-endian.
 The header size counts the space padding, so the data segment begins at byte offset 16 plus the header size.
-Each buffer is located by a `<buffer>_start` byte position and a `<buffer>_length` byte size, where `<buffer>` is `values` or `offsets`, both relative to the start of the data segment, so the header stays position-independent even if the segment is padded ahead.
-Buffers are found through those fields alone, never by order, and they never overlap.
+Each buffer is a `[begin, end]` pair of byte positions relative to the start of the data segment, named `data` for the rows and `offsets` for a ragged column's row starts, so the header stays position-independent even if the segment is padded ahead.
+A pair of positions can only mean positions, where a start beside a length left the unit of each to the reader; the byte count is `end - begin`.
+Buffers are found through those pairs alone, never by order, and they never overlap.
 
 Every buffer, and the data segment itself, starts at a file offset that is a multiple of the `alignment` declared in `__metadata__`, a power of two defaulting to 4096 bytes, and a reader treats any declared value below 64 as 64.
 That alignment reaches the start of a buffer and stops there: rows follow one another inside a buffer with no gap, so only the first row of a column is aligned by it.
@@ -87,66 +89,68 @@ The 4 KB default matches the x86 page, the common SSD logical sector, the `O_DIR
 That default is small on purpose, for the reason RocksDB reads 4 KB SST blocks where a columnar store like ClickHouse reads 64 KB to 1 MB: a traversal touches scattered entries and wants the smallest unit that still amortizes a device read.
 A producer targeting Apple Silicon can raise `alignment` to 16384, or to 2 MB for huge pages, and readers simply honor the declared value.
 
-A flat graph has exactly three columns — `key`, `value`, and `neighbors`.
-A producer may append extra columns for its own use, and readers that only need the graph ignore them.
+A flat graph has three graph columns — `key`, `value`, and `neighbors` — and every one of them is required.
+Any other top-level key except `__metadata__` is a column in the same grammar with the same node count, which a producer writes for its own use and a graph reader ignores.
 
 ```json
 {
   "__metadata__": {
-    "metric": "dot",          # optional; distance the graph was built for, e.g. dot, euclidean, angular
-    "nodes": 20000000,        # optional; must equal the row count of key
-    "expansion": 128,         # optional, e.g. ef_construction
-    "alignment": 4096         # buffer alignment in bytes; default 4096, floor 64
+    "metric": "dot",                # optional; distance the graph was built for, e.g. dot, euclidean, angular
+    "expansion": 128,               # optional; the breadth the graph was built with, `ef_construction` by its usual name
+    "alignment": 4096,              # buffer alignment in bytes; a power of two, default 4096, floor 64
+    "created_by": "usearch 3.x",    # free-form provenance, and anything else a producer wants to record
+    "built_at": "2026-07-19"
   },
   "key": {
-    "dtype": "u64",           # node identity: u32, u64, uuid, or utf8
-    "values_start": 0,        # scalar column: no shape means width 1
-    "values_length": 0
+    "dtype": "uuid",          # node identity: u32, u64, uuid, or utf8
+    "data": [0, 320000000]    # 20M keys of 16 bytes; no shape means one element per row
   },
   "value": {
     "dtype": "f16",           # embedding vector, or utf8 for a string payload
-    "shape": 1536,            # fixed width, or [rows, cols]; offsets_* instead for variable length
-    "values_start": 0,
-    "values_length": 0
+    "shape": 1536,            # fixed width, or [rows, cols]; offsets instead for ragged rows
+    "data": [320000000, 61760000000]
   },
   "neighbors": {
     "dtype": "u32",           # node indices into this same file, never keys: u32 or u64
-    "shape": 32,              # fixed degree; offsets_* instead for variable degree
-    "values_start": 0,
-    "values_length": 0
+    "shape": 32,              # fixed degree; offsets instead for a variable one
+    "data": [61760000000, 64320000000]
   }
 }
 ```
 
-A `utf8` key or value is variable-length and gains the `offsets_*` fields of the irregular layout below.
+A `utf8` key or value carries a `shape` when its rows are a fixed width, and the `offsets` buffer of the irregular layout below when they are not.
 No column is nullable.
 Every node is present in every column, so there is no validity bitmap and no null count.
-The `key` column sets the node count, every other column must agree with it, and so must `nodes` when declared.
+The `key` column sets the node count, and every other column must agree with it.
+No header field restates that count, since a second source of truth for a derivable fact can only disagree.
 A node with no outgoing edges is a zero-length `neighbors` list, which is empty rather than null, and any optional payload must be encoded in-band, never as a null.
 Keys are global to a dataset and need not be unique, so several nodes may carry the same key, each with its own value.
 
 Within a `neighbors` list, any index at or past the node count is a __sentinel__ and names no node: a reader skips it.
 This is what lets a fixed-degree `neighbors` column stand in for a variable-degree one — a producer pads a short adjacency row with a sentinel rather than dropping to the irregular layout.
 A sentinel may sit anywhere in a row, though a producer normally pads the tail.
-Any out-of-range value serves, so there is no distinguished sentinel to agree on; the node count itself, or the index type's maximum, is the natural choice.
+Any out-of-range value serves, so a reader needs no agreement to skip one, and a producer writes the index type's maximum by convention.
 A reader that walks the graph honors this; one that only unpacks buffers hands the raw indices through untouched, since it relabels the buffer rather than reading it.
 
 ### Regular vs Irregular Columns
 
-Each column is a flat set of scalar fields, and the presence of `offsets_dtype` selects the layout.
+The presence of an `offsets` buffer selects the layout.
 
-- __Regular__ has no `offsets_dtype`, so it is an Arrow primitive array when `shape` is omitted and a `FixedSizeList<T, shape>` otherwise.
-  A single values buffer holds the concatenated rows, located by `values_start` and `values_length`.
-  `shape` is the fixed width, a bare number or a `[rows, cols]` pair whose product is the width, and defaults to 1 when omitted, so node `i` occupies `values[i * shape .. (i + 1) * shape]` and the node count is `values_length / (shape * sizeof(dtype))`.
+- __Regular__ has no `offsets`, so it is an Arrow primitive array when `shape` is omitted and a `FixedSizeList<T, shape>` otherwise.
+  Its `data` buffer holds the concatenated rows and nothing else.
+  `shape` is the fixed width, a bare number or a `[rows, cols]` pair whose product is the width, and defaults to 1 when omitted.
+  A row occupies `shape` elements, so the node count is the `data` byte count divided by the byte length of one row, which is `shape × bits` rounded up to whole bytes and equals `shape` times the element size for every whole-byte dtype.
   Use this for scalar keys, vectors, and fixed-degree graphs.
-- __Irregular__ has an `offsets_dtype` of `u32` or `u64`, so it is an Arrow `List<T>` or `LargeList<T>`, and carries no fixed width.
+- __Irregular__ has an `offsets` buffer and an `offsets_dtype` of `u32` or `u64`, so it is an Arrow `List<T>` or `LargeList<T>`, and carries no fixed width.
   A `[0, cols]` shape marks a ragged matrix whose inner axis is `cols`, so a row of `n` elements holds `n / cols` vectors.
-  It has two buffers: the prefix-sum buffer at `offsets_start` and `offsets_length` holding `nodes + 1` non-decreasing prefix sums, plus the values buffer at `values_start` and `values_length`.
-  Reading the prefix sums as `p`, node `i`'s elements are `values[p[i] .. p[i + 1]]`, with `p[0] == 0` and `p[nodes]` equal to the total element count.
+  The `offsets` buffer holds `nodes + 1` non-decreasing prefix sums in elements, and `data` holds the concatenated rows.
+  Node `i` is the elements of `data` between prefix sums `i` and `i + 1`, the first sum being zero and the last the total element count.
 
-Arrow's offsets are signed but never negative, so an Arrow `List` offsets buffer is copied under the `u32` label unchanged, and a SafeGraphs column goes back to Arrow whenever its last prefix sum fits the signed width.
+Arrow's offsets are signed but never negative, so an Arrow `List` or `LargeList` offsets buffer is copied under the `u32` or `u64` label unchanged, and a SafeGraphs column goes back to Arrow whenever its last prefix sum fits the signed width.
 
-`dtype` names one element: the floats `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`; the signed integers `i64`, `i32`, `i16`, `i8`, `i4x2`; the unsigned `u64`, `u32`, `u16`, `u8`, `u4x2`, `u1x8`; a 16-byte `uuid`; and `utf8`.
+`dtype` names one element, and every storage width has a neutral spelling `b128`, `b64`, `b32`, `b16`, `b8` naming that many opaque bits.
+Every other spelling is an alias that adds a reading to the same width: the floats `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`; the signed integers `i64`, `i32`, `i16`, `i8`, `i4x2`; the unsigned `u64`, `u32`, `u16`, `u8`, `u4x2`, `u1x8`; `uuid` for a 16-byte identity; and `utf8` for bytes a reader may assume are valid UTF-8.
+A column of opaque bytes that are not text uses `b8`, which a sequence metric refuses where `utf8` it accepts.
 The `x2` and `x8` suffixes name packed sub-byte elements, two nibbles or eight bits to the byte, so `shape` counts logical elements and a row of `shape` such elements occupies `shape × bits / 8` bytes rounded up.
 
 A concrete variable-degree `neighbors` column, with 3 nodes of degree 2, 3, and 1:
@@ -155,29 +159,25 @@ A concrete variable-degree `neighbors` column, with 3 nodes of degree 2, 3, and 
 "neighbors": {
   "dtype": "u32",
   "offsets_dtype": "u32",   # prefix sums [0, 2, 5, 6] — 4 × u32 = 16 bytes
-  "offsets_start": 0,
-  "offsets_length": 16,
-  "values_start": 4096,     # next alignment boundary; 6 × u32 node indices = 24 bytes
-  "values_length": 24
+  "offsets": [0, 16],
+  "data": [4096, 4120]      # next alignment boundary; 6 × u32 node indices = 24 bytes
 }
 ```
 
 ### String Columns
 
-A string key or a string value uses `dtype: "utf8"`, an Arrow `Utf8` or `LargeUtf8`.
-This is just the irregular layout above with byte values.
-The `offsets_*` buffer holds `nodes + 1` prefix sums, the `values_*` buffer holds the concatenated UTF-8 bytes, and string `i` is the byte slice between prefix sums `i` and `i + 1`.
-There is no separate ASCII or fixed-width string type.
-All text is UTF-8, so any language or emoji round-trips without a codepage, and bytes that are not valid UTF-8 belong in an irregular `u8` column instead, Arrow's `Binary`.
+A string key or a string value uses `dtype: "utf8"`.
+Without a `shape` it is the irregular layout above with byte elements, an Arrow `Utf8` or `LargeUtf8`: the `offsets` buffer holds `nodes + 1` prefix sums, `data` holds the concatenated UTF-8 bytes, and string `i` is the byte slice between prefix sums `i` and `i + 1`.
+With a `shape` it is a fixed-width column of that many bytes per string, an Arrow `FixedSizeBinary`, which loses the string reading on the way into Arrow since Arrow has no fixed-width UTF-8 type.
+There is no separate ASCII type.
+All text is UTF-8, so any language or emoji round-trips without a codepage, and bytes that are not valid UTF-8 belong in a `u8` column instead, Arrow's `Binary` or `FixedSizeBinary`.
 
 ```json
 "key": {
   "dtype": "utf8",
   "offsets_dtype": "u64",   # prefix sums [0, 2, 7, 13] — 4 × u64 = 32 bytes
-  "offsets_start": 0,
-  "offsets_length": 32,
-  "values_start": 4096,     # next alignment boundary; "α" 2 + "béé" 5 + "日本" 6 = 13 UTF-8 bytes
-  "values_length": 13
+  "offsets": [0, 32],
+  "data": [4096, 4109]      # next alignment boundary; "α" 2 + "béé" 5 + "日本" 6 = 13 UTF-8 bytes
 }
 ```
 
@@ -195,25 +195,20 @@ dataset-00002-of-00002.safegraphs  # shard, a full Monolith
 ```
 
 `safetensors` has no cross-file convention of its own, since it is single-file.
-Hugging Face's sharded layout adds one on top, an index that binds each tensor to its shard, and the manifest here plays the same catalog role.
-It stays thin, carrying routing, integrity, and provenance only, never column schema, which lives authoritatively in each shard's header.
+Hugging Face's sharded layout adds one on top, an index binding each tensor to its shard, which splits by column where this manifest splits by row.
+It carries routing in `path` and `keys`, sizing in `bytes` and `nodes`, and integrity in `sha256`.
+It carries no column schema, no metric, and no provenance, all of which live in each shard's own `__metadata__`, so a shard lifted out of the set still describes itself completely.
 
 ```json
 {
-  "__metadata__": {              # dataset-wide summary + free-form provenance
-    "metric": "ip",
-    "value_dtype": "f16",        # payload described as in a shard header, so a
-    "value_length": 1536,        #   reader can size a load without opening a shard
-    "key_dtype": "uuid",
-    "created_by": "usearch 2.x",
-    "embedding_model": "openai/text-embedding-3-small",
-    "built_at": "2026-07-19"
+  "__metadata__": {              # free-form, and dataset-wide rather than per-shard
+    "dataset": "wiki-1m"
   },
   "files": [
     {
       "path": "dataset-00001-of-00002.safegraphs",  # relative to the manifest
       "bytes": 21474836480,
-      "nodes": 20000000,         # optional
+      "nodes": 20000000,         # optional; lets a coordinator size a load without opening the shard
       "keys": "^[0-7]",          # optional regex over canonical key renderings
       "sha256": "9a1c…e4"        # optional; hex digest of the whole shard file
     },
@@ -228,7 +223,6 @@ It stays thin, carrying routing, integrity, and provenance only, never column sc
 }
 ```
 
-- If a summary field ever disagrees with a shard header, the shard header wins.
 - `keys` matches the canonical rendering of a key — decimal for integers, lowercase dashed UUID for `uuid`, the string itself for `utf8` — in the RE2 syntax every mainstream engine shares.
   A coordinator routes a key lookup to the shard whose regex matches, while a vector query still fans out to every shard, since edges never cross files.
   `null` or an absent field means the shard is not key-partitioned, and the regexes of a partitioned dataset are disjoint.
@@ -246,8 +240,8 @@ It drops in with zero reshaping: `value` is `FixedSizeList<dtype, dim>`, `neighb
 Any dead slot Cagra leaves in a short row is an out-of-range index, which the sentinel convention already skips, so the matrix copies over verbatim.
 
 __FAISS__ maps through `IndexNSG`, its flat navigable graph, rather than the hierarchical `IndexHNSW`.
-Its adjacency is fixed-max-degree neighbor ids that are node indices, so it drops in either way: keep the fixed matrix and let its padding become sentinels, or export a variable-length `neighbors` column that omits the padding entirely.
-Vectors come from the paired storage index, and the external ids of an `IndexIDMap` become the `key` column.
+Its adjacency is fixed-max-degree neighbor IDs that are node indices, so it drops in either way: keep the fixed matrix and let its padding become sentinels, or export a variable-length `neighbors` column that omits the padding entirely.
+Vectors come from the paired storage index, and the external IDs of an `IndexIDMap` become the `key` column.
 FAISS `IndexShards`, independent sub-indexes with their own row spaces merged at query time, is a direct match for the Distributed manifest with overlapping local offsets.
 
 ## Case Studies

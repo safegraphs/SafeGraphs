@@ -18,11 +18,11 @@
 
 use super::batch::{batch_scan, batch_search, build_workers, open_pool, ShareRead, Workers};
 use super::{
-    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
-    TraversalContext,
+    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike,
+    TraversalContext, WalkerLike,
 };
 use crate::search::dense::view_from_bytes;
-use crate::{cast, Error, IndexLike, OffsetDType, Table, TableView, Widen};
+use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use allocator_api2::vec::Vec as AVec;
 use core::cmp::Ordering;
@@ -113,7 +113,7 @@ impl<Kernel: KernelLike<Coordinate>, Coordinate: Copy + Default + 'static> Metri
 /// checks every entry point repeats: the value column must be exactly two
 /// scalars wide, or the table is not geospatial at all. Returns the node count.
 fn coordinate_columns<Coordinate: nk::StorageElement + Copy>(
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     node_latitudes: &mut AVec<Coordinate, impl AllocatorLike>,
     node_longitudes: &mut AVec<Coordinate, impl AllocatorLike>,
 ) -> Result<usize, Error> {
@@ -226,7 +226,8 @@ where
 impl<Kernel, Coordinate, Allocator> GeospatialScanner<Kernel, Coordinate, Allocator>
 where
     Kernel: KernelLike<Coordinate>,
-    Coordinate: nk::StorageElement + Copy + Default + PartialOrd + Widen + Send + Sync + 'static,
+    Coordinate:
+        nk::StorageElement + Copy + Default + PartialOrd + ScoreLike + Send + Sync + 'static,
     Allocator: AllocatorLike + Clone + Send + Sync,
 {
     /// Batch brute-force top-k, nearest-first — a great-circle distance is
@@ -235,7 +236,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -267,7 +268,7 @@ where
     fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Coordinate, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         let node_count =
@@ -373,11 +374,9 @@ where
     Ok(())
 }
 
-/// The traversal half of any geospatial metric: owns the reusable scratch and
-/// scores one expansion's staged nodes in a single kernel call, gathering their
-/// scattered coordinate pairs first — the same gather every sequence searcher
-/// pays, for the same reason.
-pub struct GeospatialSearcher<Kernel, Coordinate, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the geospatial metric: one query at a fixed node width,
+/// gathering a staged expansion's scattered coordinate pairs into one kernel call.
+pub struct GeospatialWalker<Kernel, Coordinate, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, Coordinate, Allocator>,
     staged_latitudes: AVec<Coordinate, Allocator>,
     staged_longitudes: AVec<Coordinate, Allocator>,
@@ -385,7 +384,7 @@ pub struct GeospatialSearcher<Kernel, Coordinate, Index = u32, Allocator: Alloca
     kernel: core::marker::PhantomData<fn() -> Kernel>,
 }
 
-impl<Kernel, Coordinate, Index, Allocator> GeospatialSearcher<Kernel, Coordinate, Index, Allocator>
+impl<Kernel, Coordinate, Index, Allocator> GeospatialWalker<Kernel, Coordinate, Index, Allocator>
 where
     Kernel: KernelLike<Coordinate>,
     Coordinate: Copy + Default,
@@ -393,11 +392,11 @@ where
     Allocator: AllocatorLike + Clone,
 {
     /// A searcher walking with breadth `expansion_factor`, its scratch in
-    /// `alloc`, uniform with [`DotSearcher::new`].
+    /// `alloc`, uniform with [`DotWalker::new`].
     ///
-    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
+    /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        Ok(GeospatialSearcher {
+        Ok(GeospatialWalker {
             context: TraversalContext::new_in(expansion_factor, alloc.clone())?,
             staged_latitudes: AVec::new_in(alloc.clone()),
             staged_longitudes: AVec::new_in(alloc.clone()),
@@ -412,8 +411,8 @@ where
     }
 }
 
-impl<Kernel, Coordinate, Index, Allocator> SearcherLike<GeospatialMetric<Kernel, Coordinate>>
-    for GeospatialSearcher<Kernel, Coordinate, Index, Allocator>
+impl<Kernel, Coordinate, Index, Allocator> WalkerLike<GeospatialMetric<Kernel, Coordinate>>
+    for GeospatialWalker<Kernel, Coordinate, Index, Allocator>
 where
     Kernel: KernelLike<Coordinate>,
     Coordinate: nk::StorageElement + Copy + Default + PartialOrd + 'static,
@@ -426,7 +425,7 @@ where
     fn score_nodes(
         &mut self,
         query: &[Coordinate],
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [Coordinate],
     ) -> Result<(), Error> {
@@ -476,43 +475,41 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: &[Coordinate], table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: &[Coordinate], table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<GeospatialMetric<Kernel, Coordinate>, Self>(self, query, table)
     }
 }
 
-/// A geospatial searcher whose neighbor width is settled by the tables it
-/// searches, not named by the caller — the family's width resolver, one leaf
-/// per pool thread exactly as [`DotSearch`] keeps them.
-///
-/// [`DotSearch`]: crate::search::dense::DotSearch
-pub struct GeospatialSearch<Kernel, Coordinate, Allocator: AllocatorLike = Global> {
+/// Batched geospatial walks, resolving the node width from the first table
+/// searched and holding one [`GeospatialWalker`] per pool thread.
+pub struct GeospatialSearcher<Kernel, Coordinate, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        GeospatialSearcher<Kernel, Coordinate, u32, Allocator>,
-        GeospatialSearcher<Kernel, Coordinate, u64, Allocator>,
+        GeospatialWalker<Kernel, Coordinate, u32, Allocator>,
+        GeospatialWalker<Kernel, Coordinate, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Kernel, Coordinate, Allocator> GeospatialSearch<Kernel, Coordinate, Allocator>
+impl<Kernel, Coordinate, Allocator> GeospatialSearcher<Kernel, Coordinate, Allocator>
 where
     Kernel: KernelLike<Coordinate>,
-    Coordinate: nk::StorageElement + Copy + Default + PartialOrd + Widen + Send + Sync + 'static,
+    Coordinate:
+        nk::StorageElement + Copy + Default + PartialOrd + ScoreLike + Send + Sync + 'static,
     Allocator: AllocatorLike + Clone + Send,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearch::new`].
+    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearcher::new`].
     ///
-    /// [`DotSearch::new`]: crate::search::dense::DotSearch::new
+    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(GeospatialSearch {
+        Ok(GeospatialSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -525,7 +522,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -538,7 +535,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        GeospatialSearcher::new(expansion_factor, alloc.clone())
+                        GeospatialWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -558,7 +555,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        GeospatialSearcher::new(expansion_factor, alloc.clone())
+                        GeospatialWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -582,21 +579,27 @@ where
 
 /// Spherical great-circle distance, nearest-first, meters.
 pub type HaversineMetric<Coordinate> = GeospatialMetric<HaversineKernel, Coordinate>;
+/// Exact brute force over the Haversine distance.
 pub type HaversineScanner<Coordinate, Allocator = Global> =
     GeospatialScanner<HaversineKernel, Coordinate, Allocator>;
-pub type HaversineSearcher<Coordinate, Index = u32, Allocator = Global> =
-    GeospatialSearcher<HaversineKernel, Coordinate, Index, Allocator>;
-pub type HaversineSearch<Coordinate, Allocator = Global> =
-    GeospatialSearch<HaversineKernel, Coordinate, Allocator>;
+/// One query's greedy walk under the Haversine distance.
+pub type HaversineWalker<Coordinate, Index = u32, Allocator = Global> =
+    GeospatialWalker<HaversineKernel, Coordinate, Index, Allocator>;
+/// Batched walks under the Haversine distance.
+pub type HaversineSearcher<Coordinate, Allocator = Global> =
+    GeospatialSearcher<HaversineKernel, Coordinate, Allocator>;
 
 /// WGS84 geodesic distance, nearest-first, meters.
 pub type VincentyMetric<Coordinate> = GeospatialMetric<VincentyKernel, Coordinate>;
+/// Exact brute force over the Vincenty distance.
 pub type VincentyScanner<Coordinate, Allocator = Global> =
     GeospatialScanner<VincentyKernel, Coordinate, Allocator>;
-pub type VincentySearcher<Coordinate, Index = u32, Allocator = Global> =
-    GeospatialSearcher<VincentyKernel, Coordinate, Index, Allocator>;
-pub type VincentySearch<Coordinate, Allocator = Global> =
-    GeospatialSearch<VincentyKernel, Coordinate, Allocator>;
+/// One query's greedy walk under the Vincenty distance.
+pub type VincentyWalker<Coordinate, Index = u32, Allocator = Global> =
+    GeospatialWalker<VincentyKernel, Coordinate, Index, Allocator>;
+/// Batched walks under the Vincenty distance.
+pub type VincentySearcher<Coordinate, Allocator = Global> =
+    GeospatialSearcher<VincentyKernel, Coordinate, Allocator>;
 
 // endregion: Metric aliases
 
@@ -630,7 +633,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> HaversineScannerAny<Allocat
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -656,8 +659,8 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> HaversineScannerAny<Allocat
 
 /// The batch-walk twin of [`HaversineScannerAny`].
 pub enum HaversineSearcherAny<Allocator: AllocatorLike = Global> {
-    F64(HaversineSearch<f64, Allocator>),
-    F32(HaversineSearch<f32, Allocator>),
+    F64(HaversineSearcher<f64, Allocator>),
+    F32(HaversineSearcher<f32, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> HaversineSearcherAny<Allocator> {
@@ -669,10 +672,10 @@ impl<Allocator: AllocatorLike + Clone + Send> HaversineSearcherAny<Allocator> {
     ) -> Result<Self, Error> {
         Ok(match dtype {
             "f64" => {
-                HaversineSearcherAny::F64(HaversineSearch::new(expansion_factor, scope, alloc)?)
+                HaversineSearcherAny::F64(HaversineSearcher::new(expansion_factor, scope, alloc)?)
             }
             "f32" => {
-                HaversineSearcherAny::F32(HaversineSearch::new(expansion_factor, scope, alloc)?)
+                HaversineSearcherAny::F32(HaversineSearcher::new(expansion_factor, scope, alloc)?)
             }
             _ => return Err(Error::UnknownDType),
         })
@@ -688,7 +691,7 @@ impl<Allocator: AllocatorLike + Clone + Send> HaversineSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -737,7 +740,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> VincentyScannerAny<Allocato
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -763,8 +766,8 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> VincentyScannerAny<Allocato
 
 /// The batch-walk twin of [`VincentyScannerAny`].
 pub enum VincentySearcherAny<Allocator: AllocatorLike = Global> {
-    F64(VincentySearch<f64, Allocator>),
-    F32(VincentySearch<f32, Allocator>),
+    F64(VincentySearcher<f64, Allocator>),
+    F32(VincentySearcher<f32, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> VincentySearcherAny<Allocator> {
@@ -775,8 +778,12 @@ impl<Allocator: AllocatorLike + Clone + Send> VincentySearcherAny<Allocator> {
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => VincentySearcherAny::F64(VincentySearch::new(expansion_factor, scope, alloc)?),
-            "f32" => VincentySearcherAny::F32(VincentySearch::new(expansion_factor, scope, alloc)?),
+            "f64" => {
+                VincentySearcherAny::F64(VincentySearcher::new(expansion_factor, scope, alloc)?)
+            }
+            "f32" => {
+                VincentySearcherAny::F32(VincentySearcher::new(expansion_factor, scope, alloc)?)
+            }
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -791,7 +798,7 @@ impl<Allocator: AllocatorLike + Clone + Send> VincentySearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -820,6 +827,7 @@ impl<Allocator: AllocatorLike + Clone + Send> VincentySearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::testing::outputs;
     use crate::{GraphLike, NeighborList, Shape};
 
     /// Three cities on a fully connected triangle, coordinates in radians:
@@ -885,18 +893,9 @@ mod tests {
         }
     }
 
-    /// `queries × k` outputs plus counts, the shaped-batch boilerplate.
-    fn outputs(queries: usize, k: usize) -> (Matrix<u64>, Matrix<f64>, Vec<u64>) {
-        (
-            Matrix::<u64>::new(queries, k).unwrap(),
-            Matrix::<f64>::new(queries, k).unwrap(),
-            vec![0u64; queries],
-        )
-    }
-
     #[test]
     fn haversine_scan_ranks_nearest_city() {
-        let table = crate::Table::build(&cities(), None).unwrap();
+        let table = crate::GraphTable::build(&cities(), None).unwrap();
         let mut scanner = HaversineScanner::<f64>::new(ExecutionScope::Serial, Global).unwrap();
 
         let query = berlin();
@@ -924,8 +923,9 @@ mod tests {
 
     #[test]
     fn haversine_walk_agrees_with_scan() {
-        let table = crate::Table::build(&cities(), None).unwrap();
-        let mut searcher = HaversineSearch::<f64>::new(3, ExecutionScope::Serial, Global).unwrap();
+        let table = crate::GraphTable::build(&cities(), None).unwrap();
+        let mut searcher =
+            HaversineSearcher::<f64>::new(3, ExecutionScope::Serial, Global).unwrap();
 
         let query = berlin();
         let queries =
@@ -950,7 +950,7 @@ mod tests {
         // The geodesic refines the sphere's distances without reordering three
         // cities this far apart — and its Berlin-Paris figure lands within a
         // percent of the true ~878 km.
-        let table = crate::Table::build(&cities(), None).unwrap();
+        let table = crate::GraphTable::build(&cities(), None).unwrap();
         let mut scanner = VincentyScanner::<f64>::new(ExecutionScope::Serial, Global).unwrap();
 
         let query = berlin();
@@ -976,7 +976,7 @@ mod tests {
     fn parallel_scan_matches_serial() {
         // Eight queries across four workers must land the exact rows the serial
         // path lands: each worker owns its query's strided tile column.
-        let table = crate::Table::build(&cities(), None).unwrap();
+        let table = crate::GraphTable::build(&cities(), None).unwrap();
         let mut coordinates = Vec::new();
         for city in [
             (52.5200, 13.4050),
@@ -1009,7 +1009,7 @@ mod tests {
         };
 
         let (serial_matches, serial_distances, serial_counts) = run(ExecutionScope::Serial);
-        let (parallel_matches, parallel_distances, parallel_counts) = run(ExecutionScope::Cpus(4));
+        let (parallel_matches, parallel_distances, parallel_counts) = run(ExecutionScope::CPUs(4));
         assert_eq!(serial_counts, parallel_counts);
         for query in 0..8 {
             assert_eq!(
@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn dispatch_resolves_dtype() {
-        let table = crate::Table::build(&cities(), None).unwrap();
+        let table = crate::GraphTable::build(&cities(), None).unwrap();
         let query = berlin();
         // SAFETY: reinterpret the `[f64; 2]` query as the raw bytes the erased
         // layer accepts.
@@ -1087,7 +1087,7 @@ mod tests {
             }
         }
 
-        let table = crate::Table::build(&Triples, None).unwrap();
+        let table = crate::GraphTable::build(&Triples, None).unwrap();
         let mut scanner = HaversineScanner::<f64>::new(ExecutionScope::Serial, Global).unwrap();
         let queries = nk::Matrix::<f64>::try_from_scalars(&[0.0f32, 0.0], &[1, 2]).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(1, 1);

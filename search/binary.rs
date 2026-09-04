@@ -10,20 +10,18 @@
 //! get pairwise-scanned arms through [`SetPairScanner`], scoring with the very
 //! kernel the walk uses, so scan and walk agree on every dtype either way.
 //!
-//! The packing-aware [`matrix_view`]/[`value_view`] scan primitive is reused from
-//! `dense`, and the shaped [`batch_scan`]/[`batch_search`] top-k from the shared
-//! `batch` engine; only the metric bodies live here.
+//! The packing-aware `matrix_view` and `value_view` scan primitives are reused
+//! from `dense`, and the shaped `batch_scan` and `batch_search` top-k from the
+//! shared `batch` engine; only the metric bodies live here.
 //!
 //! [`AngularScanner`]: crate::search::dense::AngularScanner
-//! [`batch_scan`]: crate::search::batch::batch_scan
-//! [`batch_search`]: crate::search::batch::batch_search
 
 use super::batch::{batch_scan, batch_search, build_workers, open_pool, Workers};
 use super::{
-    walk, ExecutionScope, Matrix, MetricLike, Ranking, ScannerLike, SearcherLike, TraversalContext,
+    walk, ExecutionScope, Matrix, MetricLike, Ranking, ScannerLike, TraversalContext, WalkerLike,
 };
 use crate::search::dense::{value_view, view_from_bytes};
-use crate::{cast, Error, IndexLike, OffsetDType, Table, TableView, Widen};
+use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use core::cmp::Ordering;
 use forkunion as fu;
@@ -31,11 +29,8 @@ use numkong as nk;
 
 // region: Hamming
 
-/// The batch half of the Hamming metric. Structurally the [`AngularScanner`] of the
-/// bit world: it packs the query side through [`nk::DotsPackedMatrix`] and streams
-/// the value side from the map, differing only in the popcount-of-XOR kernel.
-///
-/// [`AngularScanner`]: crate::search::dense::AngularScanner
+/// The batch half of the Hamming metric: owns a thread pool, packs the query side
+/// once per call, and streams the value side from the map through a popcount kernel.
 pub struct HammingScanner<Value: nk::Hammings + nk::Hamming, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     packed: nk::DotsPackedMatrix<Value, Allocator>,
@@ -65,7 +60,7 @@ impl<Value, Allocator> HammingScanner<Value, Allocator>
 where
     Allocator: AllocatorLike + Clone,
     Value: nk::Hamming + nk::Hammings + 'static,
-    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen,
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + ScoreLike,
     HammingScanner<Value, Allocator>: ScannerLike<HammingMetric<Value>>,
 {
     /// Batch brute-force top-k, nearest-first — Hamming is a smaller-is-better
@@ -73,7 +68,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -95,12 +90,13 @@ where
     }
 }
 
-/// The traversal half of the Hamming metric.
-pub struct HammingSearcher<Value: nk::Hamming, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the Hamming metric: one query at a fixed node width,
+/// scoring a staged node set one bit string at a time.
+pub struct HammingWalker<Value: nk::Hamming, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, <Value as nk::Hamming>::Output, Allocator>,
 }
 
-impl<Value, Index, Allocator> HammingSearcher<Value, Index, Allocator>
+impl<Value, Index, Allocator> HammingWalker<Value, Index, Allocator>
 where
     Value: nk::Hamming,
     Index: IndexLike,
@@ -108,12 +104,12 @@ where
     <Value as nk::Hamming>::Output: Copy + Default,
 {
     /// A searcher walking with breadth `expansion_factor`, its scratch in
-    /// `alloc`, uniform with [`DotSearcher::new`].
+    /// `alloc`, uniform with [`DotWalker::new`].
     ///
-    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
+    /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(HammingSearcher {
+        Ok(HammingWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
@@ -126,10 +122,7 @@ where
 }
 
 /// Hamming distance — the count of differing bits — over a packed-bit scalar, in
-/// `u32`. Smaller is nearer, so it ranks like a Euclidean distance. One generic
-/// marker spans every bit type, as [`DotMetric`] does for the reals.
-///
-/// [`DotMetric`]: crate::search::dense::DotMetric
+/// `u32`. Smaller is nearer, so it ranks like a Euclidean distance.
 pub struct HammingMetric<Value>(core::marker::PhantomData<Value>);
 
 impl<Value: nk::Hamming + 'static> MetricLike for HammingMetric<Value>
@@ -151,7 +144,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
@@ -191,8 +184,7 @@ where
     }
 }
 
-impl<Metric, Value, Index, Allocator> SearcherLike<Metric>
-    for HammingSearcher<Value, Index, Allocator>
+impl<Metric, Value, Index, Allocator> WalkerLike<Metric> for HammingWalker<Value, Index, Allocator>
 where
     Value: nk::Hamming + 'static,
     Index: IndexLike,
@@ -207,7 +199,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -231,42 +223,40 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
 
-/// A Hamming searcher whose neighbor width is settled by the tables it searches,
-/// the bit twin of [`AngularSearch`].
-///
-/// [`AngularSearch`]: crate::search::dense::AngularSearch
-pub struct HammingSearch<Value: nk::Hamming, Allocator: AllocatorLike = Global> {
+/// Batched Hamming walks, resolving the node width from the first table
+/// searched and holding one [`HammingWalker`] per pool thread.
+pub struct HammingSearcher<Value: nk::Hamming, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        HammingSearcher<Value, u32, Allocator>,
-        HammingSearcher<Value, u64, Allocator>,
+        HammingWalker<Value, u32, Allocator>,
+        HammingWalker<Value, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Value, Allocator> HammingSearch<Value, Allocator>
+impl<Value, Allocator> HammingSearcher<Value, Allocator>
 where
     Value: nk::Hamming + 'static,
     Allocator: AllocatorLike + Clone,
     <Value as nk::Hamming>::Output: Copy + Default + PartialOrd,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearch::new`].
+    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearcher::new`].
     ///
-    /// [`DotSearch::new`]: crate::search::dense::DotSearch::new
+    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(HammingSearch {
+        Ok(HammingSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -278,17 +268,15 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error>
     where
-        <Value as nk::Hamming>::Output: Widen,
-        HammingSearcher<Value, u32, Allocator>:
-            SearcherLike<HammingMetric<Value>, Index = u32> + Send,
-        HammingSearcher<Value, u64, Allocator>:
-            SearcherLike<HammingMetric<Value>, Index = u64> + Send,
+        <Value as nk::Hamming>::Output: ScoreLike,
+        HammingWalker<Value, u32, Allocator>: WalkerLike<HammingMetric<Value>, Index = u32> + Send,
+        HammingWalker<Value, u64, Allocator>: WalkerLike<HammingMetric<Value>, Index = u64> + Send,
     {
         let table = table.view();
         let threads = self.pool.threads_count();
@@ -298,7 +286,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        HammingSearcher::new(expansion_factor, alloc.clone())
+                        HammingWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -318,7 +306,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        HammingSearcher::new(expansion_factor, alloc.clone())
+                        HammingWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -350,7 +338,7 @@ where
 /// very kernel the walk uses, so a pairwise scan and a walk agree exactly.
 pub trait SetKernelLike<Value>: 'static {
     /// The kernel's native output: `u32` for Hamming counts, `f32` for Jaccard.
-    type Output: Copy + Default + PartialOrd + Widen + Send + Sync;
+    type Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync;
 
     /// The distance between two equal-length rows. `None` is a length
     /// mismatch, which the callers turn into [`Error::Inconsistent`].
@@ -362,7 +350,7 @@ pub struct HammingKernel;
 
 impl<Value: nk::Hamming + 'static> SetKernelLike<Value> for HammingKernel
 where
-    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
 {
     type Output = <Value as nk::Hamming>::Output;
 
@@ -376,7 +364,7 @@ pub struct JaccardKernel;
 
 impl<Value: nk::Jaccard + 'static> SetKernelLike<Value> for JaccardKernel
 where
-    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
 {
     type Output = <Value as nk::Jaccard>::Output;
 
@@ -420,7 +408,7 @@ where
 fn scan_pairwise_tile<Kernel, Value>(
     pool: &mut fu::ThreadPool,
     queries: nk::MatrixView<'_, Value>,
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     scores: &mut Matrix<Kernel::Output, impl AllocatorLike + Clone>,
 ) -> Result<(), Error>
 where
@@ -480,7 +468,7 @@ impl<Metric, Value, Allocator> ScannerLike<Metric>
     for SetPairScanner<HammingKernel, Value, Allocator>
 where
     Value: nk::Hamming + nk::StorageElement + Copy + Default + Send + Sync + 'static,
-    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
     Metric: MetricLike<Score = <Value as nk::Hamming>::Output> + ?Sized,
     for<'a> Metric::Queries<'a>: Into<nk::MatrixView<'a, Value>>,
     Allocator: AllocatorLike + Clone + Send + Sync,
@@ -488,7 +476,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         scan_pairwise_tile::<HammingKernel, Value>(&mut self.pool, queries.into(), table, scores)
@@ -499,7 +487,7 @@ impl<Metric, Value, Allocator> ScannerLike<Metric>
     for SetPairScanner<JaccardKernel, Value, Allocator>
 where
     Value: nk::Jaccard + nk::StorageElement + Copy + Default + Send + Sync + 'static,
-    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
     Metric: MetricLike<Score = <Value as nk::Jaccard>::Output> + ?Sized,
     for<'a> Metric::Queries<'a>: Into<nk::MatrixView<'a, Value>>,
     Allocator: AllocatorLike + Clone + Send + Sync,
@@ -507,7 +495,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         scan_pairwise_tile::<JaccardKernel, Value>(&mut self.pool, queries.into(), table, scores)
@@ -517,7 +505,7 @@ where
 impl<Value, Allocator> SetPairScanner<HammingKernel, Value, Allocator>
 where
     Value: nk::Hamming + nk::StorageElement + Copy + Default + Send + Sync + 'static,
-    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    <Value as nk::Hamming>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
     Allocator: AllocatorLike + Clone + Send + Sync,
 {
     /// Batch brute-force top-k, nearest-first, uniform with
@@ -525,7 +513,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -550,7 +538,7 @@ where
 impl<Value, Allocator> SetPairScanner<JaccardKernel, Value, Allocator>
 where
     Value: nk::Jaccard + nk::StorageElement + Copy + Default + Send + Sync + 'static,
-    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
     Allocator: AllocatorLike + Clone + Send + Sync,
 {
     /// Batch brute-force top-k, nearest-first, uniform with
@@ -558,7 +546,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -589,6 +577,8 @@ pub type JaccardPairScanner<Value, Allocator = Global> =
 
 // endregion: Pairwise set scanner
 
+/// A Hamming scanner chosen at runtime from a file's value dtype: `u1x8` through
+/// the packed kernel, the wider set dtypes pairwise.
 pub enum HammingScannerAny<Allocator: AllocatorLike = Global> {
     U1x8(HammingScanner<nk::u1x8, Allocator>),
     /// `u8` ships no packed kernel, so its arm scans pairwise — exact, just
@@ -617,7 +607,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> HammingScannerAny<Allocator
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -645,8 +635,8 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> HammingScannerAny<Allocator
 ///
 /// [`DotSearcherAny`]: crate::search::dense::DotSearcherAny
 pub enum HammingSearcherAny<Allocator: AllocatorLike = Global> {
-    U1x8(HammingSearch<nk::u1x8, Allocator>),
-    U8(HammingSearch<u8, Allocator>),
+    U1x8(HammingSearcher<nk::u1x8, Allocator>),
+    U8(HammingSearcher<u8, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
@@ -657,8 +647,10 @@ impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "u1x8" => HammingSearcherAny::U1x8(HammingSearch::new(expansion_factor, scope, alloc)?),
-            "u8" => HammingSearcherAny::U8(HammingSearch::new(expansion_factor, scope, alloc)?),
+            "u1x8" => {
+                HammingSearcherAny::U1x8(HammingSearcher::new(expansion_factor, scope, alloc)?)
+            }
+            "u8" => HammingSearcherAny::U8(HammingSearcher::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -673,7 +665,7 @@ impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -732,7 +724,7 @@ impl<Value, Allocator> JaccardScanner<Value, Allocator>
 where
     Allocator: AllocatorLike + Clone,
     Value: nk::Jaccard + nk::Jaccards + 'static,
-    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + Widen,
+    <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd + ScoreLike,
     JaccardScanner<Value, Allocator>: ScannerLike<JaccardMetric<Value>>,
 {
     /// Batch brute-force top-k, nearest-first — Jaccard is a smaller-is-better
@@ -740,7 +732,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -762,12 +754,13 @@ where
     }
 }
 
-/// The traversal half of the Jaccard metric.
-pub struct JaccardSearcher<Value: nk::Jaccard, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the Jaccard metric: one query at a fixed node width,
+/// scoring a staged node set one bit string at a time.
+pub struct JaccardWalker<Value: nk::Jaccard, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, <Value as nk::Jaccard>::Output, Allocator>,
 }
 
-impl<Value, Index, Allocator> JaccardSearcher<Value, Index, Allocator>
+impl<Value, Index, Allocator> JaccardWalker<Value, Index, Allocator>
 where
     Value: nk::Jaccard,
     Index: IndexLike,
@@ -775,12 +768,12 @@ where
     <Value as nk::Jaccard>::Output: Copy + Default,
 {
     /// A searcher walking with breadth `expansion_factor`, its scratch in
-    /// `alloc`, uniform with [`DotSearcher::new`].
+    /// `alloc`, uniform with [`DotWalker::new`].
     ///
-    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
+    /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(JaccardSearcher {
+        Ok(JaccardWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
@@ -816,7 +809,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
@@ -855,8 +848,7 @@ where
     }
 }
 
-impl<Metric, Value, Index, Allocator> SearcherLike<Metric>
-    for JaccardSearcher<Value, Index, Allocator>
+impl<Metric, Value, Index, Allocator> WalkerLike<Metric> for JaccardWalker<Value, Index, Allocator>
 where
     Value: nk::Jaccard + 'static,
     Index: IndexLike,
@@ -871,7 +863,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -895,39 +887,40 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
 
-/// A Jaccard searcher whose neighbor width is settled by the tables it searches.
-pub struct JaccardSearch<Value: nk::Jaccard, Allocator: AllocatorLike = Global> {
+/// Batched Jaccard walks, resolving the node width from the first table
+/// searched and holding one [`JaccardWalker`] per pool thread.
+pub struct JaccardSearcher<Value: nk::Jaccard, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        JaccardSearcher<Value, u32, Allocator>,
-        JaccardSearcher<Value, u64, Allocator>,
+        JaccardWalker<Value, u32, Allocator>,
+        JaccardWalker<Value, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Value, Allocator> JaccardSearch<Value, Allocator>
+impl<Value, Allocator> JaccardSearcher<Value, Allocator>
 where
     Value: nk::Jaccard + 'static,
     Allocator: AllocatorLike + Clone,
     <Value as nk::Jaccard>::Output: Copy + Default + PartialOrd,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearch::new`].
+    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearcher::new`].
     ///
-    /// [`DotSearch::new`]: crate::search::dense::DotSearch::new
+    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(JaccardSearch {
+        Ok(JaccardSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -939,17 +932,15 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error>
     where
-        <Value as nk::Jaccard>::Output: Widen,
-        JaccardSearcher<Value, u32, Allocator>:
-            SearcherLike<JaccardMetric<Value>, Index = u32> + Send,
-        JaccardSearcher<Value, u64, Allocator>:
-            SearcherLike<JaccardMetric<Value>, Index = u64> + Send,
+        <Value as nk::Jaccard>::Output: ScoreLike,
+        JaccardWalker<Value, u32, Allocator>: WalkerLike<JaccardMetric<Value>, Index = u32> + Send,
+        JaccardWalker<Value, u64, Allocator>: WalkerLike<JaccardMetric<Value>, Index = u64> + Send,
     {
         let table = table.view();
         let threads = self.pool.threads_count();
@@ -959,7 +950,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        JaccardSearcher::new(expansion_factor, alloc.clone())
+                        JaccardWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -979,7 +970,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        JaccardSearcher::new(expansion_factor, alloc.clone())
+                        JaccardWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -1028,7 +1019,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> JaccardScannerAny<Allocator
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1061,9 +1052,9 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> JaccardScannerAny<Allocator
 
 /// The Jaccard twin of [`HammingSearcherAny`]: runtime dispatch over a batch walk.
 pub enum JaccardSearcherAny<Allocator: AllocatorLike = Global> {
-    U1x8(JaccardSearch<nk::u1x8, Allocator>),
-    U16(JaccardSearch<u16, Allocator>),
-    U32(JaccardSearch<u32, Allocator>),
+    U1x8(JaccardSearcher<nk::u1x8, Allocator>),
+    U16(JaccardSearcher<u16, Allocator>),
+    U32(JaccardSearcher<u32, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
@@ -1074,9 +1065,11 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "u1x8" => JaccardSearcherAny::U1x8(JaccardSearch::new(expansion_factor, scope, alloc)?),
-            "u16" => JaccardSearcherAny::U16(JaccardSearch::new(expansion_factor, scope, alloc)?),
-            "u32" => JaccardSearcherAny::U32(JaccardSearch::new(expansion_factor, scope, alloc)?),
+            "u1x8" => {
+                JaccardSearcherAny::U1x8(JaccardSearcher::new(expansion_factor, scope, alloc)?)
+            }
+            "u16" => JaccardSearcherAny::U16(JaccardSearcher::new(expansion_factor, scope, alloc)?),
+            "u32" => JaccardSearcherAny::U32(JaccardSearcher::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -1092,7 +1085,7 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1128,6 +1121,7 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::testing::assert_scores_close;
     use crate::{GraphLike, NeighborList, OffsetDType, Shape};
 
     /// Three nested 8-bit nodes `11111111 ⊃ 11110000 ⊃ 10000000`, packed as `u1x8`,
@@ -1210,7 +1204,7 @@ mod tests {
         // Popcount of XOR against `11111110`: node 0 differs in 1 bit, node 1 in 3,
         // node 2 in 6 — so the batch ranks `[0,1,2]`, distances `[1,3,6]`, and the
         // scan and the walk agree exactly. `k` and the query count read off `matches`.
-        let table = Table::build(&binary_ring(2), None).unwrap();
+        let table = GraphTable::build(&binary_ring(2), None).unwrap();
         let query = binary_query();
 
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -1229,10 +1223,10 @@ mod tests {
             .unwrap();
         assert_eq!(counts, [3]);
         assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
-        assert_eq!(distances.row(0).unwrap(), &[1.0, 3.0, 6.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[1.0, 3.0, 6.0]);
 
         let mut searcher =
-            HammingSearch::<nk::u1x8>::new(3, ExecutionScope::Serial, Global).unwrap();
+            HammingSearcher::<nk::u1x8>::new(3, ExecutionScope::Serial, Global).unwrap();
         let mut walked = Matrix::<u64>::new(1, 3).unwrap();
         let mut walked_scores = Matrix::<f64>::new(1, 3).unwrap();
         searcher
@@ -1245,14 +1239,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(walked.row(0).unwrap(), &[0, 1, 2]);
-        assert_eq!(walked_scores.row(0).unwrap(), &[1.0, 3.0, 6.0]);
+        assert_scores_close(walked_scores.row(0).unwrap(), &[1.0, 3.0, 6.0]);
     }
 
     #[test]
     fn jaccard_scan_and_search_agree() {
         // One minus intersection over union: node 0 is `1 - 7/8`, the others farther,
         // so the ranking is `[0,1,2]`, and scan and walk agree.
-        let table = Table::build(&binary_ring(2), None).unwrap();
+        let table = GraphTable::build(&binary_ring(2), None).unwrap();
         let query = binary_query();
 
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -1270,10 +1264,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
-        assert_eq!(distances.row(0).unwrap()[0], 0.125);
+        assert_scores_close(&distances.row(0).unwrap()[..1], &[0.125]);
 
         let mut searcher =
-            JaccardSearch::<nk::u1x8>::new(3, ExecutionScope::Serial, Global).unwrap();
+            JaccardSearcher::<nk::u1x8>::new(3, ExecutionScope::Serial, Global).unwrap();
         let mut walked = Matrix::<u64>::new(1, 3).unwrap();
         let mut walked_scores = Matrix::<f64>::new(1, 3).unwrap();
         searcher
@@ -1286,7 +1280,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(walked.row(0).unwrap(), &[0, 1, 2]);
-        assert_eq!(walked_scores.row(0).unwrap()[0], 0.125);
+        assert_scores_close(&walked_scores.row(0).unwrap()[..1], &[0.125]);
     }
 
     /// Three `u8` count vectors on the triangle: node 1 equals the query, node
@@ -1337,7 +1331,7 @@ mod tests {
 
     #[test]
     fn pairwise_arms_scan_and_walk_agree() {
-        let table = Table::build(&Counts, None).unwrap();
+        let table = GraphTable::build(&Counts, None).unwrap();
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];
@@ -1357,7 +1351,7 @@ mod tests {
             .unwrap();
         assert_eq!(counts, [3]);
         assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
-        assert_eq!(distances.row(0).unwrap(), &[0.0, 1.0, 4.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[0.0, 1.0, 4.0]);
 
         let mut searcher =
             HammingSearcherAny::new(table.value_dtype(), 3, ExecutionScope::Serial, Global)
@@ -1372,7 +1366,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
-        assert_eq!(distances.row(0).unwrap(), &[0.0, 1.0, 4.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[0.0, 1.0, 4.0]);
     }
 
     /// The same triangle as `u32` counts, for the weighted Jaccard arms.
@@ -1426,7 +1420,7 @@ mod tests {
     fn weighted_jaccard_u32_scan_and_walk_agree() {
         // Weighted Jaccard against `[3,1,4,2]`: node 1 is identical — distance
         // zero — node 0 near, node 2 far. Scan and walk agree exactly.
-        let table = Table::build(&WideCounts, None).unwrap();
+        let table = GraphTable::build(&WideCounts, None).unwrap();
         let query_bytes = {
             // SAFETY: reinterpret the contiguous `[u32; 4]` query as its bytes.
             unsafe {
@@ -1473,14 +1467,14 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[1, 0, 2]);
-        assert_eq!(distances.row(0).unwrap(), &scanned[..]);
+        assert_scores_close(distances.row(0).unwrap(), &scanned[..]);
     }
 
     #[test]
     fn dispatch_scans_and_walks_bits() {
         // The erased runtime path: open a bit table, dispatch on its `u1x8` header,
         // and rank nearest-first through both a batch scan and a batch walk.
-        let table = Table::build(&binary_ring(2), None).unwrap();
+        let table = GraphTable::build(&binary_ring(2), None).unwrap();
         let query: [u8; 1] = [0b0111_1111];
 
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();

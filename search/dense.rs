@@ -1,10 +1,11 @@
 //! Dense-vector metrics over NumKong. No StringZilla type appears here.
 //!
-//! Each metric is a generic descriptor — [`DotMetric<Value>`] over any scalar `T` —
-//! that names a scalar and its score. One [`DotScanner`] and [`DotSearcher`] body,
-//! generic over that scalar, serves every dtype; the searcher is also generic over
-//! the table's neighbor width, so a `u32` graph traverses in `u32`. [`DotSearch`]
-//! resolves that width from a table for a caller who has not named it.
+//! Each metric is a generic descriptor — [`DotMetric<Value>`] over any scalar
+//! `Value` — that names a scalar and its score. One [`DotScanner`] and
+//! [`DotWalker`] body, generic over that scalar, serves every dtype; the walker is
+//! generic over the node width too, so a `u32` graph traverses in `u32`.
+//! [`DotSearcher`] resolves that width from a table for a caller who has not
+//! named it.
 //!
 //! Choosing the scalar at runtime is a dense concern, so it lives here too:
 //! [`DotScannerAny`] and [`DotSearcherAny`] route a header dtype string to the
@@ -15,13 +16,31 @@
 //! than chosen here: `i32` for `i8`, `f64` for `f32`, `f32` for `bf16`. The value
 //! column streams zero-copy from the memory map and is never packed or widened;
 //! only the small query side is packed.
+//!
+//! ```no_run
+//! use safegraphs::search::dense::DotScannerAny;
+//! use safegraphs::search::{ExecutionScope, Matrix};
+//! use safegraphs::{GraphLike, GraphTable};
+//! use std::alloc::System;
+//!
+//! let table = GraphTable::open("index.safegraphs")?;
+//! let mut scanner = DotScannerAny::new(table.value_dtype(), ExecutionScope::CPUs(0), System)?;
+//!
+//! let (queries, k) = (1, 10);
+//! let mut matches = Matrix::<u64>::new(queries, k)?;
+//! let mut distances = Matrix::<f64>::new(queries, k)?;
+//! let mut counts = vec![0u64; queries];
+//! # let query_bytes: &[u8] = &[];
+//! scanner.scan(query_bytes, &table, &mut matches, &mut distances, &mut counts)?;
+//! # Ok::<(), safegraphs::Error>(())
+//! ```
 
 use super::batch::{batch_scan, batch_search, build_workers, open_pool, Workers};
 use super::{
-    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
-    TraversalContext,
+    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike,
+    TraversalContext, WalkerLike,
 };
-use crate::{cast, Error, IndexLike, OffsetDType, Table, TableView, Widen};
+use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use core::cmp::Ordering;
 use forkunion as fu;
@@ -67,7 +86,7 @@ where
 /// logical elements. The byte buffer reinterprets as packed storage scalars, which
 /// [`matrix_view`] then unpacks by shape.
 pub(crate) fn value_view<Value>(
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     width: usize,
 ) -> Result<nk::MatrixView<'_, Value>, Error>
 where
@@ -131,7 +150,7 @@ impl<Value, Allocator> DotScanner<Value, Allocator>
 where
     Allocator: AllocatorLike + Clone,
     Value: nk::Dot + nk::Dots + 'static,
-    <Value as nk::Dot>::Output: Copy + Default + PartialOrd + Widen,
+    <Value as nk::Dot>::Output: Copy + Default + PartialOrd + ScoreLike,
     DotScanner<Value, Allocator>: ScannerLike<DotMetric<Value>>,
 {
     /// Batch brute-force top-k. `matches`/`distances` are `queries × k`; their shape
@@ -139,7 +158,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -161,16 +180,13 @@ where
     }
 }
 
-/// The traversal half of every dense metric: owns the reusable scratch and scores
-/// a node set one vector at a time, which is what a handful of neighbors wants.
-/// The index type `I` matches the table's neighbor width, so the frontier stays
-/// compact; `DotSearch` resolves it, but a caller who knows their table can name
-/// it directly, `I` defaulting to `u32`.
-pub struct DotSearcher<Value: nk::Dot, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the dense metric: one query at a fixed node width,
+/// scoring a staged node set one vector at a time.
+pub struct DotWalker<Value: nk::Dot, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, <Value as nk::Dot>::Output, Allocator>,
 }
 
-impl<Value, Index, Allocator> DotSearcher<Value, Index, Allocator>
+impl<Value, Index, Allocator> DotWalker<Value, Index, Allocator>
 where
     Value: nk::Dot,
     Index: IndexLike,
@@ -183,7 +199,7 @@ where
     /// per-expansion scoring runs inline on whichever thread walks it.
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(DotSearcher {
+        Ok(DotWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
@@ -198,11 +214,8 @@ where
     }
 }
 
-/// Inner-product similarity over any NumKong scalar, accumulated in that scalar's
-/// native dot output — `i32` for `i8`, `u32` for `u8`, `f64` for `f32`, `f32` for
-/// every half and minifloat. One generic marker replaces a struct per dtype: the
-/// scalar is the only thing that ever varied, so `DotMetric<i8>` and
-/// `DotMetric<nk::e4m3>` are the whole vocabulary, and a new dtype adds no code.
+/// Inner-product similarity over any NumKong scalar, larger-is-better, accumulated
+/// in that scalar's native dot output: `i32` for `i8`, `f64` for `f32`.
 pub struct DotMetric<Value>(core::marker::PhantomData<Value>);
 
 impl<Value: nk::Dot + 'static> MetricLike for DotMetric<Value>
@@ -230,7 +243,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
@@ -273,7 +286,7 @@ where
     }
 }
 
-impl<Metric, Value, Index, Allocator> SearcherLike<Metric> for DotSearcher<Value, Index, Allocator>
+impl<Metric, Value, Index, Allocator> WalkerLike<Metric> for DotWalker<Value, Index, Allocator>
 where
     Value: nk::Dot + 'static,
     Index: IndexLike,
@@ -288,7 +301,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -312,28 +325,21 @@ where
         Ranking::Farthest.compare(a, b)
     }
 
-    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
 
-/// A dot searcher whose neighbor width is settled by the tables it searches, not
-/// named by the caller. Construction is configuration alone — breadth, scope —
-/// and builds the pool; the first searched table picks the `u32` or `u64` worker
-/// lane, one traversal context per pool thread, and a later table of the other
-/// width rebuilds it. For a dense metric a leaf is nothing but its scratch, so the
-/// lane is exactly a pool of contexts. A dispatcher over value dtypes builds one of
-/// these per dtype and never branches on width itself; the query fan-out lives in
-/// [`batch_search`].
-pub struct DotSearch<Value: nk::Dot, Allocator: AllocatorLike = Global> {
+/// Batched dot-product walks, resolving the node width from the first table
+/// searched and holding one [`DotWalker`] per pool thread.
+pub struct DotSearcher<Value: nk::Dot, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
-    workers:
-        Workers<DotSearcher<Value, u32, Allocator>, DotSearcher<Value, u64, Allocator>, Allocator>,
+    workers: Workers<DotWalker<Value, u32, Allocator>, DotWalker<Value, u64, Allocator>, Allocator>,
     alloc: Allocator,
 }
 
-impl<Value, Allocator> DotSearch<Value, Allocator>
+impl<Value, Allocator> DotSearcher<Value, Allocator>
 where
     Value: nk::Dot + 'static,
     Allocator: AllocatorLike + Clone,
@@ -348,7 +354,7 @@ where
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(DotSearch {
+        Ok(DotSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -360,15 +366,15 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error>
     where
-        <Value as nk::Dot>::Output: Widen,
-        DotSearcher<Value, u32, Allocator>: SearcherLike<DotMetric<Value>, Index = u32> + Send,
-        DotSearcher<Value, u64, Allocator>: SearcherLike<DotMetric<Value>, Index = u64> + Send,
+        <Value as nk::Dot>::Output: ScoreLike,
+        DotWalker<Value, u32, Allocator>: WalkerLike<DotMetric<Value>, Index = u32> + Send,
+        DotWalker<Value, u64, Allocator>: WalkerLike<DotMetric<Value>, Index = u64> + Send,
     {
         let table = table.view();
         let threads = self.pool.threads_count();
@@ -378,7 +384,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        DotSearcher::new(expansion_factor, alloc.clone())
+                        DotWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -398,7 +404,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        DotSearcher::new(expansion_factor, alloc.clone())
+                        DotWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -448,14 +454,14 @@ impl<Value, Allocator> EuclideanScanner<Value, Allocator>
 where
     Allocator: AllocatorLike + Clone,
     Value: nk::Euclidean + nk::Euclideans + 'static,
-    <Value as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd + Widen,
+    <Value as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd + ScoreLike,
     EuclideanScanner<Value, Allocator>: ScannerLike<EuclideanMetric<Value>>,
 {
     /// Batch brute-force top-k, nearest-first — L2 is smaller-is-better.
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -477,12 +483,13 @@ where
     }
 }
 
-/// The traversal half of every Euclidean metric.
-pub struct EuclideanSearcher<Value: nk::Euclidean, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the Euclidean metric: one query at a fixed node width,
+/// scoring a staged node set one vector at a time.
+pub struct EuclideanWalker<Value: nk::Euclidean, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, <Value as nk::Euclidean>::EuclideanOutput, Allocator>,
 }
 
-impl<Value, Index, Allocator> EuclideanSearcher<Value, Index, Allocator>
+impl<Value, Index, Allocator> EuclideanWalker<Value, Index, Allocator>
 where
     Value: nk::Euclidean,
     Index: IndexLike,
@@ -490,10 +497,10 @@ where
     <Value as nk::Euclidean>::EuclideanOutput: Copy + Default,
 {
     /// A searcher walking with breadth `expansion_factor`, its scratch in
-    /// `alloc`, uniform with [`DotSearcher::new`].
+    /// `alloc`, uniform with [`DotWalker::new`].
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(EuclideanSearcher {
+        Ok(EuclideanWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
@@ -530,7 +537,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
@@ -571,8 +578,8 @@ where
     }
 }
 
-impl<Metric, Value, Index, Allocator> SearcherLike<Metric>
-    for EuclideanSearcher<Value, Index, Allocator>
+impl<Metric, Value, Index, Allocator> WalkerLike<Metric>
+    for EuclideanWalker<Value, Index, Allocator>
 where
     Value: nk::Euclidean + 'static,
     Index: IndexLike,
@@ -587,7 +594,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -613,38 +620,38 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
 
-/// A Euclidean searcher whose neighbor width is settled by the tables it searches,
-/// the distance twin of [`DotSearch`]: a pool plus one context per thread.
-pub struct EuclideanSearch<Value: nk::Euclidean, Allocator: AllocatorLike = Global> {
+/// Batched Euclidean walks, resolving the node width from the first table
+/// searched and holding one [`EuclideanWalker`] per pool thread.
+pub struct EuclideanSearcher<Value: nk::Euclidean, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        EuclideanSearcher<Value, u32, Allocator>,
-        EuclideanSearcher<Value, u64, Allocator>,
+        EuclideanWalker<Value, u32, Allocator>,
+        EuclideanWalker<Value, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Value, Allocator> EuclideanSearch<Value, Allocator>
+impl<Value, Allocator> EuclideanSearcher<Value, Allocator>
 where
     Value: nk::Euclidean + 'static,
     Allocator: AllocatorLike + Clone,
     <Value as nk::Euclidean>::EuclideanOutput: Copy + Default + PartialOrd,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearch::new`].
+    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearcher::new`].
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(EuclideanSearch {
+        Ok(EuclideanSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -657,17 +664,17 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error>
     where
-        <Value as nk::Euclidean>::EuclideanOutput: Widen,
-        EuclideanSearcher<Value, u32, Allocator>:
-            SearcherLike<EuclideanMetric<Value>, Index = u32> + Send,
-        EuclideanSearcher<Value, u64, Allocator>:
-            SearcherLike<EuclideanMetric<Value>, Index = u64> + Send,
+        <Value as nk::Euclidean>::EuclideanOutput: ScoreLike,
+        EuclideanWalker<Value, u32, Allocator>:
+            WalkerLike<EuclideanMetric<Value>, Index = u32> + Send,
+        EuclideanWalker<Value, u64, Allocator>:
+            WalkerLike<EuclideanMetric<Value>, Index = u64> + Send,
     {
         let table = table.view();
         let threads = self.pool.threads_count();
@@ -677,7 +684,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        EuclideanSearcher::new(expansion_factor, alloc.clone())
+                        EuclideanWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -697,7 +704,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        EuclideanSearcher::new(expansion_factor, alloc.clone())
+                        EuclideanWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -747,14 +754,14 @@ impl<Value, Allocator> AngularScanner<Value, Allocator>
 where
     Allocator: AllocatorLike + Clone,
     Value: nk::Angular + nk::Angulars + 'static,
-    <Value as nk::Angular>::Output: Copy + Default + PartialOrd + Widen,
+    <Value as nk::Angular>::Output: Copy + Default + PartialOrd + ScoreLike,
     AngularScanner<Value, Allocator>: ScannerLike<AngularMetric<Value>>,
 {
     /// Batch brute-force top-k, nearest-first — cosine distance is smaller-is-better.
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -776,12 +783,13 @@ where
     }
 }
 
-/// The traversal half of every angular metric.
-pub struct AngularSearcher<Value: nk::Angular, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the angular metric: one query at a fixed node width,
+/// scoring a staged node set one vector at a time.
+pub struct AngularWalker<Value: nk::Angular, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, <Value as nk::Angular>::Output, Allocator>,
 }
 
-impl<Value, Index, Allocator> AngularSearcher<Value, Index, Allocator>
+impl<Value, Index, Allocator> AngularWalker<Value, Index, Allocator>
 where
     Value: nk::Angular,
     Index: IndexLike,
@@ -789,10 +797,10 @@ where
     <Value as nk::Angular>::Output: Copy + Default,
 {
     /// A searcher walking with breadth `expansion_factor`, its scratch in
-    /// `alloc`, uniform with [`DotSearcher::new`].
+    /// `alloc`, uniform with [`DotWalker::new`].
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(AngularSearcher {
+        Ok(AngularWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
     }
@@ -829,7 +837,7 @@ where
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         // The batch is already a shaped `nodes-agnostic` matrix; its width must match
@@ -869,8 +877,7 @@ where
     }
 }
 
-impl<Metric, Value, Index, Allocator> SearcherLike<Metric>
-    for AngularSearcher<Value, Index, Allocator>
+impl<Metric, Value, Index, Allocator> WalkerLike<Metric> for AngularWalker<Value, Index, Allocator>
 where
     Value: nk::Angular + 'static,
     Index: IndexLike,
@@ -885,7 +892,7 @@ where
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error> {
@@ -909,38 +916,38 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: Metric::Query<'_>, table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: Metric::Query<'_>, table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<Metric, Self>(self, query, table)
     }
 }
 
-/// An angular searcher whose neighbor width is settled by the tables it searches,
-/// the cosine twin of [`EuclideanSearch`]: a pool plus one context per thread.
-pub struct AngularSearch<Value: nk::Angular, Allocator: AllocatorLike = Global> {
+/// Batched angular walks, resolving the node width from the first table
+/// searched and holding one [`AngularWalker`] per pool thread.
+pub struct AngularSearcher<Value: nk::Angular, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        AngularSearcher<Value, u32, Allocator>,
-        AngularSearcher<Value, u64, Allocator>,
+        AngularWalker<Value, u32, Allocator>,
+        AngularWalker<Value, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Value, Allocator> AngularSearch<Value, Allocator>
+impl<Value, Allocator> AngularSearcher<Value, Allocator>
 where
     Value: nk::Angular + 'static,
     Allocator: AllocatorLike + Clone,
     <Value as nk::Angular>::Output: Copy + Default + PartialOrd,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearch::new`].
+    /// `scope` names, its scratch in `alloc`, uniform with [`DotSearcher::new`].
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(AngularSearch {
+        Ok(AngularSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -953,17 +960,15 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error>
     where
-        <Value as nk::Angular>::Output: Widen,
-        AngularSearcher<Value, u32, Allocator>:
-            SearcherLike<AngularMetric<Value>, Index = u32> + Send,
-        AngularSearcher<Value, u64, Allocator>:
-            SearcherLike<AngularMetric<Value>, Index = u64> + Send,
+        <Value as nk::Angular>::Output: ScoreLike,
+        AngularWalker<Value, u32, Allocator>: WalkerLike<AngularMetric<Value>, Index = u32> + Send,
+        AngularWalker<Value, u64, Allocator>: WalkerLike<AngularMetric<Value>, Index = u64> + Send,
     {
         let table = table.view();
         let threads = self.pool.threads_count();
@@ -973,7 +978,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        AngularSearcher::new(expansion_factor, alloc.clone())
+                        AngularWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -993,7 +998,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        AngularSearcher::new(expansion_factor, alloc.clone())
+                        AngularWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -1018,7 +1023,7 @@ where
 /// `*Any` hands to its typed scanner or searcher.
 pub(crate) fn view_from_bytes<'q, Value: nk::StorageElement>(
     queries: &'q [u8],
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
 ) -> Result<nk::MatrixView<'q, Value>, Error> {
     let width = table.value_width().ok_or(Error::Inconsistent)?;
     matrix_view(cast(queries).ok_or(Error::WrongType)?, width)
@@ -1094,7 +1099,7 @@ impl<Allocator: AllocatorLike + Clone> DotScannerAny<Allocator> {
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1197,28 +1202,28 @@ impl<Allocator: AllocatorLike + Clone> DotScannerAny<Allocator> {
 
 /// A dot searcher chosen from a file's value dtype string. As with
 /// [`DotScannerAny`], the branch is on the value dtype alone; each arm's
-/// [`DotSearch`] resolves the neighbor width from the table, so a `u32` graph
+/// [`DotSearcher`] resolves the neighbor width from the table, so a `u32` graph
 /// walks in `u32` cells and only the final results widen to `u64`.
 pub enum DotSearcherAny<Allocator: AllocatorLike = Global> {
-    F64(DotSearch<f64, Allocator>),
-    F32(DotSearch<f32, Allocator>),
-    Bf16(DotSearch<nk::bf16, Allocator>),
-    F16(DotSearch<nk::f16, Allocator>),
-    E5M2(DotSearch<nk::e5m2, Allocator>),
-    E4M3(DotSearch<nk::e4m3, Allocator>),
-    E3M2(DotSearch<nk::e3m2, Allocator>),
-    E2M3(DotSearch<nk::e2m3, Allocator>),
-    I8(DotSearch<i8, Allocator>),
-    I4x2(DotSearch<nk::i4x2, Allocator>),
-    U8(DotSearch<u8, Allocator>),
-    U4x2(DotSearch<nk::u4x2, Allocator>),
-    U1x8(DotSearch<nk::u1x8, Allocator>),
+    F64(DotSearcher<f64, Allocator>),
+    F32(DotSearcher<f32, Allocator>),
+    Bf16(DotSearcher<nk::bf16, Allocator>),
+    F16(DotSearcher<nk::f16, Allocator>),
+    E5M2(DotSearcher<nk::e5m2, Allocator>),
+    E4M3(DotSearcher<nk::e4m3, Allocator>),
+    E3M2(DotSearcher<nk::e3m2, Allocator>),
+    E2M3(DotSearcher<nk::e2m3, Allocator>),
+    I8(DotSearcher<i8, Allocator>),
+    I4x2(DotSearcher<nk::i4x2, Allocator>),
+    U8(DotSearcher<u8, Allocator>),
+    U4x2(DotSearcher<nk::u4x2, Allocator>),
+    U1x8(DotSearcher<nk::u1x8, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> DotSearcherAny<Allocator> {
     /// A searcher for `dtype`, walking with breadth `expansion_factor` across
     /// the workers `scope` names, its scratch in `alloc`. No table is seen here: the neighbor width is settled
-    /// inside [`DotSearch`] by the first searched table, never branched on here.
+    /// inside [`DotSearcher`] by the first searched table, never branched on here.
     pub fn new(
         dtype: &str,
         expansion_factor: usize,
@@ -1226,19 +1231,35 @@ impl<Allocator: AllocatorLike + Clone + Send> DotSearcherAny<Allocator> {
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => DotSearcherAny::F64(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "f32" => DotSearcherAny::F32(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "bf16" => DotSearcherAny::Bf16(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "f16" => DotSearcherAny::F16(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "e5m2" => DotSearcherAny::E5M2(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "e4m3" => DotSearcherAny::E4M3(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "e3m2" => DotSearcherAny::E3M2(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "e2m3" => DotSearcherAny::E2M3(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "i8" => DotSearcherAny::I8(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "i4x2" => DotSearcherAny::I4x2(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "u8" => DotSearcherAny::U8(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "u4x2" => DotSearcherAny::U4x2(DotSearch::new(expansion_factor, scope, alloc.clone())?),
-            "u1x8" => DotSearcherAny::U1x8(DotSearch::new(expansion_factor, scope, alloc.clone())?),
+            "f64" => DotSearcherAny::F64(DotSearcher::new(expansion_factor, scope, alloc.clone())?),
+            "f32" => DotSearcherAny::F32(DotSearcher::new(expansion_factor, scope, alloc.clone())?),
+            "bf16" => {
+                DotSearcherAny::Bf16(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "f16" => DotSearcherAny::F16(DotSearcher::new(expansion_factor, scope, alloc.clone())?),
+            "e5m2" => {
+                DotSearcherAny::E5M2(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "e4m3" => {
+                DotSearcherAny::E4M3(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "e3m2" => {
+                DotSearcherAny::E3M2(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "e2m3" => {
+                DotSearcherAny::E2M3(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "i8" => DotSearcherAny::I8(DotSearcher::new(expansion_factor, scope, alloc.clone())?),
+            "i4x2" => {
+                DotSearcherAny::I4x2(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "u8" => DotSearcherAny::U8(DotSearcher::new(expansion_factor, scope, alloc.clone())?),
+            "u4x2" => {
+                DotSearcherAny::U4x2(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
+            "u1x8" => {
+                DotSearcherAny::U1x8(DotSearcher::new(expansion_factor, scope, alloc.clone())?)
+            }
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -1268,7 +1289,7 @@ impl<Allocator: AllocatorLike + Clone + Send> DotSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1425,7 +1446,7 @@ impl<Allocator: AllocatorLike + Clone> EuclideanScannerAny<Allocator> {
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1520,20 +1541,20 @@ impl<Allocator: AllocatorLike + Clone> EuclideanScannerAny<Allocator> {
 }
 
 /// The Euclidean twin of [`DotSearcherAny`]: runtime dtype dispatch over a walk,
-/// nearest-first. The neighbor width resolves inside each [`EuclideanSearch`].
+/// nearest-first. The neighbor width resolves inside each [`EuclideanSearcher`].
 pub enum EuclideanSearcherAny<Allocator: AllocatorLike = Global> {
-    F64(EuclideanSearch<f64, Allocator>),
-    F32(EuclideanSearch<f32, Allocator>),
-    Bf16(EuclideanSearch<nk::bf16, Allocator>),
-    F16(EuclideanSearch<nk::f16, Allocator>),
-    E5M2(EuclideanSearch<nk::e5m2, Allocator>),
-    E4M3(EuclideanSearch<nk::e4m3, Allocator>),
-    E3M2(EuclideanSearch<nk::e3m2, Allocator>),
-    E2M3(EuclideanSearch<nk::e2m3, Allocator>),
-    I8(EuclideanSearch<i8, Allocator>),
-    I4x2(EuclideanSearch<nk::i4x2, Allocator>),
-    U8(EuclideanSearch<u8, Allocator>),
-    U4x2(EuclideanSearch<nk::u4x2, Allocator>),
+    F64(EuclideanSearcher<f64, Allocator>),
+    F32(EuclideanSearcher<f32, Allocator>),
+    Bf16(EuclideanSearcher<nk::bf16, Allocator>),
+    F16(EuclideanSearcher<nk::f16, Allocator>),
+    E5M2(EuclideanSearcher<nk::e5m2, Allocator>),
+    E4M3(EuclideanSearcher<nk::e4m3, Allocator>),
+    E3M2(EuclideanSearcher<nk::e3m2, Allocator>),
+    E2M3(EuclideanSearcher<nk::e2m3, Allocator>),
+    I8(EuclideanSearcher<i8, Allocator>),
+    I4x2(EuclideanSearcher<nk::i4x2, Allocator>),
+    U8(EuclideanSearcher<u8, Allocator>),
+    U4x2(EuclideanSearcher<nk::u4x2, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> EuclideanSearcherAny<Allocator> {
@@ -1544,62 +1565,62 @@ impl<Allocator: AllocatorLike + Clone + Send> EuclideanSearcherAny<Allocator> {
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => EuclideanSearcherAny::F64(EuclideanSearch::new(
+            "f64" => EuclideanSearcherAny::F64(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "f32" => EuclideanSearcherAny::F32(EuclideanSearch::new(
+            "f32" => EuclideanSearcherAny::F32(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "bf16" => EuclideanSearcherAny::Bf16(EuclideanSearch::new(
+            "bf16" => EuclideanSearcherAny::Bf16(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "f16" => EuclideanSearcherAny::F16(EuclideanSearch::new(
+            "f16" => EuclideanSearcherAny::F16(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e5m2" => EuclideanSearcherAny::E5M2(EuclideanSearch::new(
+            "e5m2" => EuclideanSearcherAny::E5M2(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e4m3" => EuclideanSearcherAny::E4M3(EuclideanSearch::new(
+            "e4m3" => EuclideanSearcherAny::E4M3(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e3m2" => EuclideanSearcherAny::E3M2(EuclideanSearch::new(
+            "e3m2" => EuclideanSearcherAny::E3M2(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e2m3" => EuclideanSearcherAny::E2M3(EuclideanSearch::new(
+            "e2m3" => EuclideanSearcherAny::E2M3(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "i8" => EuclideanSearcherAny::I8(EuclideanSearch::new(
+            "i8" => EuclideanSearcherAny::I8(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "i4x2" => EuclideanSearcherAny::I4x2(EuclideanSearch::new(
+            "i4x2" => EuclideanSearcherAny::I4x2(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "u8" => EuclideanSearcherAny::U8(EuclideanSearch::new(
+            "u8" => EuclideanSearcherAny::U8(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "u4x2" => EuclideanSearcherAny::U4x2(EuclideanSearch::new(
+            "u4x2" => EuclideanSearcherAny::U4x2(EuclideanSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
@@ -1628,7 +1649,7 @@ impl<Allocator: AllocatorLike + Clone + Send> EuclideanSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1778,7 +1799,7 @@ impl<Allocator: AllocatorLike + Clone> AngularScannerAny<Allocator> {
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1873,20 +1894,20 @@ impl<Allocator: AllocatorLike + Clone> AngularScannerAny<Allocator> {
 }
 
 /// The Angular twin of [`DotSearcherAny`]: runtime dtype dispatch over a walk,
-/// nearest-first, width resolved inside each [`AngularSearch`].
+/// nearest-first, width resolved inside each [`AngularSearcher`].
 pub enum AngularSearcherAny<Allocator: AllocatorLike = Global> {
-    F64(AngularSearch<f64, Allocator>),
-    F32(AngularSearch<f32, Allocator>),
-    Bf16(AngularSearch<nk::bf16, Allocator>),
-    F16(AngularSearch<nk::f16, Allocator>),
-    E5M2(AngularSearch<nk::e5m2, Allocator>),
-    E4M3(AngularSearch<nk::e4m3, Allocator>),
-    E3M2(AngularSearch<nk::e3m2, Allocator>),
-    E2M3(AngularSearch<nk::e2m3, Allocator>),
-    I8(AngularSearch<i8, Allocator>),
-    I4x2(AngularSearch<nk::i4x2, Allocator>),
-    U8(AngularSearch<u8, Allocator>),
-    U4x2(AngularSearch<nk::u4x2, Allocator>),
+    F64(AngularSearcher<f64, Allocator>),
+    F32(AngularSearcher<f32, Allocator>),
+    Bf16(AngularSearcher<nk::bf16, Allocator>),
+    F16(AngularSearcher<nk::f16, Allocator>),
+    E5M2(AngularSearcher<nk::e5m2, Allocator>),
+    E4M3(AngularSearcher<nk::e4m3, Allocator>),
+    E3M2(AngularSearcher<nk::e3m2, Allocator>),
+    E2M3(AngularSearcher<nk::e2m3, Allocator>),
+    I8(AngularSearcher<i8, Allocator>),
+    I4x2(AngularSearcher<nk::i4x2, Allocator>),
+    U8(AngularSearcher<u8, Allocator>),
+    U4x2(AngularSearcher<nk::u4x2, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
@@ -1897,52 +1918,62 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => {
-                AngularSearcherAny::F64(AngularSearch::new(expansion_factor, scope, alloc.clone())?)
-            }
-            "f32" => {
-                AngularSearcherAny::F32(AngularSearch::new(expansion_factor, scope, alloc.clone())?)
-            }
-            "bf16" => AngularSearcherAny::Bf16(AngularSearch::new(
+            "f64" => AngularSearcherAny::F64(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "f16" => {
-                AngularSearcherAny::F16(AngularSearch::new(expansion_factor, scope, alloc.clone())?)
-            }
-            "e5m2" => AngularSearcherAny::E5M2(AngularSearch::new(
+            "f32" => AngularSearcherAny::F32(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e4m3" => AngularSearcherAny::E4M3(AngularSearch::new(
+            "bf16" => AngularSearcherAny::Bf16(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e3m2" => AngularSearcherAny::E3M2(AngularSearch::new(
+            "f16" => AngularSearcherAny::F16(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "e2m3" => AngularSearcherAny::E2M3(AngularSearch::new(
+            "e5m2" => AngularSearcherAny::E5M2(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "i8" => {
-                AngularSearcherAny::I8(AngularSearch::new(expansion_factor, scope, alloc.clone())?)
-            }
-            "i4x2" => AngularSearcherAny::I4x2(AngularSearch::new(
+            "e4m3" => AngularSearcherAny::E4M3(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
             )?),
-            "u8" => {
-                AngularSearcherAny::U8(AngularSearch::new(expansion_factor, scope, alloc.clone())?)
-            }
-            "u4x2" => AngularSearcherAny::U4x2(AngularSearch::new(
+            "e3m2" => AngularSearcherAny::E3M2(AngularSearcher::new(
+                expansion_factor,
+                scope,
+                alloc.clone(),
+            )?),
+            "e2m3" => AngularSearcherAny::E2M3(AngularSearcher::new(
+                expansion_factor,
+                scope,
+                alloc.clone(),
+            )?),
+            "i8" => AngularSearcherAny::I8(AngularSearcher::new(
+                expansion_factor,
+                scope,
+                alloc.clone(),
+            )?),
+            "i4x2" => AngularSearcherAny::I4x2(AngularSearcher::new(
+                expansion_factor,
+                scope,
+                alloc.clone(),
+            )?),
+            "u8" => AngularSearcherAny::U8(AngularSearcher::new(
+                expansion_factor,
+                scope,
+                alloc.clone(),
+            )?),
+            "u4x2" => AngularSearcherAny::U4x2(AngularSearcher::new(
                 expansion_factor,
                 scope,
                 alloc.clone(),
@@ -1971,7 +2002,7 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -2068,6 +2099,7 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::testing::assert_scores_close;
     use crate::{GraphLike, NeighborList, OffsetDType, Shape};
 
     /// Three nodes whose values are held in dtype `T` in a NumKong matrix, so one
@@ -2187,11 +2219,11 @@ mod tests {
         dtype: &'static str,
         rows: &[f32],
         query: &[f32],
-    ) -> (Table, nk::Matrix<Value>) {
+    ) -> (GraphTable, nk::Matrix<Value>) {
         let width = query.len();
         let node_count = rows.len() / width;
         let values = nk::Matrix::<Value>::try_from_scalars(rows, &[node_count, width]).unwrap();
-        let table = Table::build(
+        let table = GraphTable::build(
             &Ring {
                 dtype,
                 values,
@@ -2210,9 +2242,9 @@ mod tests {
     where
         Value: nk::FloatConvertible + nk::Dot + nk::Dots + Clone + Send + Sync + 'static,
         Value: nk::Dot<Output = <Value as nk::Dots>::Accumulator>,
-        <Value as nk::Dot>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
-        DotSearcher<Value, u32>: SearcherLike<DotMetric<Value>, Index = u32> + Send,
-        DotSearcher<Value, u64>: SearcherLike<DotMetric<Value>, Index = u64> + Send,
+        <Value as nk::Dot>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
+        DotWalker<Value, u32>: WalkerLike<DotMetric<Value>, Index = u32> + Send,
+        DotWalker<Value, u64>: WalkerLike<DotMetric<Value>, Index = u64> + Send,
     {
         let (table, query) = ring_table::<Value>(dtype, rows, query);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -2229,7 +2261,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} scan");
-        DotSearch::<Value>::new(3, ExecutionScope::Serial, Global)
+        DotSearcher::<Value>::new(3, ExecutionScope::Serial, Global)
             .unwrap()
             .search(
                 query.view(),
@@ -2248,9 +2280,9 @@ mod tests {
             nk::FloatConvertible + nk::Euclidean + nk::Euclideans + Clone + Send + Sync + 'static,
         Value: nk::Euclidean<EuclideanOutput = <Value as nk::Euclideans>::SpatialResult>,
         <Value as nk::Euclidean>::EuclideanOutput:
-            Copy + Default + PartialOrd + Widen + Send + Sync,
-        EuclideanSearcher<Value, u32>: SearcherLike<EuclideanMetric<Value>, Index = u32> + Send,
-        EuclideanSearcher<Value, u64>: SearcherLike<EuclideanMetric<Value>, Index = u64> + Send,
+            Copy + Default + PartialOrd + ScoreLike + Send + Sync,
+        EuclideanWalker<Value, u32>: WalkerLike<EuclideanMetric<Value>, Index = u32> + Send,
+        EuclideanWalker<Value, u64>: WalkerLike<EuclideanMetric<Value>, Index = u64> + Send,
     {
         let (table, query) = ring_table::<Value>(dtype, rows, query);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -2267,7 +2299,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} scan");
-        EuclideanSearch::<Value>::new(3, ExecutionScope::Serial, Global)
+        EuclideanSearcher::<Value>::new(3, ExecutionScope::Serial, Global)
             .unwrap()
             .search(
                 query.view(),
@@ -2284,9 +2316,9 @@ mod tests {
     where
         Value: nk::FloatConvertible + nk::Angular + nk::Angulars + Clone + Send + Sync + 'static,
         Value: nk::Angular<Output = <Value as nk::Angulars>::SpatialResult>,
-        <Value as nk::Angular>::Output: Copy + Default + PartialOrd + Widen + Send + Sync,
-        AngularSearcher<Value, u32>: SearcherLike<AngularMetric<Value>, Index = u32> + Send,
-        AngularSearcher<Value, u64>: SearcherLike<AngularMetric<Value>, Index = u64> + Send,
+        <Value as nk::Angular>::Output: Copy + Default + PartialOrd + ScoreLike + Send + Sync,
+        AngularWalker<Value, u32>: WalkerLike<AngularMetric<Value>, Index = u32> + Send,
+        AngularWalker<Value, u64>: WalkerLike<AngularMetric<Value>, Index = u64> + Send,
     {
         let (table, query) = ring_table::<Value>(dtype, rows, query);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -2303,7 +2335,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &order, "{dtype} scan");
-        AngularSearch::<Value>::new(3, ExecutionScope::Serial, Global)
+        AngularSearcher::<Value>::new(3, ExecutionScope::Serial, Global)
             .unwrap()
             .search(
                 query.view(),
@@ -2385,7 +2417,7 @@ mod tests {
         // query count read off the `matches`/`distances` matrices, `counts` reporting
         // how many each query found. Query `[3,5]` dots to `[13,29,45]`, so both the
         // brute-force scan and the graph walk rank nodes `[2,1,0]`, scores `[45,29,13]`.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let queries = i8_query(&[3.0, 5.0]);
 
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -2404,9 +2436,9 @@ mod tests {
             .unwrap();
         assert_eq!(counts, [3]);
         assert_eq!(matches.row(0).unwrap(), &[2, 1, 0]);
-        assert_eq!(distances.row(0).unwrap(), &[45.0, 29.0, 13.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[45.0, 29.0, 13.0]);
 
-        let mut searcher = DotSearch::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
+        let mut searcher = DotSearcher::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
         let mut walked = Matrix::<u64>::new(1, 3).unwrap();
         let mut walked_scores = Matrix::<f64>::new(1, 3).unwrap();
         searcher
@@ -2420,7 +2452,7 @@ mod tests {
             .unwrap();
         assert_eq!(counts, [3]);
         assert_eq!(walked.row(0).unwrap(), &[2, 1, 0]);
-        assert_eq!(walked_scores.row(0).unwrap(), &[45.0, 29.0, 13.0]);
+        assert_scores_close(walked_scores.row(0).unwrap(), &[45.0, 29.0, 13.0]);
     }
 
     /// A one-row `i8` query batch as a shaped matrix, for the behavior tests.
@@ -2432,11 +2464,11 @@ mod tests {
     fn scan_over_a_materialized_file() {
         // The core promise: build an index, serialize it to the on-disk image, parse
         // that image back, and scan the parsed table — not the in-memory fixture.
-        let built = Table::build(&ring_i8(), None).unwrap();
+        let built = GraphTable::build(&ring_i8(), None).unwrap();
         let image = built.as_bytes().to_vec();
-        let table = Table::from_bytes(&image).unwrap();
+        let table = GraphTable::from_bytes(&image).unwrap();
 
-        let mut scanner = DotScanner::<i8>::new(ExecutionScope::Cpus(2), Global).unwrap();
+        let mut scanner = DotScanner::<i8>::new(ExecutionScope::CPUs(2), Global).unwrap();
         let query = i8_query(&[3.0, 4.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2452,14 +2484,14 @@ mod tests {
             .unwrap();
         // Dots against [3,4]: node0=11, node1=25, node2=39 → ranked [2,1,0].
         assert_eq!(matches.row(0).unwrap(), &[2, 1, 0]);
-        assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0, 11.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[39.0, 25.0, 11.0]);
     }
 
     #[test]
     fn euclidean_scan_pins_exact_distances() {
         // The distances themselves, not just the ranking: node 1 sits at `√8`, node 0
         // and 2 farther, confirming the kernel returns real L2 distance, not squared.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let mut scanner = EuclideanScanner::<i8>::new(ExecutionScope::Serial, Global).unwrap();
         let query = i8_query(&[1.0, 2.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -2476,7 +2508,7 @@ mod tests {
             .unwrap();
         // Query equals node 0: distance 0 there, `√8` and `√32` to nodes 1 and 2.
         assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
-        assert_eq!(distances.row(0).unwrap()[0], 0.0);
+        assert_scores_close(&distances.row(0).unwrap()[..1], &[0.0]);
         assert!((distances.row(0).unwrap()[1] - 8f64.sqrt()).abs() < 1e-5);
     }
 
@@ -2484,10 +2516,10 @@ mod tests {
     fn batch_walks_many_queries() {
         // A three-query batch through one searcher — the shaped input carries the
         // count, and `matches`/`distances` come back `queries × k`, one row each.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let queries =
             nk::Matrix::<i8>::try_from_scalars(&[3.0, 4.0, 5.0, 6.0, 1.0, 2.0], &[3, 2]).unwrap();
-        let mut searcher = DotSearch::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
+        let mut searcher = DotSearcher::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
         let mut matches = Matrix::<u64>::new(3, 2).unwrap();
         let mut distances = Matrix::<f64>::new(3, 2).unwrap();
         let mut counts = [0u64; 3];
@@ -2505,7 +2537,7 @@ mod tests {
         assert_eq!(matches.row(0).unwrap(), &[2, 1]);
         assert_eq!(matches.row(1).unwrap(), &[2, 1]);
         assert_eq!(matches.row(2).unwrap(), &[2, 1]);
-        assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[39.0, 25.0]);
         assert_eq!(distances.row(1).unwrap(), &[61.0, 39.0]);
     }
 
@@ -2515,14 +2547,14 @@ mod tests {
         // as a one-thread run: the dynamic schedule hands each query to whichever
         // thread is free, and each must write its own row of the outputs with no
         // crosstalk. Eight varied queries make the schedule interleave.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let scalars: [f32; 16] = [
             3.0, 5.0, 1.0, 4.0, 5.0, 2.0, 2.0, 6.0, 4.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
         ];
         let queries = nk::Matrix::<i8>::try_from_scalars(&scalars, &[8, 2]).unwrap();
 
         let run = |scope: ExecutionScope| {
-            let mut searcher = DotSearch::<i8>::new(3, scope, Global).unwrap();
+            let mut searcher = DotSearcher::<i8>::new(3, scope, Global).unwrap();
             let mut matches = Matrix::<u64>::new(8, 3).unwrap();
             let mut distances = Matrix::<f64>::new(8, 3).unwrap();
             let mut counts = [0u64; 8];
@@ -2540,7 +2572,7 @@ mod tests {
 
         let (sequential_matches, sequential_distances, sequential_counts) =
             run(ExecutionScope::Serial);
-        let (parallel_matches, parallel_distances, parallel_counts) = run(ExecutionScope::Cpus(4));
+        let (parallel_matches, parallel_distances, parallel_counts) = run(ExecutionScope::CPUs(4));
         assert_eq!(sequential_counts, parallel_counts);
         for query in 0..8 {
             assert_eq!(
@@ -2609,10 +2641,10 @@ mod tests {
 
     #[test]
     fn walk_restarts_across_components() {
-        let table = Table::build(&TwoTriangles, None).unwrap();
+        let table = GraphTable::build(&TwoTriangles, None).unwrap();
         // ef spans the whole graph, so the walk must keep restarting until every node
         // is visited — and only then can it name the true top-3.
-        let mut searcher = DotSearch::<i8>::new(6, ExecutionScope::Serial, Global).unwrap();
+        let mut searcher = DotSearcher::<i8>::new(6, ExecutionScope::Serial, Global).unwrap();
         let query = i8_query(&[1.0, 1.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2630,7 +2662,7 @@ mod tests {
         // Dots against [1,1]: node i scores 2*(i+1); node 5 = 12 is best, and it lives
         // in the component no fixed root of node 0 would reach.
         assert_eq!(matches.row(0).unwrap(), &[5, 4, 3]);
-        assert_eq!(distances.row(0).unwrap(), &[12.0, 10.0, 8.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[12.0, 10.0, 8.0]);
     }
 
     #[test]
@@ -2638,9 +2670,9 @@ mod tests {
         // The construction-is-configuration contract: a searcher built with no table
         // in sight serves a three-node ring, then a six-node graph, the scratch
         // growing to fit each at walk time and the width lane settling on first use.
-        let ring = Table::build(&ring_i8(), None).unwrap();
-        let triangles = Table::build(&TwoTriangles, None).unwrap();
-        let mut searcher = DotSearch::<i8>::new(6, ExecutionScope::Serial, Global).unwrap();
+        let ring = GraphTable::build(&ring_i8(), None).unwrap();
+        let triangles = GraphTable::build(&TwoTriangles, None).unwrap();
+        let mut searcher = DotSearcher::<i8>::new(6, ExecutionScope::Serial, Global).unwrap();
         let query = i8_query(&[1.0, 1.0]);
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2675,8 +2707,8 @@ mod tests {
     fn scan_f32_accumulates_in_f64() {
         // The same ring in `f32`, degree zero so the fixture also covers an edgeless
         // graph; the tile lands exactly in the `f64` accumulator.
-        let table = Table::build(&ring::<f32>("f32", &RING_ROWS, 2, 0), None).unwrap();
-        let mut scanner = DotScanner::<f32>::new(ExecutionScope::Cpus(2), Global).unwrap();
+        let table = GraphTable::build(&ring::<f32>("f32", &RING_ROWS, 2, 0), None).unwrap();
+        let mut scanner = DotScanner::<f32>::new(ExecutionScope::CPUs(2), Global).unwrap();
         let query = nk::Matrix::<f32>::try_from_scalars(&[3.0, 4.0], &[1, 2]).unwrap();
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
@@ -2692,14 +2724,14 @@ mod tests {
             .unwrap();
         // Dots against [3,4]: 11,25,39 → ranked [2,1,0] with exact `f64` distances.
         assert_eq!(matches.row(0).unwrap(), &[2, 1, 0]);
-        assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0, 11.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[39.0, 25.0, 11.0]);
     }
 
     #[test]
     fn scan_rejects_a_mismatched_output() {
         // The output matrices carry the query count; a `matches` claiming two queries
         // against a one-query batch is inconsistent, and the scan says so.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let mut scanner = DotScanner::<i8>::new(ExecutionScope::Serial, Global).unwrap();
         let query = i8_query(&[3.0, 4.0]);
         let mut matches = Matrix::<u64>::new(2, 3).unwrap();
@@ -2736,16 +2768,16 @@ mod tests {
 
     #[test]
     fn u64_leaf_walks() {
-        // The width is a real parameter, not a fixed `u32`: a `DotSearcher<i8, u64>` is
+        // The width is a real parameter, not a fixed `u32`: a `DotWalker<i8, u64>` is
         // constructible and runs the per-query walk. This table's neighbors are `u32`,
         // so reading them at `u64` is a genuine width mismatch — [`Error::WrongType`] —
         // exactly the check that proves `I` is honored at the neighbor read. A true
         // `u64`-neighbor table needs a graph past four billion nodes to build.
-        let table = Table::build(&ring_i8(), None).unwrap();
-        let mut searcher: DotSearcher<i8, u64> = DotSearcher::new(3, Global).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
+        let mut searcher: DotWalker<i8, u64> = DotWalker::new(3, Global).unwrap();
         let query: [i8; 2] = [3, 4];
         assert!(matches!(
-            <DotSearcher<i8, u64> as SearcherLike<DotMetric<i8>>>::search(
+            <DotWalker<i8, u64> as WalkerLike<DotMetric<i8>>>::search(
                 &mut searcher,
                 &query,
                 table.view(),
@@ -2758,7 +2790,7 @@ mod tests {
     fn dispatcher_resolves_dtype_and_width() {
         // A caller who opened the file blind: dtype from the header, neighbor width
         // from the column, both resolved inside the searcher, not at the call site.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let mut searcher =
             DotSearcherAny::new(table.value_dtype(), 3, ExecutionScope::Serial, Global).unwrap();
         assert_eq!(searcher.dtype(), "i8");
@@ -2771,14 +2803,17 @@ mod tests {
             .search(bytes, &table, &mut matches, &mut distances, &mut counts)
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[2, 1]);
-        assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[39.0, 25.0]);
     }
 
     #[test]
     fn scan_dispatches_on_header_dtype() {
         // The caller never names i8: it opens bytes and reads the dtype string.
-        let image = Table::build(&ring_i8(), None).unwrap().as_bytes().to_vec();
-        let table = Table::from_bytes(&image).unwrap();
+        let image = GraphTable::build(&ring_i8(), None)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let table = GraphTable::from_bytes(&image).unwrap();
 
         let mut scanner =
             DotScannerAny::new(table.value_dtype(), ExecutionScope::Serial, Global).unwrap();
@@ -2794,7 +2829,7 @@ mod tests {
             .unwrap();
         // i8 dots widened to f64: node2=39, node1=25 — same order as the typed path.
         assert_eq!(matches.row(0).unwrap(), &[2, 1]);
-        assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[39.0, 25.0]);
     }
 
     #[test]
@@ -2812,7 +2847,7 @@ mod tests {
         // The erased runtime path for the two distance metrics: dispatch on the header
         // dtype and rank nearest-first, the scan for Euclidean and the walk for
         // Angular, from the same `[3,5]` query.
-        let table = Table::build(&ring_i8(), None).unwrap();
+        let table = GraphTable::build(&ring_i8(), None).unwrap();
         let query: [i8; 2] = [3, 5];
         let bytes = unsafe { core::slice::from_raw_parts(query.as_ptr() as *const u8, 2) };
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
@@ -2882,8 +2917,8 @@ mod tests {
 
     #[test]
     fn walk_skips_neighbor_sentinels() {
-        let table = Table::build(&SentinelRing, None).unwrap();
-        let mut searcher = DotSearch::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
+        let table = GraphTable::build(&SentinelRing, None).unwrap();
+        let mut searcher = DotSearcher::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
         let query = i8_query(&[3.0, 4.0]);
         let mut matches = Matrix::<u64>::new(1, 2).unwrap();
         let mut distances = Matrix::<f64>::new(1, 2).unwrap();
@@ -2899,6 +2934,6 @@ mod tests {
             .unwrap();
         // The same top-k as the unpadded ring: `99` was skipped, never scored.
         assert_eq!(matches.row(0).unwrap(), &[2, 1]);
-        assert_eq!(distances.row(0).unwrap(), &[39.0, 25.0]);
+        assert_scores_close(distances.row(0).unwrap(), &[39.0, 25.0]);
     }
 }

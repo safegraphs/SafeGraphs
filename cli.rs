@@ -24,7 +24,7 @@ use clap::{Parser, Subcommand};
 use safegraphs::search::dispatch::{is_ragged, ranking, ScannerAny, SearcherAny, METRICS};
 use safegraphs::search::queries;
 use safegraphs::search::{ExecutionScope, Matrix, Ranking};
-use safegraphs::{Error, GraphLike, Shape, Table};
+use safegraphs::{GraphLike, GraphTable, Shape};
 
 // region: Arguments
 
@@ -134,12 +134,13 @@ fn expand(pattern: &str) -> Result<Vec<PathBuf>, String> {
 
 /// Open every shard and check they describe one dataset. Differing dtypes or
 /// shapes are a mismatch worth naming, since scoring across them is meaningless.
-fn open_shards(paths: &[PathBuf]) -> Result<Vec<Table>, String> {
+fn open_shards(paths: &[PathBuf]) -> Result<Vec<GraphTable>, String> {
     let mut tables = Vec::new();
     for path in paths {
-        let table = Table::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let table =
+            GraphTable::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
         if let Some(first) = tables.first() {
-            let first: &Table = first;
+            let first: &GraphTable = first;
             if first.value_dtype() != table.value_dtype() {
                 return Err(format!(
                     "{}: dtype {} does not match the first shard's {}",
@@ -204,7 +205,7 @@ struct ShardResults {
 /// node into `(shard, node)` so a merged hit still names its file.
 fn merge(
     per_shard: Vec<ShardResults>,
-    tables: &[Table],
+    tables: &[GraphTable],
     queries: usize,
     k: usize,
     ranking: Ranking,
@@ -279,7 +280,7 @@ fn run_query(
     if is_ragged(metric) && parsed.offsets().is_none() {
         return Err(format!("{metric} needs ragged queries"));
     }
-    let scope = ExecutionScope::Cpus(run.threads);
+    let scope = ExecutionScope::CPUs(run.threads);
 
     let mut per_shard = Vec::new();
     for (shard, table) in tables.iter().enumerate() {

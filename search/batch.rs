@@ -1,9 +1,8 @@
 //! The shared batch engine: shaped top-k over any scoring family, brute-force
 //! or by walk. Names no NumKong and no StringZilla type — only ForkUnion, for
 //! the cross-query fan-out — so every family reuses it without importing a
-//! sibling's backend. It moved out of `dense` once four of the five families
-//! were reaching into it; a module named after one family is the wrong home
-//! for all of them.
+//! sibling's backend. It lives on its own because a module named after one
+//! family is the wrong home for machinery all of them share.
 //!
 //! The vocabulary here is the uniform call shape: `matches`/`distances` are
 //! `queries × k` [`Matrix`] outputs carrying both counts, `counts[q]` reports
@@ -14,22 +13,20 @@
 //! family whose parallelism lives inside the kernel rather than across
 //! queries.
 
-use super::{
-    ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
-};
-use crate::{Error, TableView, Widen};
+use super::{ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, WalkerLike};
+use crate::{Error, GraphTableView, ScoreLike};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use allocator_api2::vec::Vec as AVec;
 use forkunion as fu;
 use std::sync::OnceLock;
 
-/// Rank column `col` of a row-major score tile (`rows = nodes`, `cols = queries`)
-/// top-k, writing row ids widened to `u64` into `nodes_out` and scores widened to
+/// Rank one query's column of a score tile top-k, writing node IDs widened to
+/// `u64` into `nodes_out` and scores widened to
 /// `f64` into `scores_out`, best-first per the [`Ranking`] direction. Unfilled
 /// slots take a `u64::MAX` sentinel.
 /// Returns the count found. Widening is monotonic, so ranking the widened scores is
 /// the native order. The shared tail of every batch scan.
-pub(crate) fn select_top_k<Score: Copy + Default + Widen>(
+pub(crate) fn select_top_k<Score: Copy + Default + ScoreLike>(
     tile: &Matrix<Score, impl AllocatorLike + Clone>,
     col: usize,
     rows: usize,
@@ -110,7 +107,7 @@ fn batch_shape(
 pub(crate) fn batch_scan<Metric, Scanner>(
     scanner: &mut Scanner,
     queries: Metric::Queries<'_>,
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     ranking: Ranking,
     tile: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     matches: &mut Matrix<u64>,
@@ -119,7 +116,7 @@ pub(crate) fn batch_scan<Metric, Scanner>(
 ) -> Result<(), Error>
 where
     Metric: MetricLike,
-    Metric::Score: Default + Widen,
+    Metric::Score: Default + ScoreLike,
     for<'a> Metric::Queries<'a>: QueryBatchLike<Metric>,
     Scanner: ScannerLike<Metric>,
 {
@@ -150,9 +147,9 @@ pub(crate) fn open_pool(scope: ExecutionScope) -> Result<fu::ThreadPool, Error> 
     let topology = fu::Topology::new().map_err(|_| Error::Alloc)?;
     let threads = match scope {
         ExecutionScope::Serial => 1,
-        ExecutionScope::Cpus(0) => topology.logical_cores_count().max(1),
-        ExecutionScope::Cpus(cpus) => cpus,
-        ExecutionScope::Gpu(_) => return Err(Error::WrongType),
+        ExecutionScope::CPUs(0) => topology.logical_cores_count().max(1),
+        ExecutionScope::CPUs(cpus) => cpus,
+        ExecutionScope::GPU(_) => return Err(Error::WrongType),
     };
     fu::ThreadPool::try_spawn(&topology, threads).map_err(|_| Error::Alloc)
 }
@@ -222,14 +219,14 @@ fn walk_one<Metric, Searcher>(
     worker: &mut Searcher,
     queries: &Metric::Queries<'_>,
     query_index: usize,
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     sink: &Sink,
 ) -> Result<(), Error>
 where
     Metric: MetricLike,
-    Metric::Score: Widen,
+    Metric::Score: ScoreLike,
     for<'a> Metric::Queries<'a>: QueryBatchLike<Metric>,
-    Searcher: SearcherLike<Metric>,
+    Searcher: WalkerLike<Metric>,
 {
     let query = queries.query(query_index).ok_or(Error::Inconsistent)?;
     worker.search(query, table)?;
@@ -258,32 +255,28 @@ fn sink_over(matches: &mut Matrix<u64>, distances: &mut Matrix<f64>, counts: &mu
 }
 
 /// Batch top-k by graph walk, fanned across the pool: each thread runs whole
-/// independent walks on its own traversal context, draining best-first into its
-/// query's row of `matches`/`distances`; `counts` is the number found, `< k` when a
-/// walk exhausts a small component. The schedule steals work per query, since a
-/// walk's length varies with the component it lands in. With a one-thread pool the
-/// fan-out runs inline on the caller, so this is the sole batch-search path for a
-/// fanned-out family, parallel or not.
+/// independent walks on its own context, draining best-first into its query's row
+/// of `matches` and `distances`, with `counts` below `k` when a walk exhausts a
+/// small component. Work is stolen per query, since a walk's length varies with the
+/// component it lands in, and a one-thread pool runs the fan-out inline.
 ///
-/// `workers` holds one leaf per pool thread — for a dense metric that is exactly a
-/// pool of contexts, the leaf being nothing but its scratch. The query batch and the
-/// table are read-only and shared; each query's output row is written by one thread
-/// alone, so `SafePtr` and [`ShareRead`] carry them across
-/// the boundary. The first error any walk raises becomes the batch's.
+/// `workers` holds one walker per pool thread. The query batch and the table are
+/// shared read-only, each output row is written by one thread alone, and the first
+/// error any walk raises becomes the batch's.
 pub(crate) fn batch_search<Metric, Searcher>(
     pool: &mut fu::ThreadPool,
     workers: &mut [Searcher],
     queries: Metric::Queries<'_>,
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     matches: &mut Matrix<u64>,
     distances: &mut Matrix<f64>,
     counts: &mut [u64],
 ) -> Result<(), Error>
 where
     Metric: MetricLike,
-    Metric::Score: Widen,
+    Metric::Score: ScoreLike,
     for<'a> Metric::Queries<'a>: QueryBatchLike<Metric>,
-    Searcher: SearcherLike<Metric> + Send,
+    Searcher: WalkerLike<Metric> + Send,
 {
     let query_count = queries.count();
     batch_shape(query_count, matches, distances, counts)?;
@@ -291,7 +284,7 @@ where
     let sink = sink_over(matches, distances, counts);
     // The query batch is immutable for the whole blocking fold and only read by
     // the tasks; its backend view types declare no `Sync`, so it rides the
-    // read-only wrapper. The table needs nothing: a [`TableView`] is `Copy` and
+    // read-only wrapper. The table needs nothing: a [`GraphTableView`] is `Copy` and
     // `Sync` by construction, so the closure just captures it.
     let queries_shared = ShareRead(&queries);
     let failure = OnceLock::new();
@@ -329,16 +322,16 @@ where
 pub(crate) fn batch_search_serial<Metric, Searcher>(
     worker: &mut Searcher,
     queries: Metric::Queries<'_>,
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     matches: &mut Matrix<u64>,
     distances: &mut Matrix<f64>,
     counts: &mut [u64],
 ) -> Result<(), Error>
 where
     Metric: MetricLike,
-    Metric::Score: Widen,
+    Metric::Score: ScoreLike,
     for<'a> Metric::Queries<'a>: QueryBatchLike<Metric>,
-    Searcher: SearcherLike<Metric>,
+    Searcher: WalkerLike<Metric>,
 {
     let query_count = queries.count();
     batch_shape(query_count, matches, distances, counts)?;

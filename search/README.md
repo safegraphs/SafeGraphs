@@ -5,8 +5,8 @@
 Enabled by the `search` Cargo feature, which pulls in NumKong for dense kernels, StringZilla for sequence kernels, and ForkUnion for structured parallelism.
 
 ```rust
-let table = Table::parse(bytes)?;
-let mut searcher = DotSearcherAny::new(table.value_dtype(), expansion_factor, ExecutionScope::Cores(0), Global)?;
+let table = GraphTable::from_bytes(bytes)?;
+let mut searcher = DotSearcherAny::new(table.value_dtype(), expansion_factor, ExecutionScope::CPUs(0), Global)?;
 let mut matches = Matrix::<u64>::new(query_count, k)?;
 let mut distances = Matrix::<f64>::new(query_count, k)?;
 let mut counts = vec![0u64; query_count];
@@ -17,7 +17,7 @@ searcher.search(query_bytes, &table, &mut matches, &mut distances, &mut counts)?
 
 __Two functors per metric family.__
 A `Scanner` is exact brute force: it scores every query against every node in one batched kernel call.
-A `Searcher` is approximate: it runs a greedy best-first walk over the file's frozen graph, one walk per query.
+A `Searcher` is approximate: it drives greedy best-first walks over the file's frozen graph, one `Walker` per query.
 Both are stateful objects that own their resources and reusable scratch; neither is a free function.
 
 __One uniform call shape.__
@@ -38,19 +38,19 @@ The `QueryBatchLike` trait — a count plus per-index access — is the only thi
 
 __Construction is configuration; the table is a call-time argument.__
 Every functor has exactly one constructor, taking only what does not depend on any particular file: the metric's own configuration (costs, the dtype string), the walk breadth `expansion_factor` for searchers, the `ExecutionScope`, and — wherever the functor owns `allocator_api2` scratch — the allocator, always last and never defaulted away behind a `new`/`new_in` pair.
-The `Table` first appears at the `scan`/`search` call, and everything derived from it — node count, neighbor index width — is resolved there, per call.
+The `GraphTable` first appears at the `scan`/`search` call, and everything derived from it — node count, neighbor index width — is resolved there, per call.
 One functor therefore serves many tables: scratch grows to fit the largest table seen and repeat calls allocate nothing.
 
 __Parallelism is owned, never exposed.__
-`ExecutionScope` — `Serial`, `Cores(n)`, or `Gpu(index)` — is the only knob that crosses the API, and no pool, topology, scheduler, or device type appears in any signature.
-Each family opens the scope into whatever its backend calls an executor: the NumKong families spawn a ForkUnion thread pool, the StringZilla ones a `DeviceScope`, and a CPU-only family answers `Gpu` with an error at construction rather than pretending.
+`ExecutionScope` — `Serial`, `CPUs(n)`, or `GPU(index)` — is the only knob that crosses the API, and no pool, topology, scheduler, or device type appears in any signature.
+Each family opens the scope into whatever its backend calls an executor: the NumKong families spawn a ForkUnion thread pool, the StringZilla ones a `DeviceScope`, and a CPU-only family answers `GPU` with an error at construction rather than pretending.
 A scanner parallelizes inside a single call, fanning the packed `queries × nodes` kernel across its executor.
 A NumKong searcher parallelizes across queries — one `TraversalContext` per pool thread, work-stealing whole walks, since walk lengths vary with the component they land in — while a StringZilla searcher runs whole walks on a single context and parallelizes inside each scoring call, where its engines already drive every worker the scope names.
 With `Serial` the fan-out runs inline on the caller — the sequential path is the same code path.
 One functor drives one device; spanning several GPUs means one functor per device and sharding tables across them, a layer above this crate.
 
 __Owners are allocator-generic; parallel code sees only views.__
-`Table<Allocator>` owns the mapping, but the search layer speaks `TableView` — a borrowed, `Copy + Send + Sync` window of the mapped bytes plus the `Copy` column descriptors.
+`GraphTable<Allocator>` owns the mapping, but the search layer speaks `GraphTableView` — a borrowed, `Copy + Send + Sync` window of the mapped bytes plus the `Copy` column descriptors.
 A fold's tasks capture the view directly, so no `unsafe` shareability assertion, no per-family re-slicing of columns, and no allocator generic survives past the public `scan`/`search` entry, which converts once with `table.view()`.
 
 __Native precision inside, wide at the boundary.__
@@ -74,11 +74,11 @@ Backend types stay in their pillar: `search.rs` names neither NumKong nor String
 
 ## Code Organization
 
-- `search.rs` — the backend-free contract: `MetricLike`, `ScannerLike`, `SearcherLike`, `QueryBatchLike`, `ExecutionScope`, the greedy `walk`, `TraversalContext`, and the owned output `Matrix`.
+- `search.rs` — the backend-free contract: `MetricLike`, `ScannerLike`, `WalkerLike`, `QueryBatchLike`, `ExecutionScope`, the greedy `walk`, `TraversalContext`, and the owned output `Matrix`.
 - `search/batch.rs` — the shared batch engine: `batch_scan`, the pooled `batch_search`, and the single-worker `batch_search_serial`, plus the width-resolver `Workers` lanes every family reuses.
 - `search/dense.rs` — Dot, Euclidean, and Angular families over every NumKong scalar.
 - `search/binary.rs` — Hamming and Jaccard over packed `u1x8` bits.
-- `search/sequence.rs` — one generic `SequenceScanner`/`SequenceSearcher`/`SequenceSearch` body over an `EngineLike` seam, instantiated four ways: byte-level Levenshtein and its codepoint-level UTF-8 variant (per-edit `LevenshteinCosts`, smaller-is-better), and Needleman-Wunsch and Smith-Waterman alignment scores (class-matrix `AlignmentCosts`, larger-is-better).
+- `search/sequence.rs` — one generic `SequenceScanner`/`SequenceWalker`/`SequenceSearcher` body over an `EngineLike` seam, instantiated four ways: byte-level Levenshtein and its codepoint-level UTF-8 variant (per-edit `LevenshteinCosts`, smaller-is-better), and Needleman-Wunsch and Smith-Waterman alignment scores (class-matrix `AlignmentCosts`, larger-is-better).
 - `search/geospatial.rs` — Haversine and Vincenty over `[latitude, longitude]` pairs in radians, meters out, nearest-first: one generic body over a `KernelLike` seam, the scan fanning per-query broadcasts across the pool since the kernels have no packed cross-product.
 - `search/maxsim.rs` — late-interaction MaxSim over ragged `[*, depth]` multi-vectors in `f32`/`f16`/`bf16`, nearest-first: the kernel sums one-minus-best-cosine per query token, so an identical pair scores zero. Queries pack once per batch and become the metric's own `Query` type; nodes pack into reusable staging slots — per staged node in the walk, per pool worker in the scan, which fans over nodes to fill contiguous tile rows.
 - `search/dispatch.rs` — the cross-family router over a file's declared metric; deliberately empty until the families' erased entry points settle.

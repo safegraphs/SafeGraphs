@@ -4,10 +4,41 @@
 //! a JSON header that is the complete schema, and a data segment of raw,
 //! Arrow-layout buffers.
 //!
+//! The header names three columns. `key` is the caller's identity, global across
+//! shards and free to repeat; `value` is the payload; `neighbors` holds the
+//! outgoing edges as node indices into this same file. Each column locates its
+//! buffers with `[begin, end]` byte pairs relative to the data segment, `data`
+//! for the rows and `offsets` for a ragged column's row starts.
+//!
+//! Two words divide the vocabulary. A __row__ is one column's slot, the unit a
+//! buffer addresses, so [`StorageDType::row_bytes`] measures one and
+//! [`Column::rows`] counts them. A __node__ is the tuple of rows sharing a
+//! position across every column, so [`GraphLike::len`] counts nodes and
+//! [`GraphLike`] yields them. They are equal because the `key` column sets the
+//! node count and every other column must agree.
+//!
 //! Reading is zero-copy. Buffers are reinterpreted as typed slices straight out
 //! of the memory map; nothing is copied. Allocation happens only for result sets
 //! and search state, through fallible APIs, so the reader never panics on memory
 //! pressure.
+//!
+//! ```no_run
+//! use safegraphs::{GraphLike, GraphTable};
+//!
+//! let table = GraphTable::open("index.safegraphs")?;
+//! let node = table.find_key(b"wiki-1m").unwrap_or(0);
+//! let _payload: &[u8] = table.value(node);
+//! let edges = table.neighbors(node);
+//! if let Some(neighbors) = edges.as_slice::<u32>() {
+//!     for neighbor in neighbors {
+//!         // An index at or past the node count is a sentinel and names no node.
+//!         if (*neighbor as usize) < table.len() {
+//!             let _their_payload = table.value(*neighbor as usize);
+//!         }
+//!     }
+//! }
+//! # Ok::<(), safegraphs::Error>(())
+//! ```
 
 use std::fs::File;
 use std::path::Path;
@@ -22,8 +53,8 @@ use jsontape::{parse_in, Json, JsonError};
 /// The 8-byte magic at offset 0 of every `.safegraphs` file.
 pub const MAGIC: [u8; 8] = *b"SAFEGRPH";
 
-/// A byte range in the data segment: a start and a length, mirroring the
-/// header's `<name>_start` and `<name>_length`.
+/// A byte range in the data segment, parsed from a header's `[begin, end]` pair
+/// and held as the start and byte count a slice wants.
 #[derive(Clone, Copy)]
 pub struct ByteRange {
     pub start: usize,
@@ -32,7 +63,9 @@ pub struct ByteRange {
 
 /// Storage width of a payload element, in bits. Storage is decoupled from
 /// compute, so a `StorageDType` only says how wide an element is, never how to
-/// interpret it. A 2-byte `Bin16` is equally an `f16`, a `bf16`, or a `u16`; the
+/// interpret it. Every width has a neutral `bN` spelling naming N opaque bits,
+/// and the other spellings are aliases that add a reading to the same width: a
+/// 2-byte `Bin16` is equally a `b16`, an `f16`, a `bf16`, or a `u16`; the
 /// numeric meaning lives in `metadata` and is the compute layer's concern. Widths
 /// below a byte — `Bin4` for a `4`-bit nibble, `Bin1` for a packed bit — pack
 /// several elements into a byte, so a row's byte length is [`row_bytes`], never a
@@ -66,7 +99,7 @@ impl StorageDType {
 
     /// Element size in bytes, rounded up. Meaningful only for whole-byte widths,
     /// where a column indexes elements one at a time — offsets, keys, neighbor
-    /// ids. A sub-byte value column never reaches here; it measures rows through
+    /// IDs. A sub-byte value column never reaches here; it measures rows through
     /// [`row_bytes`] instead.
     ///
     /// [`row_bytes`]: StorageDType::row_bytes
@@ -94,7 +127,7 @@ impl StorageDType {
 }
 
 /// Width of a node index or prefix-sum entry. Unsigned, since offsets and node
-/// ids are non-negative and no column is nullable.
+/// IDs are non-negative and no column is nullable.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OffsetDType {
     U32,
@@ -131,35 +164,35 @@ impl IndexLike for u64 {
     const OFFSET_DTYPE: OffsetDType = OffsetDType::U64;
 }
 
-/// The score-side twin of [`IndexLike::to_u64`]: a native metric accumulator
-/// widened to the one score type a runtime caller can name. Where a walk leaves
-/// the graph it widens its node through [`IndexLike`] and its score through
-/// this, so the erased boundary is `(u64, f64)` and nothing wider. Every native
-/// accumulator — `i32`, `u32`, `f32`, `f64` — fits exactly in `f64`'s mantissa, so
-/// this loses nothing today; a metric scoring past 2^53 is the only thing it could.
-pub trait Widen: Copy {
+/// The score-side twin of [`IndexLike`]: a native metric accumulator widened to
+/// the one score type a runtime caller can name. Where a walk leaves the graph it
+/// widens its node through [`IndexLike`] and its score through this, so the
+/// erased boundary is `(u64, f64)` and nothing wider. Every native accumulator —
+/// `i32`, `u32`, `f32`, `f64` — fits exactly in `f64`'s mantissa, so this loses
+/// nothing today; a metric scoring past 2^53 is the only thing it could.
+pub trait ScoreLike: Copy {
     fn widen(self) -> f64;
 }
 
-impl Widen for i32 {
+impl ScoreLike for i32 {
     fn widen(self) -> f64 {
         self as f64
     }
 }
 
-impl Widen for u32 {
+impl ScoreLike for u32 {
     fn widen(self) -> f64 {
         self as f64
     }
 }
 
-impl Widen for f32 {
+impl ScoreLike for f32 {
     fn widen(self) -> f64 {
         self as f64
     }
 }
 
-impl Widen for f64 {
+impl ScoreLike for f64 {
     fn widen(self) -> f64 {
         self
     }
@@ -168,7 +201,7 @@ impl Widen for f64 {
 /// An edit distance counts operations, so it is bounded by the longer input's
 /// length and cannot approach the 2^53 this trait's contract worries about — a
 /// 9-petabyte string would have to fit in the value column first.
-impl Widen for usize {
+impl ScoreLike for usize {
     fn widen(self) -> f64 {
         self as f64
     }
@@ -176,20 +209,20 @@ impl Widen for usize {
 
 /// An alignment score is bounded by the longer input's length times the largest
 /// `i8` cost, so like [`usize`] it sits far inside the mantissa.
-impl Widen for isize {
+impl ScoreLike for isize {
     fn widen(self) -> f64 {
         self as f64
     }
 }
 
-/// The prefix-sum buffer of an irregular column.
+/// The offsets buffer of an irregular column, holding its prefix sums.
 #[derive(Clone, Copy)]
 pub struct IrregularOffsets {
     pub dtype: OffsetDType,
     pub range: ByteRange,
 }
 
-/// How a column's rows sit in its values buffer. Regular or irregular, never
+/// How a column's rows sit in its data buffer. Regular or irregular, never
 /// both. This is the __byte layout__; the __logical shape__ a metric reads is
 /// [`Shape`], carried separately so a regular `points × 3` cloud and a ragged
 /// `[*, dim]` multi-vector each state their axes without changing addressing.
@@ -257,18 +290,21 @@ impl Shape {
     }
 }
 
-/// One column: an element type, a layout, and its values buffer. `E` is the
+/// One column: an element type, a layout, and its data buffer. `E` is the
 /// element type: `StorageDType` for payload columns whose bytes the reader does
 /// not interpret, `OffsetDType` for the neighbor graph whose values are node
 /// indices. The dtype string lives in the header document, reachable through
-/// [`Table::dtype_name`].
+/// [`GraphTable::dtype_name`].
 #[derive(Clone, Copy)]
 pub struct Column<Element> {
+    /// Storage width of one element, resolved from the header's dtype string.
     pub dtype: Element,
+    /// How the rows sit in `data`: a fixed width, or addressed by offsets.
     pub layout: ColumnLayout,
     /// The logical shape a metric reads, orthogonal to the byte `layout`.
     pub shape: Shape,
-    pub values: ByteRange,
+    /// The rows themselves, as a range of the data segment.
+    pub data: ByteRange,
 }
 
 /// The bytes behind a file: a memory map, or an owned in-memory buffer. Both are
@@ -293,14 +329,14 @@ impl<Allocator: AllocatorLike> Backing<Allocator> {
 /// copyable descriptors that point into it by offset, so buffers are handed out
 /// as zero-copy slices. Only the free-form `metadata` document allocates,
 /// through `A`.
-pub struct Table<Allocator: AllocatorLike = Global> {
+pub struct GraphTable<Allocator: AllocatorLike = Global> {
     /// The bytes behind every buffer, kept alive for the whole handle so borrowed
     /// slices stay valid.
     backing: Backing<Allocator>,
 
     /// Byte offset of the data segment: the first byte past the padded header.
     /// Every column's `ByteRange` is relative to this.
-    data_start: usize,
+    segment_start: usize,
 
     /// The parsed header document, owned in `A`: the free-form `__metadata__`
     /// plus each column's descriptor and dtype string.
@@ -414,11 +450,13 @@ impl ElementLike for StorageDType {
         Ok(match text {
             b"u1x8" => StorageDType::Bin1,
             b"i4x2" | b"u4x2" => StorageDType::Bin4,
-            b"u8" | b"i8" | b"e4m3" | b"e5m2" | b"e2m3" | b"e3m2" | b"utf8" => StorageDType::Bin8,
-            b"u16" | b"i16" | b"f16" | b"bf16" => StorageDType::Bin16,
-            b"u32" | b"i32" | b"f32" => StorageDType::Bin32,
-            b"u64" | b"i64" | b"f64" => StorageDType::Bin64,
-            b"bin128" | b"uuid" => StorageDType::Bin128,
+            b"b8" | b"u8" | b"i8" | b"e4m3" | b"e5m2" | b"e2m3" | b"e3m2" | b"utf8" => {
+                StorageDType::Bin8
+            }
+            b"b16" | b"u16" | b"i16" | b"f16" | b"bf16" => StorageDType::Bin16,
+            b"b32" | b"u32" | b"i32" | b"f32" => StorageDType::Bin32,
+            b"b64" | b"u64" | b"i64" | b"f64" => StorageDType::Bin64,
+            b"b128" | b"uuid" => StorageDType::Bin128,
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -454,12 +492,24 @@ fn to_usize(v: u64) -> Result<usize, Error> {
     usize::try_from(v).map_err(|_| Error::TooLarge)
 }
 
-fn field_usize<Allocator: AllocatorLike>(
+/// A buffer's `[begin, end]` pair, as a range of `end - begin` bytes at `begin`.
+/// A pair of byte positions can only mean positions, where a `_start` beside a
+/// `_length` left the unit of each to the reader.
+fn span_field<Allocator: AllocatorLike>(
     obj: &Json<Allocator>,
     key: &'static str,
-) -> Result<usize, Error> {
-    let v = obj.get(key).ok_or(Error::MissingField(key))?;
-    to_usize(v.as_u64().ok_or(Error::WrongType)?)
+) -> Result<ByteRange, Error> {
+    let pair = obj.get(key).ok_or(Error::MissingField(key))?;
+    let pair = pair.as_array().ok_or(Error::WrongType)?;
+    if pair.len() != 2 {
+        return Err(Error::WrongType);
+    }
+    let begin = to_usize(pair[0].as_u64().ok_or(Error::WrongType)?)?;
+    let end = to_usize(pair[1].as_u64().ok_or(Error::WrongType)?)?;
+    Ok(ByteRange {
+        start: begin,
+        len: end.checked_sub(begin).ok_or(Error::Inconsistent)?,
+    })
 }
 
 /// The buffer alignment `__metadata__` declares: a power of two, 4096 when
@@ -512,18 +562,15 @@ impl<Element: ElementLike> Column<Element> {
                 .as_bytes(),
         )?;
 
-        let values = ByteRange {
-            start: field_usize(obj, "values_start")?,
-            len: field_usize(obj, "values_length")?,
-        };
+        let data = span_field(obj, "data")?;
 
         // The logical shape: absent -> Scalar; a bare number -> Vector; a
         // two-element array `[rows, cols]` -> Matrix (rows 0 marks the ragged
         // axis). Threaded next to the dtype for every metric to read.
         let shape = shape_from_json(obj)?;
 
-        let layout = match obj.get("offsets_dtype") {
-            Some(offset_dtype) => {
+        let layout = match obj.get("offsets") {
+            Some(_) => {
                 // Offset-addressed rows may be shapeless (`Scalar` — a tape of
                 // variable-length strings) or ragged (`Matrix(0, cols)` — rows of
                 // fixed-width tuples, a varying number of them). What they may
@@ -535,14 +582,15 @@ impl<Element: ElementLike> Column<Element> {
                 if !matches!(shape, Shape::Scalar | Shape::Matrix(0, _)) {
                     return Err(Error::Inconsistent);
                 }
-                let offset_dtype = offset_dtype.as_str().ok_or(Error::WrongType)?;
+                let offset_dtype = obj
+                    .get("offsets_dtype")
+                    .ok_or(Error::MissingField("offsets_dtype"))?
+                    .as_str()
+                    .ok_or(Error::WrongType)?;
                 ColumnLayout::Irregular {
                     offsets: IrregularOffsets {
                         dtype: OffsetDType::from_dtype(offset_dtype.as_bytes())?,
-                        range: ByteRange {
-                            start: field_usize(obj, "offsets_start")?,
-                            len: field_usize(obj, "offsets_length")?,
-                        },
+                        range: span_field(obj, "offsets")?,
                     },
                 }
             }
@@ -557,7 +605,7 @@ impl<Element: ElementLike> Column<Element> {
             dtype,
             layout,
             shape,
-            values,
+            data,
         })
     }
 }
@@ -570,7 +618,7 @@ fn column_field<Element: ElementLike, Allocator: AllocatorLike>(
     Column::<Element>::from_json(obj)
 }
 
-impl Table<Global> {
+impl GraphTable<Global> {
     /// Memory-map a file read-only; pages fault in lazily. Metadata allocates in
     /// the global heap.
     pub fn open<PathRef: AsRef<Path>>(path: PathRef) -> Result<Self, Error> {
@@ -598,7 +646,7 @@ impl Table<Global> {
     }
 }
 
-impl<Allocator: AllocatorLike + Clone> Table<Allocator> {
+impl<Allocator: AllocatorLike + Clone> GraphTable<Allocator> {
     /// Memory-map a file read-only, allocating the metadata document in `alloc`.
     pub fn open_in<PathRef: AsRef<Path>>(path: PathRef, alloc: Allocator) -> Result<Self, Error> {
         let file = File::open(path)?;
@@ -628,7 +676,7 @@ impl<Allocator: AllocatorLike + Clone> Table<Allocator> {
     /// Shared parse over any backing: frame it, parse the header, extract the
     /// columns and metadata, then validate.
     fn from_backing(backing: Backing<Allocator>, alloc: Allocator) -> Result<Self, Error> {
-        let (data_start, header, key, value, neighbors) = {
+        let (segment_start, header, key, value, neighbors) = {
             let bytes = backing.as_bytes();
             if bytes.get(..8) != Some(&MAGIC[..]) {
                 return Err(Error::BadMagic);
@@ -637,23 +685,23 @@ impl<Allocator: AllocatorLike + Clone> Table<Allocator> {
             let mut length_bytes = [0u8; 8];
             length_bytes.copy_from_slice(len_bytes);
             let header_len = to_usize(u64::from_le_bytes(length_bytes))?;
-            let data_start = 16usize.checked_add(header_len).ok_or(Error::Truncated)?;
-            if bytes.len() < data_start {
+            let segment_start = 16usize.checked_add(header_len).ok_or(Error::Truncated)?;
+            if bytes.len() < segment_start {
                 return Err(Error::Truncated);
             }
 
             // Parse the header into an owned document.
-            let header = &bytes[16..data_start];
+            let header = &bytes[16..segment_start];
             let doc = parse_in(header, alloc)?;
             let key = column_field::<StorageDType, Allocator>(&doc, "key")?;
             let value = column_field::<StorageDType, Allocator>(&doc, "value")?;
             let neighbors = column_field::<OffsetDType, Allocator>(&doc, "neighbors")?;
-            (data_start, doc, key, value, neighbors)
+            (segment_start, doc, key, value, neighbors)
         };
 
-        let file = Table {
+        let file = GraphTable {
             backing,
-            data_start,
+            segment_start,
             header,
             key,
             value,
@@ -664,30 +712,35 @@ impl<Allocator: AllocatorLike + Clone> Table<Allocator> {
     }
 }
 
-/// The query-time read surface of a [`Table`], detached from its owner: the
+/// The query-time read surface of a [`GraphTable`], detached from its owner: the
 /// mapped bytes plus the three `Copy` column descriptors and the header's dtype
 /// strings, pre-extracted. `Copy + Send + Sync` by construction — a parallel
 /// fold's tasks capture it directly, and the allocator behind the owning table
 /// never appears — so the search layer speaks this type and stays free of both
 /// the allocator generic and any unsafe shareability assertion.
 #[derive(Clone, Copy)]
-pub struct TableView<'t> {
-    /// The complete file image; every [`ByteRange`] is relative to `data_start`.
+pub struct GraphTableView<'t> {
+    /// The complete file image; every [`ByteRange`] is relative to `segment_start`.
     bytes: &'t [u8],
-    data_start: usize,
+    /// Byte offset of the data segment, the first byte past the padded header.
+    segment_start: usize,
+    /// Node identity, one row per node.
     key: Column<StorageDType>,
+    /// Node payload, one row per node.
     value: Column<StorageDType>,
+    /// Outgoing edges, as node indices into this same file.
     neighbors: Column<OffsetDType>,
-    /// The header dtype strings, which the `Copy` descriptors cannot recover —
+    /// The key column's dtype string, which the `Copy` descriptor cannot recover —
     /// `f16`, `bf16`, and `u16` all collapse to one storage width.
     key_dtype: &'t str,
+    /// The value column's dtype string, for the same reason.
     value_dtype: &'t str,
 }
 
-impl<'t> TableView<'t> {
+impl<'t> GraphTableView<'t> {
     /// Number of nodes.
     pub fn len(&self) -> usize {
-        self.key.len()
+        self.key.rows()
     }
 
     /// True when there are no nodes.
@@ -739,7 +792,7 @@ impl<'t> TableView<'t> {
         if nodes == 0 {
             return 0;
         }
-        let entries = self.neighbors.values.len / self.neighbors.dtype.size();
+        let entries = self.neighbors.data.len / self.neighbors.dtype.size();
         entries / nodes
     }
 
@@ -764,10 +817,10 @@ impl<'t> TableView<'t> {
     /// The whole value buffer, contiguous, for a batch scan over a regular
     /// column.
     pub fn value_buffer(&self) -> &'t [u8] {
-        self.buffer(self.value.values)
+        self.buffer(self.value.data)
     }
 
-    /// The value column's prefix-sum buffer and its width, or `None` when the
+    /// The value column's offsets buffer and its width, or `None` when the
     /// column is regular and has no offsets at all.
     pub fn value_offsets(&self) -> Option<(&'t [u8], OffsetDType)> {
         match self.value.layout {
@@ -787,25 +840,25 @@ impl<'t> TableView<'t> {
     /// invariant that every stored `ByteRange` lies within the map, and degrades
     /// to an empty slice rather than panicking if that were ever violated.
     fn buffer(&self, range: ByteRange) -> &'t [u8] {
-        let start = self.data_start.wrapping_add(range.start);
+        let start = self.segment_start.wrapping_add(range.start);
         let end = start.wrapping_add(range.len);
         self.bytes.get(start..end).unwrap_or(&[])
     }
 
-    /// Slice `len` bytes at `offset` within a column's values buffer, checking the
+    /// Slice `len` bytes at `offset` within a column's data buffer, checking the
     /// sub-range stays inside it.
-    fn subslice(&self, values: ByteRange, offset: usize, len: usize) -> Option<&'t [u8]> {
-        if offset.checked_add(len)? > values.len {
+    fn subslice(&self, data: ByteRange, offset: usize, len: usize) -> Option<&'t [u8]> {
+        if offset.checked_add(len)? > data.len {
             return None;
         }
         Some(self.buffer(ByteRange {
-            start: values.start.checked_add(offset)?,
+            start: data.start.checked_add(offset)?,
             len,
         }))
     }
 
     /// The `[begin, end)` element indices of node `node` in an irregular column,
-    /// read from its prefix-sum buffer and checked monotonic.
+    /// read from its offsets buffer and checked monotonic.
     fn node_span(&self, offsets: IrregularOffsets, node: usize) -> Option<(usize, usize)> {
         let element_size = offsets.dtype.size();
         let offset_bytes = self.buffer(offsets.range);
@@ -836,27 +889,27 @@ impl<'t> TableView<'t> {
     ) -> Option<&'t [u8]> {
         match column.layout {
             ColumnLayout::Regular { width } => {
-                // Safe to use the infallible form: a `TableView` only exists
+                // Safe to use the infallible form: a `GraphTableView` only exists
                 // after `check_layout` proved this width against the buffer.
                 let per = column.dtype.row_bytes(width);
-                self.subslice(column.values, node.checked_mul(per)?, per)
+                self.subslice(column.data, node.checked_mul(per)?, per)
             }
             ColumnLayout::Irregular { offsets } => {
                 let element_size = column.dtype.size();
                 let (begin, end) = self.node_span(offsets, node)?;
                 let offset = begin.checked_mul(element_size)?;
                 let len = end.checked_sub(begin)?.checked_mul(element_size)?;
-                self.subslice(column.values, offset, len)
+                self.subslice(column.data, offset, len)
             }
         }
     }
 }
 
 /// A view is a [`GraphLike`] too, so anything a producer's graph can do — a
-/// rebuild through [`Table::build`] included — a borrowed view can.
-impl GraphLike for TableView<'_> {
+/// rebuild through [`GraphTable::build`] included — a borrowed view can.
+impl GraphLike for GraphTableView<'_> {
     fn len(&self) -> usize {
-        TableView::len(self)
+        GraphTableView::len(self)
     }
     fn key_dtype(&self) -> &str {
         self.key_dtype
@@ -865,33 +918,33 @@ impl GraphLike for TableView<'_> {
         self.value_dtype
     }
     fn key_shape(&self) -> Option<Shape> {
-        TableView::key_shape(self)
+        GraphTableView::key_shape(self)
     }
     fn value_shape(&self) -> Option<Shape> {
-        TableView::value_shape(self)
+        GraphTableView::value_shape(self)
     }
     fn neighbors_degree(&self) -> Option<usize> {
-        TableView::neighbors_degree(self)
+        GraphTableView::neighbors_degree(self)
     }
     fn key(&self, node: usize) -> &[u8] {
-        TableView::key(self, node)
+        GraphTableView::key(self, node)
     }
     fn value(&self, node: usize) -> &[u8] {
-        TableView::value(self, node)
+        GraphTableView::value(self, node)
     }
     fn neighbors(&self, node: usize) -> NeighborList<'_> {
-        TableView::neighbors(self, node)
+        GraphTableView::neighbors(self, node)
     }
 }
 
-impl<Allocator: AllocatorLike> Table<Allocator> {
+impl<Allocator: AllocatorLike> GraphTable<Allocator> {
     /// The bytes behind the file, mapped or in-memory.
     fn bytes(&self) -> &[u8] {
         self.backing.as_bytes()
     }
 
     /// The complete `.safegraphs` byte image — magic, header, and data segment —
-    /// ready to write to a file or hand to [`from_bytes`](Table::from_bytes). For
+    /// ready to write to a file or hand to [`from_bytes`](GraphTable::from_bytes). For
     /// a built index this is the serialization; for a mapped one it is the mapping
     /// itself, so the borrow is always zero-copy.
     pub fn as_bytes(&self) -> &[u8] {
@@ -913,6 +966,8 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
         declared_alignment(self.metadata()).unwrap_or(4096)
     }
 
+    /// The breadth the graph was __built__ with, `ef_construction` by its usual
+    /// name. A walk's own breadth is a caller's argument and appears in no header.
     pub fn expansion(&self) -> Option<u64> {
         self.metadata_get("expansion").and_then(|v| v.as_u64())
     }
@@ -922,7 +977,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     }
 
     /// The original dtype string of a column, "key" / "value" / "neighbors", for
-    /// the compute layer to reinterpret its opaque values buffer.
+    /// the compute layer to reinterpret its opaque data buffer.
     pub fn dtype_name(&self, column: &str) -> Option<&str> {
         self.header.get(column)?.get("dtype")?.as_str()
     }
@@ -939,11 +994,11 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
         &self.neighbors
     }
 
-    /// Borrow the query-time read surface as a [`TableView`] — `Copy`, `Send`,
+    /// Borrow the query-time read surface as a [`GraphTableView`] — `Copy`, `Send`,
     /// and `Sync` regardless of this table's allocator, so parallel code takes
     /// the view and the owner stays behind.
-    pub fn view(&self) -> TableView<'_> {
-        TableView {
+    pub fn view(&self) -> GraphTableView<'_> {
+        GraphTableView {
             key_dtype: self.dtype_name("key").unwrap_or(""),
             value_dtype: self.dtype_name("value").unwrap_or(""),
             ..self.columns_view()
@@ -954,11 +1009,11 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     /// header lookups, so per-node delegation costs nothing. It carries no dtype
     /// strings, so `key_dtype` and `value_dtype` go to [`dtype_name`] instead.
     ///
-    /// [`dtype_name`]: Table::dtype_name
-    fn columns_view(&self) -> TableView<'_> {
-        TableView {
+    /// [`dtype_name`]: GraphTable::dtype_name
+    fn columns_view(&self) -> GraphTableView<'_> {
+        GraphTableView {
             bytes: self.bytes(),
-            data_start: self.data_start,
+            segment_start: self.segment_start,
             key: self.key,
             value: self.value,
             neighbors: self.neighbors,
@@ -978,8 +1033,10 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
 }
 
 impl<Element: ElementLike> Column<Element> {
-    /// Number of nodes the column describes, derived from its own buffers.
-    pub fn len(&self) -> usize {
+    /// Number of rows the column holds, derived from its own buffers. Equal to
+    /// the file's node count, which every column must agree on, but named for
+    /// the column's own axis.
+    pub fn rows(&self) -> usize {
         match self.layout {
             ColumnLayout::Regular { width } => {
                 // Derived from the header before `check_layout` has vetted the
@@ -987,7 +1044,7 @@ impl<Element: ElementLike> Column<Element> {
                 // width describes no rows at all, which the layout check then
                 // rejects.
                 match self.dtype.checked_row_bytes(width) {
-                    Some(per) => self.values.len.checked_div(per).unwrap_or(0),
+                    Some(per) => self.data.len.checked_div(per).unwrap_or(0),
                     None => 0,
                 }
             }
@@ -1003,7 +1060,7 @@ impl<Element: ElementLike> Column<Element> {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.rows() == 0
     }
 }
 
@@ -1072,14 +1129,14 @@ impl<'a> NeighborList<'a> {
     }
 }
 
-impl<Allocator: AllocatorLike> Table<Allocator> {
+impl<Allocator: AllocatorLike> GraphTable<Allocator> {
     /// The whole value buffer, contiguous, for a batch scan. Only meaningful for
     /// a regular value column; pair with [`GraphLike::value_shape`].
     pub fn value_buffer(&self) -> &[u8] {
         self.columns_view().value_buffer()
     }
 
-    /// The value column's prefix-sum buffer and its width, or `None` when the
+    /// The value column's offsets buffer and its width, or `None` when the
     /// column is regular and has no offsets at all.
     ///
     /// Exposed because a variable-length column is exactly an Arrow-style tape —
@@ -1098,16 +1155,10 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     /// that the columns agree on node count.
     fn validate(&self) -> Result<(), Error> {
         let alignment = declared_alignment(self.metadata())?;
-        let len = self.key.len();
+        let len = self.key.rows();
         self.check_layout(&self.key, len, alignment)?;
         self.check_layout(&self.value, len, alignment)?;
-        self.check_layout(&self.neighbors, len, alignment)?;
-        if let Some(declared) = self.metadata_get("nodes").and_then(|v| v.as_u64()) {
-            if usize::try_from(declared).ok() != Some(len) {
-                return Err(Error::Inconsistent);
-            }
-        }
-        Ok(())
+        self.check_layout(&self.neighbors, len, alignment)
     }
 
     /// Confirm one column's buffers fit the map and match `len` exactly.
@@ -1126,7 +1177,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
                     .dtype
                     .checked_row_bytes(width)
                     .ok_or(Error::TooLarge)?;
-                if per.checked_mul(len) != Some(column.values.len) {
+                if per.checked_mul(len) != Some(column.data.len) {
                     return Err(Error::Inconsistent);
                 }
             }
@@ -1141,7 +1192,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
                 }
             }
         }
-        self.check_buffer(column.values, alignment)
+        self.check_buffer(column.data, alignment)
     }
 
     /// Confirm a buffer begins on the declared alignment and ends within the
@@ -1151,7 +1202,7 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
             return Err(Error::Inconsistent);
         }
         let end = self
-            .data_start
+            .segment_start
             .checked_add(range.start)
             .and_then(|start| start.checked_add(range.len))
             .ok_or(Error::TooLarge)?;
@@ -1163,9 +1214,9 @@ impl<Allocator: AllocatorLike> Table<Allocator> {
     }
 }
 
-impl<Allocator: AllocatorLike> GraphLike for Table<Allocator> {
+impl<Allocator: AllocatorLike> GraphLike for GraphTable<Allocator> {
     fn len(&self) -> usize {
-        self.key.len()
+        self.key.rows()
     }
 
     fn key_dtype(&self) -> &str {
@@ -1208,9 +1259,9 @@ pub struct Node<'a> {
     pub neighbors: NeighborList<'a>,
 }
 
-/// A graph read node by node. Both a producer's graph and a parsed [`Table`]
-/// implement it, so a `Table` can be built from any `GraphLike`, including
-/// another `Table`.
+/// A graph read node by node. Both a producer's graph and a parsed [`GraphTable`]
+/// implement it, so a `GraphTable` can be built from any `GraphLike`, including
+/// another `GraphTable`.
 pub trait GraphLike {
     /// Number of nodes.
     fn len(&self) -> usize;
@@ -1329,13 +1380,18 @@ fn reserve_span(cursor: &mut usize, len: usize, alignment: usize) -> Result<usiz
     Ok(start)
 }
 
-/// Accumulates one column's on-disk buffers: concatenated values, and u64
+/// Accumulates one column's on-disk buffers: the concatenated rows, and `u64`
 /// prefix-sum offsets when the column is irregular.
 struct ColumnBuilder<Allocator: AllocatorLike> {
+    /// Storage width of one element.
     dtype: StorageDType,
+    /// Elements per row, or `None` when the rows are ragged.
     width: Option<usize>,
-    values: AVec<u8, Allocator>,
+    /// The rows themselves, concatenated.
+    data: AVec<u8, Allocator>,
+    /// `nodes + 1` prefix sums, ragged columns only.
     offsets: AVec<u8, Allocator>,
+    /// Elements written so far, the next row's start.
     running: u64,
 }
 
@@ -1348,7 +1404,7 @@ impl<Allocator: AllocatorLike + Clone> ColumnBuilder<Allocator> {
         Ok(ColumnBuilder {
             dtype,
             width,
-            values: AVec::new_in(alloc.clone()),
+            data: AVec::new_in(alloc.clone()),
             offsets,
             running: 0,
         })
@@ -1364,7 +1420,7 @@ impl<Allocator: AllocatorLike + Clone> ColumnBuilder<Allocator> {
                 if bytes.len() != row {
                     return Err(Error::Inconsistent);
                 }
-                push_bytes(&mut self.values, bytes)?;
+                push_bytes(&mut self.data, bytes)?;
             }
             // Irregular: whole-byte elements counted for the prefix sum. A sub-byte
             // dtype never arrives here — only sequences are irregular, and they are
@@ -1374,7 +1430,7 @@ impl<Allocator: AllocatorLike + Clone> ColumnBuilder<Allocator> {
                 if element_size == 0 || !bytes.len().is_multiple_of(element_size) {
                     return Err(Error::Inconsistent);
                 }
-                push_bytes(&mut self.values, bytes)?;
+                push_bytes(&mut self.data, bytes)?;
                 self.running += (bytes.len() / element_size) as u64;
                 push_bytes(&mut self.offsets, &self.running.to_le_bytes())?;
             }
@@ -1406,7 +1462,7 @@ fn write_column<Allocator: AllocatorLike>(
     column: &ColumnBuilder<Allocator>,
     shape: Shape,
     off_start: Option<usize>,
-    val_start: usize,
+    data_start: usize,
 ) {
     header.push_str(&format!(",\"{name}\":{{\"dtype\":\"{dtype}\""));
     match off_start {
@@ -1417,9 +1473,9 @@ fn write_column<Allocator: AllocatorLike>(
         // files and new writers agree byte for byte.
         Some(off) => {
             header.push_str(&format!(
-                ",\"offsets_dtype\":\"u64\",\"offsets_start\":{},\"offsets_length\":{}",
+                ",\"offsets_dtype\":\"u64\",\"offsets\":[{},{}]",
                 off,
-                column.offsets.len()
+                off + column.offsets.len()
             ));
             if let Shape::Matrix(rows, cols) = shape {
                 header.push_str(&format!(",\"shape\":[{rows},{cols}]"));
@@ -1437,19 +1493,19 @@ fn write_column<Allocator: AllocatorLike>(
         },
     }
     header.push_str(&format!(
-        ",\"values_start\":{},\"values_length\":{}}}",
-        val_start,
-        column.values.len()
+        ",\"data\":[{},{}]}}",
+        data_start,
+        data_start + column.data.len()
     ));
 }
 
 fn write_buffer<Allocator: AllocatorLike>(
     file: &mut AVec<u8, Allocator>,
-    data_start: usize,
+    segment_start: usize,
     start: usize,
     bytes: &[u8],
 ) {
-    let target = data_start + start;
+    let target = segment_start + start;
     while file.len() < target {
         file.push(0);
     }
@@ -1493,7 +1549,7 @@ where
         value.push_row(graph.value(i))?;
     }
 
-    // Widen the neighbor index type to whatever the node count needs.
+    // ScoreLike the neighbor index type to whatever the node count needs.
     let neighbor_dtype = if node_count > u32::MAX as usize {
         OffsetDType::U64
     } else {
@@ -1510,7 +1566,7 @@ where
         if list.dtype == neighbor_dtype {
             // Same width: the bytes are already node indices in the target
             // encoding, so copy the row verbatim with no per-edge widening. This
-            // is the path a re-materialized `Table` always takes.
+            // is the path a re-materialized `GraphTable` always takes.
             neighbors.push_row(list.bytes)?;
         } else {
             // The one place widths genuinely cross, when a producer's graph and
@@ -1535,11 +1591,11 @@ where
 
     let mut cursor = 0usize;
     let key_offsets_start = reserve_offsets(&key, &mut cursor, alignment)?;
-    let key_values_start = reserve_span(&mut cursor, key.values.len(), alignment)?;
+    let key_data_start = reserve_span(&mut cursor, key.data.len(), alignment)?;
     let value_offsets_start = reserve_offsets(&value, &mut cursor, alignment)?;
-    let value_values_start = reserve_span(&mut cursor, value.values.len(), alignment)?;
+    let value_data_start = reserve_span(&mut cursor, value.data.len(), alignment)?;
     let neighbor_offsets_start = reserve_offsets(&neighbors, &mut cursor, alignment)?;
-    let neighbor_values_start = reserve_span(&mut cursor, neighbors.values.len(), alignment)?;
+    let neighbor_data_start = reserve_span(&mut cursor, neighbors.data.len(), alignment)?;
     let data_len = cursor;
 
     let mut header = String::new();
@@ -1556,7 +1612,7 @@ where
         &key,
         key_shape.unwrap_or(Shape::Scalar),
         key_offsets_start,
-        key_values_start,
+        key_data_start,
     );
     write_column(
         &mut header,
@@ -1565,7 +1621,7 @@ where
         &value,
         graph.value_shape().unwrap_or(Shape::Scalar),
         value_offsets_start,
-        value_values_start,
+        value_data_start,
     );
     write_column(
         &mut header,
@@ -1574,15 +1630,15 @@ where
         &neighbors,
         Shape::Vector(neighbors.width.unwrap_or(1)),
         neighbor_offsets_start,
-        neighbor_values_start,
+        neighbor_data_start,
     );
     header.push('}');
 
     let unpadded = 16usize.checked_add(header.len()).ok_or(Error::TooLarge)?;
     let header_pad = (alignment - (unpadded % alignment)) % alignment;
     let header_len = header.len() + header_pad;
-    let data_start = 16 + header_len;
-    let total = data_start.checked_add(data_len).ok_or(Error::TooLarge)?;
+    let segment_start = 16 + header_len;
+    let total = segment_start.checked_add(data_len).ok_or(Error::TooLarge)?;
 
     let mut file: AVec<u8, Allocator> = AVec::new_in(alloc);
     file.try_reserve_exact(total).map_err(|_| Error::Alloc)?;
@@ -1593,21 +1649,21 @@ where
         file.push(b' ');
     }
     if let Some(off) = key_offsets_start {
-        write_buffer(&mut file, data_start, off, &key.offsets);
+        write_buffer(&mut file, segment_start, off, &key.offsets);
     }
-    write_buffer(&mut file, data_start, key_values_start, &key.values);
+    write_buffer(&mut file, segment_start, key_data_start, &key.data);
     if let Some(off) = value_offsets_start {
-        write_buffer(&mut file, data_start, off, &value.offsets);
+        write_buffer(&mut file, segment_start, off, &value.offsets);
     }
-    write_buffer(&mut file, data_start, value_values_start, &value.values);
+    write_buffer(&mut file, segment_start, value_data_start, &value.data);
     if let Some(off) = neighbor_offsets_start {
-        write_buffer(&mut file, data_start, off, &neighbors.offsets);
+        write_buffer(&mut file, segment_start, off, &neighbors.offsets);
     }
     write_buffer(
         &mut file,
-        data_start,
-        neighbor_values_start,
-        &neighbors.values,
+        segment_start,
+        neighbor_data_start,
+        &neighbors.data,
     );
 
     Ok(file)
@@ -1683,7 +1739,7 @@ mod tests {
 
     #[test]
     fn round_trip_regular() {
-        let table = Table::build(&toy(), None).unwrap();
+        let table = GraphTable::build(&toy(), None).unwrap();
         assert_eq!(table.len(), 3);
         assert_eq!(table.value_shape(), Some(Shape::Vector(2)));
         assert_eq!(table.key(1), &20u64.to_le_bytes()[..]);
@@ -1702,18 +1758,18 @@ mod tests {
 
     #[test]
     fn round_trip_through_bytes() {
-        let table = Table::build(&toy(), None).unwrap();
+        let table = GraphTable::build(&toy(), None).unwrap();
         let bytes = table.bytes().to_vec();
-        let reopened = Table::from_bytes(&bytes).unwrap();
+        let reopened = GraphTable::from_bytes(&bytes).unwrap();
         assert_eq!(reopened.len(), 3);
         assert_eq!(reopened.key(2), &30u64.to_le_bytes()[..]);
     }
 
     #[test]
     fn table_is_graphlike() {
-        // A Table implements GraphLike, so it can be re-materialized into another.
-        let table = Table::build(&toy(), None).unwrap();
-        let rebuilt = Table::build(&table, None).unwrap();
+        // A GraphTable implements GraphLike, so it can be re-materialized into another.
+        let table = GraphTable::build(&toy(), None).unwrap();
+        let rebuilt = GraphTable::build(&table, None).unwrap();
         assert_eq!(rebuilt.len(), 3);
         assert_eq!(rebuilt.key(0), &10u64.to_le_bytes()[..]);
         let edges = rebuilt.neighbors(1);
@@ -1770,19 +1826,19 @@ mod tests {
 
     #[test]
     fn a_ragged_value_column_rebuilds() {
-        let table = Table::build(&RaggedValues, None).unwrap();
+        let table = GraphTable::build(&RaggedValues, None).unwrap();
         assert_eq!(table.value_shape(), None);
         assert_eq!(table.value(1), b"sitting");
 
-        let rebuilt = Table::build(&table, None).unwrap();
+        let rebuilt = GraphTable::build(&table, None).unwrap();
         assert_eq!(rebuilt.value_shape(), None);
         assert_eq!(rebuilt.value(0), b"kitten");
         assert_eq!(rebuilt.value(2), b"mitten");
         assert_eq!(rebuilt.as_bytes(), table.as_bytes());
     }
 
-    /// Fixed-width `utf8` keys, the layout a rebuild used to turn ragged because
-    /// it read the dtype string rather than the declared shape.
+    /// Fixed-width `utf8` keys, whose layout a rebuild takes from the declared
+    /// shape rather than from the dtype string.
     struct FixedKeys;
 
     impl GraphLike for FixedKeys {
@@ -1819,14 +1875,26 @@ mod tests {
 
     #[test]
     fn a_fixed_width_key_column_stays_fixed_through_a_rebuild() {
-        let table = Table::build(&FixedKeys, None).unwrap();
+        let table = GraphTable::build(&FixedKeys, None).unwrap();
         assert_eq!(table.key_shape(), Some(Shape::Vector(8)));
         assert_eq!(table.key(0), b"wiki-1m\0");
 
-        let rebuilt = Table::build(&table, None).unwrap();
+        let rebuilt = GraphTable::build(&table, None).unwrap();
         assert_eq!(rebuilt.key_shape(), Some(Shape::Vector(8)));
         assert_eq!(rebuilt.key(1), b"deep-1b\0");
         assert_eq!(rebuilt.as_bytes(), table.as_bytes());
+    }
+
+    /// The header names each buffer once, as a pair of byte positions.
+    #[test]
+    fn buffers_are_written_as_position_pairs() {
+        let table = GraphTable::build(&RaggedValues, None).unwrap();
+        let bytes = table.as_bytes();
+        // The header is the `header_len` bytes after the magic and the length.
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        let header = core::str::from_utf8(&bytes[16..16 + header_len]).unwrap();
+        assert!(header.contains("\"data\":["));
+        assert!(header.contains("\"offsets\":["));
     }
 
     /// An alignment that is not a power of two is refused, whether it is above
@@ -1837,7 +1905,7 @@ mod tests {
             let metadata = format!("{{\"alignment\":{alignment}}}");
             let document = parse_in(metadata.as_bytes(), Global).unwrap();
             assert!(matches!(
-                Table::build(&toy(), Some(&document)),
+                GraphTable::build(&toy(), Some(&document)),
                 Err(Error::Inconsistent)
             ));
         }

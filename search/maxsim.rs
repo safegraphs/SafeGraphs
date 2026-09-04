@@ -19,11 +19,11 @@
 
 use super::batch::{batch_scan, batch_search, build_workers, open_pool, ShareRead, Workers};
 use super::{
-    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
-    TraversalContext,
+    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike,
+    TraversalContext, WalkerLike,
 };
 use crate::search::dense::matrix_view;
-use crate::{cast, Error, IndexLike, OffsetDType, Shape, Table, TableView};
+use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, Shape};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use core::cmp::Ordering;
 use forkunion as fu;
@@ -106,7 +106,7 @@ where
 /// The fixed token width of a MaxSim value column — the `depth` of every
 /// multi-vector in the file. The single shape check every entry point repeats:
 /// the token axis must be the ragged one, so only `Matrix(0, depth)` qualifies.
-fn multi_vector_depth(table: TableView<'_>) -> Result<usize, Error> {
+fn multi_vector_depth(table: GraphTableView<'_>) -> Result<usize, Error> {
     match table.value_shape() {
         Some(Shape::Matrix(0, depth)) if depth != 0 => Ok(depth),
         _ => Err(Error::WrongType),
@@ -137,17 +137,12 @@ where
 
 // region: Scanner
 
-/// The batch half of the MaxSim metric: owns a thread pool, the packed node
-/// multi-vectors — packed once per scan and shared read-only across the fold —
-/// one packed-query scratch per worker, and the reusable score tile.
+/// The batch half of the MaxSim metric: owns a thread pool, one packed form per
+/// query since queries are the small side, one packed-node scratch per pool
+/// thread rather than one per node, and the reusable score tile.
 pub struct MaxSimScanner<Scalar: nk::MaxSim, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
-    /// One packed form per query, packed once per scan and shared read-only.
-    /// Queries are the __small__ side, so these are the ones worth holding.
     packed_queries: Vec<nk::MaxSimPackedMatrix<Scalar, Allocator>>,
-    /// One packed-node scratch per pool thread. A node is packed, scored, and
-    /// overwritten by the next node on that thread, so the whole scan holds
-    /// `threads` node buffers rather than one per node.
     workers: Vec<nk::MaxSimPackedMatrix<Scalar, Allocator>>,
     tile: Matrix<f64, Allocator>,
     alloc: Allocator,
@@ -187,7 +182,7 @@ where
     pub fn scan(
         &mut self,
         queries: MaxSimBatch<'_, Scalar>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -218,7 +213,7 @@ where
     fn scan(
         &mut self,
         queries: MaxSimBatch<'_, Scalar>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<f64, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         let depth = multi_vector_depth(table)?;
@@ -321,7 +316,7 @@ where
 /// overwritten by the next node the thread takes.
 fn scan_one_node<Scalar, Allocator>(
     packed_node: &mut nk::MaxSimPackedMatrix<Scalar, Allocator>,
-    table: TableView<'_>,
+    table: GraphTableView<'_>,
     node: usize,
     depth: usize,
     packed_queries: &[nk::MaxSimPackedMatrix<Scalar, Allocator>],
@@ -348,27 +343,27 @@ where
 
 // region: Searcher
 
-/// The traversal half of the MaxSim metric: owns the reusable scratch, packs the
-/// query once per walk, and scores one expansion's staged nodes against it.
-pub struct MaxSimSearcher<Scalar: nk::MaxSim, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the MaxSim metric: one query at a fixed node width,
+/// packing the query once per walk and scoring each staged node against it.
+pub struct MaxSimWalker<Scalar: nk::MaxSim, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, f64, Allocator>,
     packed_query: nk::MaxSimPackedMatrix<Scalar, Allocator>,
     packed_node: nk::MaxSimPackedMatrix<Scalar, Allocator>,
 }
 
-impl<Scalar, Index, Allocator> MaxSimSearcher<Scalar, Index, Allocator>
+impl<Scalar, Index, Allocator> MaxSimWalker<Scalar, Index, Allocator>
 where
     Scalar: nk::MaxSim,
     Index: IndexLike,
     Allocator: AllocatorLike + Clone,
 {
     /// A searcher walking with breadth `expansion_factor`, its scratch in
-    /// `alloc`, uniform with [`DotSearcher::new`].
+    /// `alloc`, uniform with [`DotWalker::new`].
     ///
-    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
+    /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(MaxSimSearcher {
+        Ok(MaxSimWalker {
             context: TraversalContext::new_in(expansion_factor, alloc.clone())?,
             packed_query: nk::MaxSimPackedMatrix::empty_in(alloc.clone()),
             packed_node: nk::MaxSimPackedMatrix::empty_in(alloc),
@@ -381,8 +376,8 @@ where
     }
 }
 
-impl<Scalar, Index, Allocator> SearcherLike<MaxSimMetric<Scalar>>
-    for MaxSimSearcher<Scalar, Index, Allocator>
+impl<Scalar, Index, Allocator> WalkerLike<MaxSimMetric<Scalar>>
+    for MaxSimWalker<Scalar, Index, Allocator>
 where
     Scalar: nk::MaxSim + nk::StorageElement + Copy + Default + 'static,
     <Scalar as nk::MaxSim>::Score: Into<f64>,
@@ -395,7 +390,7 @@ where
     fn score_nodes(
         &mut self,
         query: &[Scalar],
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [f64],
     ) -> Result<(), Error> {
@@ -431,40 +426,40 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: &[Scalar], table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: &[Scalar], table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<MaxSimMetric<Scalar>, Self>(self, query, table)
     }
 }
 
-/// A MaxSim searcher whose neighbor width is settled by the tables it searches —
-/// the family's width resolver, one leaf per pool thread.
-pub struct MaxSimSearch<Scalar: nk::MaxSim, Allocator: AllocatorLike = Global> {
+/// Batched MaxSim walks, resolving the node width from the first table
+/// searched and holding one [`MaxSimWalker`] per pool thread.
+pub struct MaxSimSearcher<Scalar: nk::MaxSim, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        MaxSimSearcher<Scalar, u32, Allocator>,
-        MaxSimSearcher<Scalar, u64, Allocator>,
+        MaxSimWalker<Scalar, u32, Allocator>,
+        MaxSimWalker<Scalar, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Scalar, Allocator> MaxSimSearch<Scalar, Allocator>
+impl<Scalar, Allocator> MaxSimSearcher<Scalar, Allocator>
 where
     Scalar: nk::MaxSim + nk::StorageElement + Copy + Default + Send + Sync + 'static,
     <Scalar as nk::MaxSim>::Score: Into<f64>,
     Allocator: AllocatorLike + Clone + Send,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, uniform with [`DotSearch::new`].
+    /// `scope` names, uniform with [`DotSearcher::new`].
     ///
-    /// [`DotSearch::new`]: crate::search::dense::DotSearch::new
+    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(MaxSimSearch {
+        Ok(MaxSimSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -477,7 +472,7 @@ where
     pub fn search(
         &mut self,
         queries: MaxSimBatch<'_, Scalar>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -490,7 +485,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        MaxSimSearcher::new(expansion_factor, alloc.clone())
+                        MaxSimWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -510,7 +505,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        MaxSimSearcher::new(expansion_factor, alloc.clone())
+                        MaxSimWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -558,7 +553,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimScannerAny<Allocator>
         &mut self,
         query_bytes: &[u8],
         token_offsets: &[usize],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -604,13 +599,13 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimScannerAny<Allocator>
 
 /// A MaxSim searcher chosen from a file's value dtype string — the walk twin of
 /// [`MaxSimScannerAny`].
-pub enum MaxSimSearchAny<Allocator: AllocatorLike = Global> {
-    F32(MaxSimSearch<f32, Allocator>),
-    F16(MaxSimSearch<nk::f16, Allocator>),
-    Bf16(MaxSimSearch<nk::bf16, Allocator>),
+pub enum MaxSimSearcherAny<Allocator: AllocatorLike = Global> {
+    F32(MaxSimSearcher<f32, Allocator>),
+    F16(MaxSimSearcher<nk::f16, Allocator>),
+    Bf16(MaxSimSearcher<nk::bf16, Allocator>),
 }
 
-impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearchAny<Allocator> {
+impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearcherAny<Allocator> {
     pub fn new(
         dtype: &str,
         expansion_factor: usize,
@@ -618,9 +613,9 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearchAny<Allocator> 
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f32" => MaxSimSearchAny::F32(MaxSimSearch::new(expansion_factor, scope, alloc)?),
-            "f16" => MaxSimSearchAny::F16(MaxSimSearch::new(expansion_factor, scope, alloc)?),
-            "bf16" => MaxSimSearchAny::Bf16(MaxSimSearch::new(expansion_factor, scope, alloc)?),
+            "f32" => MaxSimSearcherAny::F32(MaxSimSearcher::new(expansion_factor, scope, alloc)?),
+            "f16" => MaxSimSearcherAny::F16(MaxSimSearcher::new(expansion_factor, scope, alloc)?),
+            "bf16" => MaxSimSearcherAny::Bf16(MaxSimSearcher::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -629,14 +624,14 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearchAny<Allocator> 
         &mut self,
         query_bytes: &[u8],
         token_offsets: &[usize],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
         let depth = multi_vector_depth(table.view())?;
         match self {
-            MaxSimSearchAny::F32(search) => search.search(
+            MaxSimSearcherAny::F32(search) => search.search(
                 MaxSimBatch::new(
                     cast(query_bytes).ok_or(Error::WrongType)?,
                     token_offsets,
@@ -647,7 +642,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearchAny<Allocator> 
                 distances,
                 counts,
             ),
-            MaxSimSearchAny::F16(search) => search.search(
+            MaxSimSearcherAny::F16(search) => search.search(
                 MaxSimBatch::new(
                     cast(query_bytes).ok_or(Error::WrongType)?,
                     token_offsets,
@@ -658,7 +653,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearchAny<Allocator> 
                 distances,
                 counts,
             ),
-            MaxSimSearchAny::Bf16(search) => search.search(
+            MaxSimSearcherAny::Bf16(search) => search.search(
                 MaxSimBatch::new(
                     cast(query_bytes).ok_or(Error::WrongType)?,
                     token_offsets,
@@ -678,6 +673,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearchAny<Allocator> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::testing::outputs;
     use crate::{GraphLike, NeighborList, Shape};
 
     /// Three ragged multi-vectors at `depth = 2`, so the value column is
@@ -742,19 +738,11 @@ mod tests {
         }
     }
 
-    fn outputs(queries: usize, k: usize) -> (Matrix<u64>, Matrix<f64>, Vec<u64>) {
-        (
-            Matrix::<u64>::new(queries, k).unwrap(),
-            Matrix::<f64>::new(queries, k).unwrap(),
-            vec![0u64; queries],
-        )
-    }
-
     /// The ragged shape survives a build/parse round-trip — the property that
     /// unblocked this family. A regular column could not express it.
     #[test]
     fn ragged_shape_round_trips() {
-        let table = crate::Table::build(&multi_vectors(), None).unwrap();
+        let table = crate::GraphTable::build(&multi_vectors(), None).unwrap();
         assert_eq!(table.value_shape(), Some(Shape::Matrix(0, 2)));
     }
 
@@ -762,7 +750,7 @@ mod tests {
     /// orthogonal-or-opposite to node 2, which must therefore rank last.
     #[test]
     fn scan_ranks_the_opposed_multi_vector_last() {
-        let table = crate::Table::build(&multi_vectors(), None).unwrap();
+        let table = crate::GraphTable::build(&multi_vectors(), None).unwrap();
         let mut scanner = MaxSimScanner::<f32>::new(ExecutionScope::Serial, Global).unwrap();
 
         let scalars = [1.0f32, 0.0];

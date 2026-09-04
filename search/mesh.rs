@@ -22,11 +22,11 @@
 
 use super::batch::{batch_scan, batch_search, build_workers, open_pool, ShareRead, Workers};
 use super::{
-    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, SearcherLike,
-    TraversalContext,
+    walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike,
+    TraversalContext, WalkerLike,
 };
 use crate::search::dense::matrix_view;
-use crate::{cast, Error, IndexLike, OffsetDType, Shape, Table, TableView};
+use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, Shape};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use core::cmp::Ordering;
 use forkunion as fu;
@@ -130,7 +130,7 @@ where
 
 /// The cardinality of a mesh value column: `points`, requiring exactly three
 /// coordinates per point. The single shape check every entry point repeats.
-fn cloud_points(table: TableView<'_>) -> Result<usize, Error> {
+fn cloud_points(table: GraphTableView<'_>) -> Result<usize, Error> {
     match table.value_shape() {
         // `Matrix(0, 3)` is the crate's ragged sentinel, not a zero-point cloud,
         // and a superposition needs at least three points — the floor every
@@ -190,7 +190,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -222,7 +222,7 @@ where
     fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         scores: &mut Matrix<f64, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
         let points = cloud_points(table)?;
@@ -304,25 +304,25 @@ where
 
 // region: Searcher
 
-/// The traversal half of any mesh metric: owns the reusable scratch and scores
-/// one expansion's staged nodes by superposing the query cloud onto each.
-pub struct MeshSearcher<Coordinate, Superpose, Index = u32, Allocator: AllocatorLike = Global> {
+/// The traversal half of the mesh metric: one query at a fixed node width,
+/// superposing the query cloud onto each staged node.
+pub struct MeshWalker<Coordinate, Superpose, Index = u32, Allocator: AllocatorLike = Global> {
     context: TraversalContext<Index, f64, Allocator>,
     marker: core::marker::PhantomData<fn() -> (Coordinate, Superpose)>,
 }
 
-impl<Coordinate, Superpose, Index, Allocator> MeshSearcher<Coordinate, Superpose, Index, Allocator>
+impl<Coordinate, Superpose, Index, Allocator> MeshWalker<Coordinate, Superpose, Index, Allocator>
 where
     Index: IndexLike,
     Allocator: AllocatorLike + Clone,
 {
     /// A searcher walking with breadth `expansion_factor`, uniform with
-    /// [`DotSearcher::new`].
+    /// [`DotWalker::new`].
     ///
-    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
+    /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         nk::capabilities::configure_thread();
-        Ok(MeshSearcher {
+        Ok(MeshWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
             marker: core::marker::PhantomData,
         })
@@ -334,8 +334,8 @@ where
     }
 }
 
-impl<Coordinate, Superpose, Index, Allocator> SearcherLike<MeshMetric<Coordinate, Superpose>>
-    for MeshSearcher<Coordinate, Superpose, Index, Allocator>
+impl<Coordinate, Superpose, Index, Allocator> WalkerLike<MeshMetric<Coordinate, Superpose>>
+    for MeshWalker<Coordinate, Superpose, Index, Allocator>
 where
     Coordinate: nk::StorageElement + Copy + Default + 'static,
     Superpose: SuperposeLike<Coordinate>,
@@ -348,7 +348,7 @@ where
     fn score_nodes(
         &mut self,
         query: &[Coordinate],
-        table: TableView<'_>,
+        table: GraphTableView<'_>,
         nodes: &[Index],
         out: &mut [f64],
     ) -> Result<(), Error> {
@@ -375,41 +375,40 @@ where
         Ranking::Nearest.compare(a, b)
     }
 
-    fn search(&mut self, query: &[Coordinate], table: TableView<'_>) -> Result<(), Error> {
+    fn search(&mut self, query: &[Coordinate], table: GraphTableView<'_>) -> Result<(), Error> {
         walk::<MeshMetric<Coordinate, Superpose>, Self>(self, query, table)
     }
 }
 
-/// A mesh searcher whose neighbor width is settled by the tables it searches —
-/// the family's width resolver, one leaf per pool thread, exactly as `DotSearch`
-/// keeps them.
-pub struct MeshSearch<Coordinate, Superpose, Allocator: AllocatorLike = Global> {
+/// Batched mesh walks, resolving the node width from the first table
+/// searched and holding one [`MeshWalker`] per pool thread.
+pub struct MeshSearcher<Coordinate, Superpose, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
     workers: Workers<
-        MeshSearcher<Coordinate, Superpose, u32, Allocator>,
-        MeshSearcher<Coordinate, Superpose, u64, Allocator>,
+        MeshWalker<Coordinate, Superpose, u32, Allocator>,
+        MeshWalker<Coordinate, Superpose, u64, Allocator>,
         Allocator,
     >,
     alloc: Allocator,
 }
 
-impl<Coordinate, Superpose, Allocator> MeshSearch<Coordinate, Superpose, Allocator>
+impl<Coordinate, Superpose, Allocator> MeshSearcher<Coordinate, Superpose, Allocator>
 where
     Coordinate: nk::StorageElement + Copy + Default + Send + Sync + 'static,
     Superpose: SuperposeLike<Coordinate>,
     Allocator: AllocatorLike + Clone + Send,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
-    /// `scope` names, uniform with [`DotSearch::new`].
+    /// `scope` names, uniform with [`DotSearcher::new`].
     ///
-    /// [`DotSearch::new`]: crate::search::dense::DotSearch::new
+    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        Ok(MeshSearch {
+        Ok(MeshSearcher {
             pool: open_pool(scope)?,
             expansion_factor,
             workers: Workers::Unresolved,
@@ -422,7 +421,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -435,7 +434,7 @@ where
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
-                        MeshSearcher::new(expansion_factor, alloc.clone())
+                        MeshWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
@@ -455,7 +454,7 @@ where
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
                     self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
-                        MeshSearcher::new(expansion_factor, alloc.clone())
+                        MeshWalker::new(expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
@@ -481,24 +480,39 @@ where
 
 /// Kabsch superposition — rotation + translation, nearest-first RMSD.
 pub type RotationalMeshMetric<Coordinate> = MeshMetric<Coordinate, RotationalSuperpose>;
+/// Exact brute force over Kabsch superposition.
 pub type RotationalMeshScanner<Coordinate, Allocator = Global> =
     MeshScanner<Coordinate, RotationalSuperpose, Allocator>;
-pub type RotationalMeshSearch<Coordinate, Allocator = Global> =
-    MeshSearch<Coordinate, RotationalSuperpose, Allocator>;
+/// One query's greedy walk under Kabsch superposition.
+pub type RotationalMeshWalker<Coordinate, Index = u32, Allocator = Global> =
+    MeshWalker<Coordinate, RotationalSuperpose, Index, Allocator>;
+/// Batched walks under Kabsch superposition.
+pub type RotationalMeshSearcher<Coordinate, Allocator = Global> =
+    MeshSearcher<Coordinate, RotationalSuperpose, Allocator>;
 
 /// Raw RMSD — no alignment, nearest-first.
 pub type RigidMeshMetric<Coordinate> = MeshMetric<Coordinate, RigidSuperpose>;
+/// Exact brute force over raw RMSD.
 pub type RigidMeshScanner<Coordinate, Allocator = Global> =
     MeshScanner<Coordinate, RigidSuperpose, Allocator>;
-pub type RigidMeshSearch<Coordinate, Allocator = Global> =
-    MeshSearch<Coordinate, RigidSuperpose, Allocator>;
+/// One query's greedy walk under raw RMSD.
+pub type RigidMeshWalker<Coordinate, Index = u32, Allocator = Global> =
+    MeshWalker<Coordinate, RigidSuperpose, Index, Allocator>;
+/// Batched walks under raw RMSD.
+pub type RigidMeshSearcher<Coordinate, Allocator = Global> =
+    MeshSearcher<Coordinate, RigidSuperpose, Allocator>;
 
 /// Umeyama superposition — rotation + translation + scale, nearest-first RMSD.
 pub type SimilarityMeshMetric<Coordinate> = MeshMetric<Coordinate, SimilaritySuperpose>;
+/// Exact brute force over Umeyama superposition.
 pub type SimilarityMeshScanner<Coordinate, Allocator = Global> =
     MeshScanner<Coordinate, SimilaritySuperpose, Allocator>;
-pub type SimilarityMeshSearch<Coordinate, Allocator = Global> =
-    MeshSearch<Coordinate, SimilaritySuperpose, Allocator>;
+/// One query's greedy walk under Umeyama superposition.
+pub type SimilarityMeshWalker<Coordinate, Index = u32, Allocator = Global> =
+    MeshWalker<Coordinate, SimilaritySuperpose, Index, Allocator>;
+/// Batched walks under Umeyama superposition.
+pub type SimilarityMeshSearcher<Coordinate, Allocator = Global> =
+    MeshSearcher<Coordinate, SimilaritySuperpose, Allocator>;
 
 // endregion: Metric aliases
 
@@ -552,7 +566,7 @@ where
     pub fn scan(
         &mut self,
         queries_bytes: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -593,23 +607,23 @@ where
 
 /// A mesh searcher chosen from a file's value dtype string — the walk twin of
 /// [`MeshScannerAny`], generic over the superposition for the same reason.
-pub enum MeshSearchAny<Superpose, Allocator: AllocatorLike = Global> {
-    F64(MeshSearch<f64, Superpose, Allocator>),
-    F32(MeshSearch<f32, Superpose, Allocator>),
-    F16(MeshSearch<nk::f16, Superpose, Allocator>),
-    Bf16(MeshSearch<nk::bf16, Superpose, Allocator>),
+pub enum MeshSearcherAny<Superpose, Allocator: AllocatorLike = Global> {
+    F64(MeshSearcher<f64, Superpose, Allocator>),
+    F32(MeshSearcher<f32, Superpose, Allocator>),
+    F16(MeshSearcher<nk::f16, Superpose, Allocator>),
+    Bf16(MeshSearcher<nk::bf16, Superpose, Allocator>),
 }
 
 /// Raw-RMSD searcher over every coordinate dtype.
-pub type RigidMeshSearchAny<Allocator = Global> = MeshSearchAny<RigidSuperpose, Allocator>;
+pub type RigidMeshSearcherAny<Allocator = Global> = MeshSearcherAny<RigidSuperpose, Allocator>;
 /// Kabsch searcher over every coordinate dtype.
-pub type RotationalMeshSearchAny<Allocator = Global> =
-    MeshSearchAny<RotationalSuperpose, Allocator>;
+pub type RotationalMeshSearcherAny<Allocator = Global> =
+    MeshSearcherAny<RotationalSuperpose, Allocator>;
 /// Umeyama searcher over every coordinate dtype.
-pub type SimilarityMeshSearchAny<Allocator = Global> =
-    MeshSearchAny<SimilaritySuperpose, Allocator>;
+pub type SimilarityMeshSearcherAny<Allocator = Global> =
+    MeshSearcherAny<SimilaritySuperpose, Allocator>;
 
-impl<Superpose, Allocator> MeshSearchAny<Superpose, Allocator>
+impl<Superpose, Allocator> MeshSearcherAny<Superpose, Allocator>
 where
     Superpose:
         SuperposeLike<f64> + SuperposeLike<f32> + SuperposeLike<nk::f16> + SuperposeLike<nk::bf16>,
@@ -622,10 +636,10 @@ where
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(match dtype {
-            "f64" => Self::F64(MeshSearch::new(expansion_factor, scope, alloc)?),
-            "f32" => Self::F32(MeshSearch::new(expansion_factor, scope, alloc)?),
-            "f16" => Self::F16(MeshSearch::new(expansion_factor, scope, alloc)?),
-            "bf16" => Self::Bf16(MeshSearch::new(expansion_factor, scope, alloc)?),
+            "f64" => Self::F64(MeshSearcher::new(expansion_factor, scope, alloc)?),
+            "f32" => Self::F32(MeshSearcher::new(expansion_factor, scope, alloc)?),
+            "f16" => Self::F16(MeshSearcher::new(expansion_factor, scope, alloc)?),
+            "bf16" => Self::Bf16(MeshSearcher::new(expansion_factor, scope, alloc)?),
             _ => return Err(Error::UnknownDType),
         })
     }
@@ -642,7 +656,7 @@ where
     pub fn search(
         &mut self,
         queries_bytes: &[u8],
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -697,6 +711,7 @@ fn view<Coordinate: nk::StorageElement>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::testing::outputs;
     use crate::{GraphLike, NeighborList, Shape};
 
     /// Three point clouds of `points = 3`, plus a query. Node 1 is the query
@@ -765,17 +780,9 @@ mod tests {
         }
     }
 
-    fn outputs(queries: usize, k: usize) -> (Matrix<u64>, Matrix<f64>, Vec<u64>) {
-        (
-            Matrix::<u64>::new(queries, k).unwrap(),
-            Matrix::<f64>::new(queries, k).unwrap(),
-            vec![0u64; queries],
-        )
-    }
-
     #[test]
     fn rigid_scan_ranks_identical_cloud_first() {
-        let table = crate::Table::build(&clouds(), None).unwrap();
+        let table = crate::GraphTable::build(&clouds(), None).unwrap();
         let mut scanner = RigidMeshScanner::<f32>::new(ExecutionScope::Serial, Global).unwrap();
         let queries = nk::Matrix::<f32>::try_from_scalars(&query(), &[1, 9]).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(1, 3);
@@ -797,11 +804,11 @@ mod tests {
 
     #[test]
     fn rotational_walk_agrees_with_scan() {
-        let table = crate::Table::build(&clouds(), None).unwrap();
+        let table = crate::GraphTable::build(&clouds(), None).unwrap();
         let mut scanner =
             RotationalMeshScanner::<f32>::new(ExecutionScope::Serial, Global).unwrap();
         let mut searcher =
-            RotationalMeshSearch::<f32>::new(3, ExecutionScope::Serial, Global).unwrap();
+            RotationalMeshSearcher::<f32>::new(3, ExecutionScope::Serial, Global).unwrap();
         let queries = nk::Matrix::<f32>::try_from_scalars(&query(), &[1, 9]).unwrap();
 
         let (mut sm, mut sd, mut sc) = outputs(1, 3);

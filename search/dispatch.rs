@@ -27,14 +27,14 @@ use super::dense::{
 use super::geospatial::{
     HaversineScannerAny, HaversineSearcherAny, VincentyScannerAny, VincentySearcherAny,
 };
-use super::maxsim::{MaxSimScannerAny, MaxSimSearchAny};
+use super::maxsim::{MaxSimScannerAny, MaxSimSearcherAny};
 use super::mesh::{
-    RigidMeshScannerAny, RigidMeshSearchAny, RotationalMeshScannerAny, RotationalMeshSearchAny,
-    SimilarityMeshScannerAny, SimilarityMeshSearchAny,
+    RigidMeshScannerAny, RigidMeshSearcherAny, RotationalMeshScannerAny, RotationalMeshSearcherAny,
+    SimilarityMeshScannerAny, SimilarityMeshSearcherAny,
 };
-use super::sequence::{AlignmentCosts, LevenshteinCosts, SequenceScanner, SequenceSearch};
+use super::sequence::{AlignmentCosts, LevenshteinCosts, SequenceScanner, SequenceSearcher};
 use super::{ExecutionScope, Matrix, Ranking};
-use crate::{Error, Table};
+use crate::{Error, GraphTable};
 use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
 use stringtape::BytesTapeView;
 use stringzilla::szs;
@@ -214,7 +214,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
         &mut self,
         query_bytes: &[u8],
         query_offsets: Option<&[u64]>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -285,14 +285,14 @@ pub enum SearcherAny<Allocator: AllocatorLike = Global> {
     Jaccard(JaccardSearcherAny<Allocator>),
     Haversine(HaversineSearcherAny<Allocator>),
     Vincenty(VincentySearcherAny<Allocator>),
-    Rmsd(RigidMeshSearchAny<Allocator>),
-    Kabsch(RotationalMeshSearchAny<Allocator>),
-    Umeyama(SimilarityMeshSearchAny<Allocator>),
-    MaxSim(MaxSimSearchAny<Allocator>),
-    Levenshtein(SequenceSearch<szs::LevenshteinDistances, Allocator>),
-    LevenshteinUtf8(SequenceSearch<szs::LevenshteinDistancesUtf8, Allocator>),
-    NeedlemanWunsch(SequenceSearch<szs::NeedlemanWunschScores, Allocator>),
-    SmithWaterman(SequenceSearch<szs::SmithWatermanScores, Allocator>),
+    Rmsd(RigidMeshSearcherAny<Allocator>),
+    Kabsch(RotationalMeshSearcherAny<Allocator>),
+    Umeyama(SimilarityMeshSearcherAny<Allocator>),
+    MaxSim(MaxSimSearcherAny<Allocator>),
+    Levenshtein(SequenceSearcher<szs::LevenshteinDistances, Allocator>),
+    LevenshteinUtf8(SequenceSearcher<szs::LevenshteinDistancesUtf8, Allocator>),
+    NeedlemanWunsch(SequenceSearcher<szs::NeedlemanWunschScores, Allocator>),
+    SmithWaterman(SequenceSearcher<szs::SmithWatermanScores, Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
@@ -343,46 +343,49 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
                 scope,
                 alloc,
             )?),
-            "rmsd" => SearcherAny::Rmsd(RigidMeshSearchAny::new(
+            "rmsd" => SearcherAny::Rmsd(RigidMeshSearcherAny::new(
                 dtype,
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "kabsch" => SearcherAny::Kabsch(RotationalMeshSearchAny::new(
+            "kabsch" => SearcherAny::Kabsch(RotationalMeshSearcherAny::new(
                 dtype,
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "umeyama" => SearcherAny::Umeyama(SimilarityMeshSearchAny::new(
+            "umeyama" => SearcherAny::Umeyama(SimilarityMeshSearcherAny::new(
                 dtype,
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "maxsim" => {
-                SearcherAny::MaxSim(MaxSimSearchAny::new(dtype, expansion_factor, scope, alloc)?)
-            }
-            "levenshtein" => SearcherAny::Levenshtein(SequenceSearch::new(
+            "maxsim" => SearcherAny::MaxSim(MaxSimSearcherAny::new(
+                dtype,
+                expansion_factor,
+                scope,
+                alloc,
+            )?),
+            "levenshtein" => SearcherAny::Levenshtein(SequenceSearcher::new(
                 LevenshteinCosts::default(),
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "levenshtein-utf8" => SearcherAny::LevenshteinUtf8(SequenceSearch::new(
+            "levenshtein-utf8" => SearcherAny::LevenshteinUtf8(SequenceSearcher::new(
                 LevenshteinCosts::default(),
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "needleman-wunsch" => SearcherAny::NeedlemanWunsch(SequenceSearch::new(
+            "needleman-wunsch" => SearcherAny::NeedlemanWunsch(SequenceSearcher::new(
                 AlignmentCosts::default(),
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "smith-waterman" => SearcherAny::SmithWaterman(SequenceSearch::new(
+            "smith-waterman" => SearcherAny::SmithWaterman(SequenceSearcher::new(
                 AlignmentCosts::default(),
                 expansion_factor,
                 scope,
@@ -397,7 +400,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
         &mut self,
         query_bytes: &[u8],
         query_offsets: Option<&[u64]>,
-        table: &Table<impl AllocatorLike>,
+        table: &GraphTable<impl AllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],

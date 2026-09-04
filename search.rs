@@ -1,5 +1,5 @@
-//! Search over a [`crate::Table`]: shared traversal machinery, and a contract
-//! every searcher follows.
+//! Search over a [`crate::GraphTable`]: shared traversal machinery, and the
+//! contract every walker and scanner follows.
 //!
 //! This module deliberately contains no scoring. It provides the pieces a metric
 //! reuses — [`MinQueue`], [`VisitedSet`], [`TraversalContext`], [`Matrix`],
@@ -11,7 +11,7 @@
 //! A metric is described by [`MetricLike`], which declares types and no
 //! behavior, and is worked by two functors it names. A [`ScannerLike`] owns an
 //! executor — a thread pool or a device — and scores a whole batch; there are few
-//! of them. A [`SearcherLike`] owns a [`TraversalContext`] and walks the graph for
+//! of them. A [`WalkerLike`] owns a [`TraversalContext`] and walks the graph for
 //! one query; there is one per worker thread, which is what makes its `&mut self`
 //! free. Nothing here is inherited: shared code is called, never derived.
 
@@ -28,7 +28,7 @@ use crate::{Error, IndexLike};
 /// Each family opens the scope into whatever its backend calls an executor: the
 /// NumKong families spawn a ForkUnion thread pool, the StringZilla ones a
 /// `DeviceScope`, and that conversion is the only place a backend type appears.
-/// A family whose kernels are CPU-only answers [`Gpu`](ExecutionScope::Gpu)
+/// A family whose kernels are CPU-only answers [`GPU`](ExecutionScope::GPU)
 /// with [`Error::WrongType`] at construction rather than pretending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionScope {
@@ -37,11 +37,11 @@ pub enum ExecutionScope {
     Serial,
     /// CPU threads, the caller included; zero means every logical core the
     /// machine reports.
-    Cpus(usize),
+    CPUs(usize),
     /// One GPU, by zero-based device index. Fanning across several GPUs is not
     /// a functor's business: build one functor per device and shard tables
     /// across them.
-    Gpu(usize),
+    GPU(usize),
 }
 
 /// Which end of a score axis wins: `Nearest` for a distance, where smaller is
@@ -62,7 +62,7 @@ impl Ranking {
     }
 
     /// Order two native scores best-first under this direction — the comparator
-    /// every family's `SearcherLike::compare` and `rank_tile` hand to the pool.
+    /// every family's `WalkerLike::compare` and `rank_tile` hand to the pool.
     /// `Greater` means __`a` is the better match__: a priority comparator, not a
     /// natural ordering, so a caller sorting with it wants `.reverse()`.
     /// Generic over the metric's own `Score`, so it runs on unwidened values; a
@@ -188,7 +188,9 @@ impl<Item, Allocator: AllocatorLike + Clone> MinQueue<Item, Allocator> {
 /// A reusable visited set over a fixed node range. Version-stamped, so `reset`
 /// is O(1): it bumps a generation counter instead of clearing the array.
 pub struct VisitedSet<Allocator: AllocatorLike = Global> {
+    /// One stamp per node, compared against `generation` rather than cleared.
     stamps: AVec<u32, Allocator>,
+    /// The current query's stamp; bumping it empties the set in O(1).
     generation: u32,
     /// How many nodes are marked this generation. The stamped array cannot report
     /// this in O(1), and the landmark sampler needs it to know when the whole
@@ -300,7 +302,7 @@ impl SplitMix {
 }
 
 /// A per-thread bundle of reusable traversal scratch, owned by a
-/// [`SearcherLike`]. Hold one per worker thread and let the walk reset it between
+/// [`WalkerLike`]. Hold one per worker thread and let the walk reset it between
 /// queries rather than reallocating.
 ///
 /// Generic over the table's native index type `I` and the metric's score `S`, so
@@ -313,10 +315,10 @@ pub struct TraversalContext<Index, Score, Allocator: AllocatorLike = Global> {
     results: MinQueue<Candidate<Index, Score>, Allocator>,
     /// Closed set.
     visited: VisitedSet<Allocator>,
-    /// Nodes staged for one batched expansion, and the scores that come back.
-    /// Lent out wholesale for the duration of a walk, so the searcher can be
-    /// borrowed mutably while they are in use.
+    /// Nodes staged for one batched expansion, lent out wholesale for the
+    /// duration of a walk so the walker stays mutably borrowable.
     neighbors: AVec<Index, Allocator>,
+    /// The scores those staged nodes come back with, lent out the same way.
     scores: AVec<Score, Allocator>,
     /// Search breadth, at least `k`. A per-searcher tuning knob rather than a
     /// per-query argument, since one searcher is one thread's worth of policy.
@@ -456,21 +458,15 @@ impl<Index: IndexLike, Score: Copy + Default> TraversalContext<Index, Score, Glo
     }
 }
 
-/// A dense, owned, row-major `rows × cols` matrix — the crate's only 2D container.
-/// Allocation is fallible and never panics. The shape it carries is what lets a
-/// batch search read `k` and the query count off the output instead of taking them
-/// as arguments, and it grows-and-reuses across calls. Deliberately NumKong-free,
-/// so it holds a batch's `matches` and `distances` for a StringZilla sequence
-/// search as readily as a NumKong dense one.
+/// A dense, owned, row-major `rows × cols` matrix, the crate's only 2D container.
+/// Allocation is fallible, and the shape it carries is what lets a batch search
+/// read `k` and the query count off the output rather than take them as arguments.
+/// Backend-free, so it holds a sequence batch's results as readily as a dense one.
 ///
-/// It also serves as a scanner's reusable score tile, with `rows = nodes` and
-/// `cols = queries`. Node-major reads backwards next to "top-`k` per query", and
-/// it is deliberate: this is the layout NumKong's cross-product writes natively,
-/// and its kernels reject a strided output outright, so the dense scan fills it
-/// with no copy and no transpose. A sequence metric has to copy out of its device
-/// matrix regardless, so it transposes inside that copy for free. Ranking then
-/// strides across the tile, one cache line per row per column, dwarfed by the
-/// work of producing the scores.
+/// As a scanner's score tile it is one row per node and one column per query.
+/// Node-major reads backwards next to "top-`k` per query" and is deliberate: it is
+/// the layout NumKong's cross-product writes natively, and those kernels reject a
+/// strided output, so a dense scan fills it with no transpose.
 pub struct Matrix<Cell, Allocator: AllocatorLike = Global> {
     data: AVec<Cell, Allocator>,
     rows: usize,
@@ -590,9 +586,11 @@ pub trait QueryBatchLike<Metric: MetricLike + ?Sized> {
 
 /// A metric: the vocabulary of its types, nothing more. It names how a query and
 /// a query batch are shaped and what a score is; the functors that do the work —
-/// a [`ScannerLike`] and a [`SearcherLike`] — reference it, so it declares no
+/// a [`ScannerLike`] and a [`WalkerLike`] — reference it, so it declares no
 /// method and no index, which is what keeps a dense metric and a sequence metric
-/// from sharing a line of implementation.
+/// from sharing a line of implementation. One generic marker serves a whole
+/// family, since the scalar is the only thing that ever varies, so a new dtype
+/// adds no code.
 pub trait MetricLike {
     /// One query. A rank-1 vector view for a dense metric, a byte slice for a
     /// sequence one. `Copy` because a walk scores with the same query on every
@@ -613,13 +611,13 @@ pub trait ScannerLike<Metric: MetricLike + ?Sized> {
     fn scan(
         &mut self,
         queries: Metric::Queries<'_>,
-        table: crate::TableView<'_>,
+        table: crate::GraphTableView<'_>,
         scores: &mut Matrix<Metric::Score, impl AllocatorLike + Clone>,
     ) -> Result<(), Error>;
 }
 
 /// The traversal half of a metric: walk the neighbor graph for one query.
-pub trait SearcherLike<Metric: MetricLike + ?Sized> {
+pub trait WalkerLike<Metric: MetricLike + ?Sized> {
     /// The node-index width this searcher traverses in, resolved from the table it
     /// was built for. Its scratch, frontier, and results are all this wide, so a
     /// `u32` graph never pays for `u64` cells. Not on [`MetricLike`]: it describes
@@ -639,7 +637,7 @@ pub trait SearcherLike<Metric: MetricLike + ?Sized> {
     fn score_nodes(
         &mut self,
         query: Metric::Query<'_>,
-        table: crate::TableView<'_>,
+        table: crate::GraphTableView<'_>,
         nodes: &[Self::Index],
         out: &mut [Metric::Score],
     ) -> Result<(), Error>;
@@ -657,36 +655,26 @@ pub trait SearcherLike<Metric: MetricLike + ?Sized> {
     fn search(
         &mut self,
         query: Metric::Query<'_>,
-        table: crate::TableView<'_>,
+        table: crate::GraphTableView<'_>,
     ) -> Result<(), Error>;
 }
 
-/// The greedy best-first walk, as a free function every searcher delegates to.
+/// The greedy best-first walk, as a free function every walker delegates to.
 ///
-/// It seeds from randomly sampled landmarks rather than caller-supplied roots: a
-/// stochastic multi-start, seeded with about as many nodes as the graph's degree,
-/// re-seeded whenever the frontier drains before the result pool fills. This is
-/// the volatile-index traversal (`inner_volatile_index.hpp`), minus everything a
-/// frozen file makes unnecessary — no watermark, no locks, no publication checks,
-/// since every node in a `.safegraphs` file is readable and immovable.
-///
-/// One iteration expands one node and scores its entire unvisited neighbor list
-/// in a single [`score_nodes`](SearcherLike::score_nodes) call, which is the shape
-/// both backends want and the only shape a sequence metric can serve at all. A
-/// neighbor id outside `0..table.len()` is a sentinel and is skipped, so a
-/// fixed-degree adjacency row may be padded rather than trimmed to length.
-/// Results are left in the searcher's context; drain them with
-/// [`TraversalContext::drain_into`].
-///
-/// [`Error::WrongType`] and friends propagate from the metric untouched.
+/// Seeds from randomly sampled landmarks, about as many as the graph's degree,
+/// re-seeding whenever the frontier drains before the result pool fills. One
+/// iteration expands one node and scores its whole unvisited neighbor list in a
+/// single [`score_nodes`](WalkerLike::score_nodes) call, skipping any neighbor ID
+/// outside `0..table.len()`. Results are left in the walker's context; drain them
+/// with [`TraversalContext::drain_into`].
 pub fn walk<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
-    table: crate::TableView<'_>,
+    table: crate::GraphTableView<'_>,
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
-    Score: SearcherLike<Metric> + ?Sized,
+    Score: WalkerLike<Metric> + ?Sized,
 {
     searcher.context().reserve(table.len())?;
     searcher.context().reset();
@@ -701,13 +689,13 @@ where
 fn walk_staged<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
-    table: crate::TableView<'_>,
+    table: crate::GraphTableView<'_>,
     staged: &mut AVec<Score::Index, impl AllocatorLike>,
     scores: &mut AVec<Metric::Score, impl AllocatorLike>,
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
-    Score: SearcherLike<Metric> + ?Sized,
+    Score: WalkerLike<Metric> + ?Sized,
 {
     let nodes = table.len();
     if nodes == 0 {
@@ -806,21 +794,25 @@ fn sample_landmarks<Metric, Score>(
 ) -> bool
 where
     Metric: MetricLike + ?Sized,
-    Score: SearcherLike<Metric> + ?Sized,
+    Score: WalkerLike<Metric> + ?Sized,
 {
     staged.clear();
     let bound = nodes as u64;
     while staged.len() < count && searcher.context().visited.len() < nodes {
-        let mut id = searcher.context().rng.bounded(bound) as usize;
-        while searcher.context().visited.contains(id) {
-            id = if id + 1 == nodes { 0 } else { id + 1 };
+        let mut candidate = searcher.context().rng.bounded(bound) as usize;
+        while searcher.context().visited.contains(candidate) {
+            candidate = if candidate + 1 == nodes {
+                0
+            } else {
+                candidate + 1
+            };
         }
-        // `id < nodes`, and the searcher was sized for this table, so it fits; a
-        // failure is treated like a failed reserve below, seeding fewer.
-        let Ok(node) = Score::Index::try_from(id) else {
+        // `candidate < nodes`, and the searcher was sized for this table, so it
+        // fits; a failure is treated like a failed reserve below, seeding fewer.
+        let Ok(node) = Score::Index::try_from(candidate) else {
             break;
         };
-        searcher.context().visited.visit(id);
+        searcher.context().visited.visit(candidate);
         if staged.try_reserve(1).is_err() {
             break;
         }
@@ -833,10 +825,10 @@ where
 /// each as visited so no node is ever scored twice.
 ///
 /// Any candidate outside `0..nodes` is a sentinel and is skipped, by the format's
-/// convention: a neighbor id at or past the node count names no node, so a
+/// convention: a neighbor ID at or past the node count names no node, so a
 /// producer may pad a fixed-degree adjacency row with such a value — the node
-/// count itself, or the id type's maximum — instead of storing a variable-length
-/// list. The reader needs no distinguished sentinel value; every out-of-range id
+/// count itself, or the ID type's maximum — instead of storing a variable-length
+/// list. The reader needs no distinguished sentinel value; every out-of-range ID
 /// is one.
 fn stage_unvisited<Metric, Score>(
     searcher: &mut Score,
@@ -846,11 +838,11 @@ fn stage_unvisited<Metric, Score>(
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
-    Score: SearcherLike<Metric> + ?Sized,
+    Score: WalkerLike<Metric> + ?Sized,
 {
     staged.clear();
     for node in candidates {
-        // Out of range, whether the id overflows `usize` or merely names no node:
+        // Out of range, whether the ID overflows `usize` or merely names no node:
         // a sentinel, skipped.
         let Ok(index) = TryInto::<usize>::try_into(node) else {
             continue;
@@ -872,7 +864,7 @@ where
 fn admit<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
-    table: crate::TableView<'_>,
+    table: crate::GraphTableView<'_>,
     staged: &AVec<Score::Index, impl AllocatorLike>,
     scores: &mut AVec<Metric::Score, impl AllocatorLike>,
     expansion_factor: usize,
@@ -887,7 +879,7 @@ fn admit<Metric, Score>(
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
-    Score: SearcherLike<Metric> + ?Sized,
+    Score: WalkerLike<Metric> + ?Sized,
 {
     if staged.is_empty() {
         return Ok(());
@@ -920,7 +912,7 @@ fn saturated<Metric, Score>(
 ) -> bool
 where
     Metric: MetricLike + ?Sized,
-    Score: SearcherLike<Metric> + ?Sized,
+    Score: WalkerLike<Metric> + ?Sized,
 {
     let results = &searcher.context().results;
     results.len() >= expansion_factor
@@ -1009,6 +1001,11 @@ pub mod dispatch;
 // needs NumKong's `f16`/`bf16` — the same gate the families sit behind.
 #[cfg(feature = "search")]
 pub mod queries;
+
+// Test-only helpers shared by every family, in the one module that may name a
+// backend for the purpose.
+#[cfg(all(test, feature = "search"))]
+pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests {
