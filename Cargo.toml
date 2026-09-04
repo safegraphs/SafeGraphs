@@ -39,7 +39,7 @@ stringtape = "2.4"
 # MaxSim for late interaction, and Kabsch/Umeyama for point meshes. `parallel`
 # gates the whole `DotsPackedParallelOps` surface — without it the pool-taking
 # kernels a dense scanner drives are compiled out entirely.
-numkong = { git = "https://github.com/ashvardanian/NumKong", branch = "main-v8-block-scaling", features = [
+numkong = { git = "https://github.com/ashvardanian/NumKong", branch = "main-v8", features = [
     "parallel",
 ], optional = true }
 

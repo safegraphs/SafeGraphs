@@ -149,7 +149,7 @@ checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
 name = "jsontape"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "allocator-api2",
  "serde",
@@ -173,8 +173,8 @@ dependencies = [
 [[package]]
 name = "numkong"
 version = "7.7.1"
-source = "git+https://github.com/ashvardanian/NumKong?branch=main-v8-block-scaling#ca405b79488d7cd88ce2ab9232f4402293e852a1"
 dependencies = [
+ "allocator-api2",
  "cc",
  "forkunion",
 ]
@@ -316,3 +316,7 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[patch.unused]]
+name = "stringzilla"
+version = "5.1.2"

@@ -98,6 +98,35 @@ while IFS= read -r file; do
         printf '%s\n' "$double_space" | head -5
         failed=1
     fi
+
+    # The two vocabulary checks below quote the very spellings they ban, so this
+    # file is the one place they cannot apply to itself.
+    case "$file" in
+    .githooks/*) continue ;;
+    esac
+
+    # Initialisms are written out in full caps, so an identity is an ID and a device
+    # is a CPU or a GPU. Word-anchored, so `void`, `valid`, `uuid`, and `identity`
+    # never trip, and a snake_case `node_id` is caught by the underscore alternative.
+    initialisms=$(printf '%s\n' "$added" |
+        grep -E '\b(id|ids|Id|Ids|Cpu|Cpus|Gpu|Gpus)\b|_id\b|\bid_' || true)
+    if [ -n "$initialisms" ]; then
+        echo "pre-commit: $file spells an initialism in mixed case — write ID, IDs, CPU, GPU:"
+        printf '%s\n' "$initialisms" | head -5
+        failed=1
+    fi
+
+    # Names this project has retired. Each was renamed deliberately, so a new use is
+    # a revival rather than an oversight. Extend the list whenever a name is retired.
+    retired=$(printf '%s\n' "$added" |
+        grep -E 'values_start|values_length|offsets_length|\bbin128\b|\bWiden\b|SearcherLike|\bTableView\b' || true)
+    if [ -n "$retired" ]; then
+        echo "pre-commit: $file uses a retired name — data/offsets are [begin, end] pairs, the"
+        echo "            16-byte dtype is uuid or b128, Widen is ScoreLike, SearcherLike is"
+        echo "            WalkerLike, and TableView is GraphTableView:"
+        printf '%s\n' "$retired" | head -5
+        failed=1
+    fi
 done <<< "$staged"
 
 if [ "$failed" -ne 0 ]; then
