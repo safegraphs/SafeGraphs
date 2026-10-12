@@ -36,6 +36,31 @@ So SafeGraphs stores rows as the producer declared them and adds no layout machi
 A producer that wants every row to land inside one page picks a `shape` whose row divides it; one that would rather spend the loads leaves it alone.
 Either way a row can straddle a page or a device sector, and how to handle that split read is the consumer's call, made where the access pattern is actually known.
 
+## Principles
+
+__Do__:
+
+- Store one flat graph per file, with no layers and no hierarchy.
+- Treat the JSON header as the whole schema, naming every column, its dtype, its shape, and its buffers.
+- Locate every buffer by a `[begin, end]` byte pair relative to the data segment.
+- Start every buffer at a multiple of `alignment`, with zeros filling the gap before it, so alignment applies to buffers and never to rows.
+- Pack rows back to back inside a buffer, each exactly as wide as its column's `shape` and dtype make it, so no row width is ever stored.
+- Pad a short fixed-width `neighbors` row with sentinels, any index at or past the node count, which a reader skips.
+- Require `key`, `value`, and `neighbors`, and let graph readers ignore every other column.
+- Write every integer little-endian.
+- Keep every file memory-mappable, so a reader takes typed slices straight out of the data segment.
+- Keep every shard of a Distributed index a complete Monolith whose edges stay inside it.
+- Let the manifest route and size shards, and leave the schema and the metric to each shard's own header.
+
+__Don't__:
+
+- Don't compress buffers, since compression defeats memory mapping.
+- Don't pad, frame, or reorder rows inside a buffer; a producer that wants page-aligned rows picks a `shape` whose row width divides the page.
+- Don't store nulls, since every node is present in every column and an empty edge list is zero-length.
+- Don't store keys or another file's indices in `neighbors`, which holds node indices into its own file.
+- Don't restate a derivable fact like the node count in the header.
+- Don't find buffers by their order, since only their pairs locate them.
+
 ## File Structure
 
 Similar to Hugging Face's `safetensors`, a SafeGraphs file is a small JSON header followed by a single data segment of raw, concatenated buffers.
@@ -51,28 +76,22 @@ There are no layers and no hierarchy, so a node's edges are simply its outgoing 
 
 A single `.safegraphs` file holds everything: the schema, the keys, the payloads, and the graph.
 
-```
-┌────────────────────────────────────┐
-│ Magic "SAFEGRPH" (8 bytes)         │
-├────────────────────────────────────┤
-│ Header size (u64, little-endian)   │
-├────────────────────────────────────┤
-│ Header JSON (UTF-8, space-padded)  │
-│  - __metadata__                    │
-│  - key / value / neighbors schema  │
-├────────────────────────────────────┤
-│ Data: key offsets, if ragged       │
-├────────────────────────────────────┤
-│ Data: key data                     │
-├────────────────────────────────────┤
-│ Data: value offsets, if ragged     │
-├────────────────────────────────────┤
-│ Data: value data                   │
-├────────────────────────────────────┤
-│ Data: neighbors offsets, if ragged │
-├────────────────────────────────────┤
-│ Data: neighbors data               │
-└────────────────────────────────────┘
+```text
+offset 0        ┌────────────────────────────────┐
+                │ magic "SAFEGRPH"               │  8 bytes
+offset 8        ├────────────────────────────────┤
+                │ header size H                  │  u64, little-endian
+offset 16       ├────────────────────────────────┤
+                │ JSON header                    │  H bytes of UTF-8, padded with spaces
+offset 16 + H   ├────────────────────────────────┤  data segment, aligned
+                │ key offsets, if ragged         │
+                │ key data                       │  each buffer starts at a multiple
+                │ value offsets, if ragged       │  of the alignment, zeros fill the gap
+                │ value data                     │  before it, and its rows follow one
+                │ neighbors offsets, if ragged   │  another with no gap
+                │ neighbors data                 │
+                │ extra columns, such as norms   │
+                └────────────────────────────────┘
 ```
 
 An 8-byte magic and a `u64` header size keep everything 8-byte aligned from the first byte and let tools sniff the file type.
@@ -91,11 +110,12 @@ A producer targeting Apple Silicon can raise `alignment` to 16384, or to 2 MB fo
 
 A flat graph has three graph columns — `key`, `value`, and `neighbors` — and every one of them is required.
 Any other top-level key except `__metadata__` is a column in the same grammar with the same node count, which a producer writes for its own use and a graph reader ignores.
+One such column is standard, [`norms`](#norms), so producers that write it agree on what it holds.
 
 ```json
 {
   "__metadata__": {
-    "metric": "dot",                # optional; distance the graph was built for, e.g. dot, euclidean, angular
+    "metric": "dot",                # optional; the registered name the graph was built for, see Metrics
     "expansion": 128,               # optional; the breadth the graph was built with, `ef_construction` by its usual name
     "alignment": 4096,              # buffer alignment in bytes; a power of two, default 4096, floor 64
     "created_by": "usearch 3.x",    # free-form provenance, and anything else a producer wants to record
@@ -181,6 +201,37 @@ All text is UTF-8, so any language or emoji round-trips without a codepage, and 
 }
 ```
 
+### Metrics
+
+`__metadata__.metric` names the metric the graph was built for, since a walk is only meaningful under that one.
+A name is spelled as the kernel library that defines it spells it: NumKong's kernels keep their underscores, and the sequence metrics keep the hyphens of the algorithms they name.
+
+- __Dense__: `dot`, `vdot`, `angular`, `euclidean`, `sqeuclidean`, `bilinear`, `mahalanobis`, `kld`, `jsd`.
+- __Binary and sparse sets__: `hamming`, `jaccard`, `sparse_dot`, `sparse_intersect`.
+- __Geospatial__: `haversine`, `vincenty`.
+- __Meshes__: `rmsd`, `kabsch`, `umeyama`.
+- __Late interaction__: `maxsim`.
+- __Sequences__: `levenshtein`, `levenshtein-utf8`, `needleman-wunsch`, `smith-waterman`.
+
+A reader refuses a name it does not recognize, and refuses by name a registered one it cannot score, rather than walking under a substitute.
+`sqeuclidean` orders nodes exactly as `euclidean` does, so a reader may serve either with the other's kernel; the reference reader scores both as `euclidean`.
+It has no kernel yet for `vdot`, `bilinear`, `mahalanobis`, `kld`, `jsd`, `sparse_dot`, or `sparse_intersect`.
+
+### Norms
+
+A `norms` column holds two numbers per node: the sum of its `value` elements, then the sum of their squares.
+It is a regular column of `shape` 2, in the dtype the value's dot products accumulate in, such as `i32` for `i8` values or `f32` for `f16` ones.
+With it a reader finishes an angular or Euclidean score from a dot product alone, or compensates a quantized one, without a second pass over the values.
+It is optional, and a reader that does not use it ignores it like any other extra column.
+
+```json
+"norms": {
+  "dtype": "f32",
+  "shape": 2,               # sum, then sum of squares
+  "data": [64320000000, 64480000000]   # 20M nodes × 2 × f32
+}
+```
+
 ### Distributed
 
 For larger datasets, the nodes are partitioned across many `.safegraphs` shards described by a JSON manifest.
@@ -188,10 +239,10 @@ Each shard is a complete Monolith as above, self-describing and independently re
 A shard's `neighbors` reference only nodes inside that same shard, so edges never cross files.
 Node indices are local to each shard, so the same index names a different node in every file, while keys are global, and the manifest, not the file format, records how they are partitioned.
 
-```
-dataset.safegraphs.json            # manifest
-dataset-00001-of-00002.safegraphs  # shard, a full Monolith
-dataset-00002-of-00002.safegraphs  # shard, a full Monolith
+```text
+dataset.safegraphs.json                  manifest: path, keys, bytes, nodes, sha256
+ ├─→ dataset-00001-of-00002.safegraphs   a full Monolith, edges stay inside it
+ └─→ dataset-00002-of-00002.safegraphs   a full Monolith, edges stay inside it
 ```
 
 `safetensors` has no cross-file convention of its own, since it is single-file.

@@ -41,11 +41,13 @@ use stringzilla::szs;
 
 /// Every metric name a file may declare, in the order [`ScannerAny`] matches
 /// them. A CLI prints this for `--help`; a producer writing `__metadata__.metric`
-/// picks from it. The strings are format contract — they match the `*Metric` type
-/// names, lowercased and underscored.
+/// picks from it. The strings are format contract — NumKong's kernel names keep
+/// their underscores, and the sequence metrics the hyphens of the algorithms
+/// they name. The last seven have no kernel here and are refused by name.
 pub const METRICS: &[&str] = &[
     "dot",
     "euclidean",
+    "sqeuclidean",
     "angular",
     "hamming",
     "jaccard",
@@ -59,7 +61,23 @@ pub const METRICS: &[&str] = &[
     "levenshtein-utf8",
     "needleman-wunsch",
     "smith-waterman",
+    "vdot",
+    "bilinear",
+    "mahalanobis",
+    "kld",
+    "jsd",
+    "sparse_dot",
+    "sparse_intersect",
 ];
+
+/// True for a registered metric this reader has no kernel for: a file naming
+/// one opens, and a scan or walk under it fails with [`Error::UnsupportedMetric`].
+fn is_unscored(metric: &str) -> bool {
+    matches!(
+        metric,
+        "vdot" | "bilinear" | "mahalanobis" | "kld" | "jsd" | "sparse_dot" | "sparse_intersect"
+    )
+}
 
 /// True when the metric reads its queries as ragged rows — sequence tapes and
 /// maxsim multi-vectors — so a caller knows whether offsets are required.
@@ -75,12 +93,14 @@ pub fn is_ragged(metric: &str) -> bool {
 /// `distances` matrix does not. `None` for an unknown metric.
 pub fn ranking(metric: &str) -> Option<Ranking> {
     Some(match metric {
-        // Similarities: a larger dot product or alignment score is a better match.
-        "dot" | "needleman-wunsch" | "smith-waterman" => Ranking::Farthest,
+        // Similarities: a larger product, overlap, or alignment score is a better match.
+        "dot" | "vdot" | "bilinear" | "sparse_dot" | "sparse_intersect" | "needleman-wunsch"
+        | "smith-waterman" => Ranking::Farthest,
         // Distances: everything else scores smaller-is-better, including MaxSim,
         // whose late interaction accumulates an angular distance.
-        "euclidean" | "angular" | "hamming" | "jaccard" | "haversine" | "vincenty" | "rmsd"
-        | "kabsch" | "umeyama" | "maxsim" | "levenshtein" | "levenshtein-utf8" => Ranking::Nearest,
+        "euclidean" | "sqeuclidean" | "angular" | "mahalanobis" | "kld" | "jsd" | "hamming"
+        | "jaccard" | "haversine" | "vincenty" | "rmsd" | "kabsch" | "umeyama" | "maxsim"
+        | "levenshtein" | "levenshtein-utf8" => Ranking::Nearest,
         _ => return None,
     })
 }
@@ -143,7 +163,8 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
     /// scan. An override the family cannot serve fails here, not silently later.
     ///
     /// Sequence costs default to unit edits and the identity substitution; a
-    /// later revision reads them from `__metadata__`.
+    /// later revision reads them from `__metadata__`. `sqeuclidean` ranks as
+    /// `euclidean` does, so it is served by that arm and reports the root.
     pub fn new(
         metric: &str,
         dtype: &str,
@@ -152,7 +173,9 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
     ) -> Result<Self, Error> {
         Ok(match metric {
             "dot" => ScannerAny::Dot(DotScannerAny::new(dtype, scope, alloc)?),
-            "euclidean" => ScannerAny::Euclidean(EuclideanScannerAny::new(dtype, scope, alloc)?),
+            "euclidean" | "sqeuclidean" => {
+                ScannerAny::Euclidean(EuclideanScannerAny::new(dtype, scope, alloc)?)
+            }
             "angular" => ScannerAny::Angular(AngularScannerAny::new(dtype, scope, alloc)?),
             "hamming" => ScannerAny::Hamming(HammingScannerAny::new(dtype, scope, alloc)?),
             "jaccard" => ScannerAny::Jaccard(JaccardScannerAny::new(dtype, scope, alloc)?),
@@ -182,11 +205,13 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
                 scope,
                 alloc,
             )?),
+            name if is_unscored(name) => return Err(Error::UnsupportedMetric),
             _ => return Err(Error::UnknownMetric),
         })
     }
 
-    /// The metric name this scanner serves — the string that selected it.
+    /// The metric name this scanner serves — the string that selected it, or
+    /// `euclidean` for `sqeuclidean`.
     pub fn metric(&self) -> &'static str {
         match self {
             ScannerAny::Dot(_) => "dot",
@@ -307,7 +332,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
     ) -> Result<Self, Error> {
         Ok(match metric {
             "dot" => SearcherAny::Dot(DotSearcherAny::new(dtype, expansion_factor, scope, alloc)?),
-            "euclidean" => SearcherAny::Euclidean(EuclideanSearcherAny::new(
+            "euclidean" | "sqeuclidean" => SearcherAny::Euclidean(EuclideanSearcherAny::new(
                 dtype,
                 expansion_factor,
                 scope,
@@ -391,6 +416,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
                 scope,
                 alloc,
             )?),
+            name if is_unscored(name) => return Err(Error::UnsupportedMetric),
             _ => return Err(Error::UnknownMetric),
         })
     }
@@ -464,20 +490,30 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
 mod tests {
     use super::*;
 
-    /// Every name in [`METRICS`] constructs, and an unknown one is refused —
-    /// the router's whole contract in one pass. Dtypes are the widest each
-    /// family accepts, so a family rejecting the dtype cannot mask a routing bug.
+    /// Every name in [`METRICS`] ranks and constructs, or is refused as
+    /// unscored — the router's whole contract in one pass. Dtypes are the widest
+    /// each family accepts, so a family rejecting the dtype cannot mask a routing
+    /// bug.
     #[test]
     fn every_metric_name_routes() {
         for metric in METRICS {
+            assert!(ranking(metric).is_some(), "{metric} has no ranking");
             let dtype = match *metric {
                 "hamming" | "jaccard" => "u1x8",
                 "maxsim" => "f32",
                 _ => "f32",
             };
             let scanner = ScannerAny::new(metric, dtype, ExecutionScope::Serial, Global);
+            if is_unscored(metric) {
+                assert!(matches!(scanner, Err(Error::UnsupportedMetric)));
+                continue;
+            }
             assert!(scanner.is_ok(), "{metric} failed to route");
-            assert_eq!(scanner.unwrap().metric(), *metric);
+            let served = match *metric {
+                "sqeuclidean" => "euclidean",
+                name => name,
+            };
+            assert_eq!(scanner.unwrap().metric(), served);
         }
     }
 

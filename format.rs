@@ -366,6 +366,8 @@ pub enum Error {
     MissingField(&'static str),
     /// A metric name is not one the router recognizes.
     UnknownMetric,
+    /// A registered metric name this reader has no kernel for.
+    UnsupportedMetric,
     /// A dtype string is not one the width table recognizes.
     UnknownDType,
     /// A JSON value was not the shape the schema expects.
@@ -393,6 +395,9 @@ impl core::fmt::Display for Error {
             Error::Json(inner) => write!(out, "header is not valid JSON: {inner:?}"),
             Error::MissingField(field) => write!(out, "header is missing {field}"),
             Error::UnknownMetric => out.write_str("no metric family answers to that name"),
+            Error::UnsupportedMetric => {
+                out.write_str("the metric is registered, but this reader cannot score it")
+            }
             Error::UnknownDType => out.write_str("no storage width answers to that dtype"),
             Error::WrongType => out.write_str("the column's dtype or shape does not suit this use"),
             Error::TooLarge => out.write_str("a declared size does not fit this platform"),
