@@ -2,22 +2,22 @@
 //! __metric-name axis__ lives.
 //!
 //! Two axes, kept apart. A family owns its __dtype__ axis: `dense` resolves
-//! `f64`…`u1x8` inside [`DotScannerAny`], `mesh` its four coordinate widths,
+//! `f64`…`u1x8` inside [`DotScannerAny`], `shapes` its two coordinate widths,
 //! `maxsim` its three packable scalars. This module owns the axis above — which
 //! family and which metric — so a file that declares `"haversine"` reaches the
-//! geospatial scanner and one that declares `"smith-waterman"` reaches the
-//! sequence engine. Neither axis leaks into the other: adding a dtype touches a
-//! family, adding a metric touches only this file.
+//! geospatial scanner and one that declares `"chamfer"` reaches the shapes one.
+//! Neither axis leaks into the other: adding a dtype touches a family, adding a
+//! metric touches only this file.
 //!
-//! `sequence` has no dtype axis at all — its four metrics differ by engine, not
-//! by scalar — so its arms hold the concrete `SequenceScanner<Engine>` rather
-//! than a family `*Any`. That asymmetry is the reason the router exists rather
-//! than a uniform per-family enum.
+//! `sequence` has no dtype axis at all — its two metrics differ by the symbol
+//! they count, not by scalar — so its arms hold the concrete `SequenceScanner`
+//! rather than a family `*Any`. That asymmetry is the reason the router exists
+//! rather than a uniform per-family enum.
 //!
 //! Queries cross as __bytes plus optional offsets__, the same model the format's
 //! own columns use: a fixed-width metric reads the bytes through the table's
-//! shape, a ragged one (sequence, maxsim) reads the offsets too. No query
-//! wrapper type and no StringZilla type appears in this module's signatures.
+//! shape, a ragged one (sequence, maxsim, shapes) reads the offsets too. No
+//! query wrapper type and no StringZilla type appears in this module's signatures.
 
 use super::binary::{HammingScannerAny, HammingSearcherAny, JaccardScannerAny, JaccardSearcherAny};
 use super::dense::{
@@ -28,22 +28,20 @@ use super::geospatial::{
     HaversineScannerAny, HaversineSearcherAny, VincentyScannerAny, VincentySearcherAny,
 };
 use super::maxsim::{MaxSimScannerAny, MaxSimSearcherAny};
-use super::mesh::{
-    RigidMeshScannerAny, RigidMeshSearcherAny, RotationalMeshScannerAny, RotationalMeshSearcherAny,
-    SimilarityMeshScannerAny, SimilarityMeshSearcherAny,
-};
-use super::sequence::{AlignmentCosts, LevenshteinCosts, SequenceScanner, SequenceSearcher};
+use super::sequence::{SequenceScanner, SequenceSearcher};
+use super::shapes::{ChamferDistance, HausdorffDistance, ShapeScannerAny, ShapeSearcherAny};
 use super::{ExecutionScope, Matrix, Ranking};
 use crate::{Error, GraphTable};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
-use stringtape::BytesTapeView;
-use stringzilla::szs;
+use allocator_api2::alloc::Allocator as TableAllocatorLike;
+use core::alloc::Allocator as AllocatorLike;
+use std::alloc::Global;
+use stringzilla as sz;
 
 /// Every metric name a file may declare, in the order [`ScannerAny`] matches
 /// them. A CLI prints this for `--help`; a producer writing `__metadata__.metric`
 /// picks from it. The strings are format contract — NumKong's kernel names keep
 /// their underscores, and the sequence metrics the hyphens of the algorithms
-/// they name. The last seven have no kernel here and are refused by name.
+/// they name. The last ten have no kernel here and are refused by name.
 pub const METRICS: &[&str] = &[
     "dot",
     "euclidean",
@@ -53,14 +51,14 @@ pub const METRICS: &[&str] = &[
     "jaccard",
     "haversine",
     "vincenty",
-    "rmsd",
-    "kabsch",
-    "umeyama",
+    "chamfer",
+    "hausdorff",
     "maxsim",
     "levenshtein",
     "levenshtein-utf8",
-    "needleman-wunsch",
-    "smith-waterman",
+    "rmsd",
+    "kabsch",
+    "umeyama",
     "vdot",
     "bilinear",
     "mahalanobis",
@@ -75,16 +73,26 @@ pub const METRICS: &[&str] = &[
 fn is_unscored(metric: &str) -> bool {
     matches!(
         metric,
-        "vdot" | "bilinear" | "mahalanobis" | "kld" | "jsd" | "sparse_dot" | "sparse_intersect"
+        "rmsd"
+            | "kabsch"
+            | "umeyama"
+            | "vdot"
+            | "bilinear"
+            | "mahalanobis"
+            | "kld"
+            | "jsd"
+            | "sparse_dot"
+            | "sparse_intersect"
     )
 }
 
-/// True when the metric reads its queries as ragged rows — sequence tapes and
-/// maxsim multi-vectors — so a caller knows whether offsets are required.
+/// True when the metric reads its queries as ragged rows — sequence tapes,
+/// maxsim multi-vectors, and point clouds — so a caller knows whether offsets
+/// are required.
 pub fn is_ragged(metric: &str) -> bool {
     matches!(
         metric,
-        "maxsim" | "levenshtein" | "levenshtein-utf8" | "needleman-wunsch" | "smith-waterman"
+        "maxsim" | "chamfer" | "hausdorff" | "levenshtein" | "levenshtein-utf8"
     )
 }
 
@@ -93,29 +101,21 @@ pub fn is_ragged(metric: &str) -> bool {
 /// `distances` matrix does not. `None` for an unknown metric.
 pub fn ranking(metric: &str) -> Option<Ranking> {
     Some(match metric {
-        // Similarities: a larger product, overlap, or alignment score is a better match.
-        "dot" | "vdot" | "bilinear" | "sparse_dot" | "sparse_intersect" | "needleman-wunsch"
-        | "smith-waterman" => Ranking::Farthest,
+        // Similarities: a larger product or overlap is a better match.
+        "dot" | "vdot" | "bilinear" | "sparse_dot" | "sparse_intersect" => Ranking::Farthest,
         // Distances: everything else scores smaller-is-better, including MaxSim,
         // whose late interaction accumulates an angular distance.
         "euclidean" | "sqeuclidean" | "angular" | "mahalanobis" | "kld" | "jsd" | "hamming"
-        | "jaccard" | "haversine" | "vincenty" | "rmsd" | "kabsch" | "umeyama" | "maxsim"
-        | "levenshtein" | "levenshtein-utf8" => Ranking::Nearest,
+        | "jaccard" | "haversine" | "vincenty" | "chamfer" | "hausdorff" | "rmsd" | "kabsch"
+        | "umeyama" | "maxsim" | "levenshtein" | "levenshtein-utf8" => Ranking::Nearest,
         _ => return None,
     })
 }
 
-/// Build the borrowed tape a sequence engine consumes from raw bytes and their
-/// prefix sums. Private, so no StringZilla type crosses this module's API.
-fn sequence_tape<'a>(bytes: &'a [u8], offsets: &'a [u64]) -> Result<szs::AnyBytesTape<'a>, Error> {
-    if offsets.first() != Some(&0) || offsets.last().map(|&end| end as usize) != Some(bytes.len()) {
-        return Err(Error::Inconsistent);
-    }
-    // SAFETY: the pair is a prefix sum over the buffer beside it — checked above —
-    // and both outlive the returned view.
-    Ok(szs::AnyBytesTape::View64(unsafe {
-        BytesTapeView::<u64>::from_raw_parts(bytes, offsets)
-    }))
+/// Borrow raw bytes and their prefix sums as the column a sequence engine
+/// consumes. Private, so no StringZilla type crosses this module's API.
+fn sequence_strings<'a>(bytes: &'a [u8], offsets: &'a [u64]) -> Result<sz::StringsView<'a>, Error> {
+    sz::StringsView::from_u64_tape(bytes, offsets).map_err(|_| Error::Inconsistent)
 }
 
 /// The offsets a ragged metric needs, or [`Error::MissingField`] when the caller
@@ -146,14 +146,11 @@ pub enum ScannerAny<Allocator: AllocatorLike = Global> {
     Jaccard(JaccardScannerAny<Allocator>),
     Haversine(HaversineScannerAny<Allocator>),
     Vincenty(VincentyScannerAny<Allocator>),
-    Rmsd(RigidMeshScannerAny<Allocator>),
-    Kabsch(RotationalMeshScannerAny<Allocator>),
-    Umeyama(SimilarityMeshScannerAny<Allocator>),
+    Chamfer(ShapeScannerAny<ChamferDistance, Allocator>),
+    Hausdorff(ShapeScannerAny<HausdorffDistance, Allocator>),
     MaxSim(MaxSimScannerAny<Allocator>),
-    Levenshtein(SequenceScanner<szs::LevenshteinDistances, Allocator>),
-    LevenshteinUtf8(SequenceScanner<szs::LevenshteinDistancesUtf8, Allocator>),
-    NeedlemanWunsch(SequenceScanner<szs::NeedlemanWunschScores, Allocator>),
-    SmithWaterman(SequenceScanner<szs::SmithWatermanScores, Allocator>),
+    Levenshtein(SequenceScanner<Allocator>),
+    LevenshteinUtf8(SequenceScanner<Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
@@ -162,9 +159,8 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
     /// re-scoring one dataset under another metric is the point of a brute-force
     /// scan. An override the family cannot serve fails here, not silently later.
     ///
-    /// Sequence costs default to unit edits and the identity substitution; a
-    /// later revision reads them from `__metadata__`. `sqeuclidean` ranks as
-    /// `euclidean` does, so it is served by that arm and reports the root.
+    /// `sqeuclidean` ranks as `euclidean` does, so it is served by that arm and
+    /// reports the root.
     pub fn new(
         metric: &str,
         dtype: &str,
@@ -181,27 +177,16 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
             "jaccard" => ScannerAny::Jaccard(JaccardScannerAny::new(dtype, scope, alloc)?),
             "haversine" => ScannerAny::Haversine(HaversineScannerAny::new(dtype, scope, alloc)?),
             "vincenty" => ScannerAny::Vincenty(VincentyScannerAny::new(dtype, scope, alloc)?),
-            "rmsd" => ScannerAny::Rmsd(RigidMeshScannerAny::new(dtype, scope, alloc)?),
-            "kabsch" => ScannerAny::Kabsch(RotationalMeshScannerAny::new(dtype, scope, alloc)?),
-            "umeyama" => ScannerAny::Umeyama(SimilarityMeshScannerAny::new(dtype, scope, alloc)?),
+            "chamfer" => ScannerAny::Chamfer(ShapeScannerAny::new(dtype, scope, alloc)?),
+            "hausdorff" => ScannerAny::Hausdorff(ShapeScannerAny::new(dtype, scope, alloc)?),
             "maxsim" => ScannerAny::MaxSim(MaxSimScannerAny::new(dtype, scope, alloc)?),
             "levenshtein" => ScannerAny::Levenshtein(SequenceScanner::new(
-                LevenshteinCosts::default(),
+                sz::LevenshteinSymbol::Bytes,
                 scope,
                 alloc,
             )?),
             "levenshtein-utf8" => ScannerAny::LevenshteinUtf8(SequenceScanner::new(
-                LevenshteinCosts::default(),
-                scope,
-                alloc,
-            )?),
-            "needleman-wunsch" => ScannerAny::NeedlemanWunsch(SequenceScanner::new(
-                AlignmentCosts::default(),
-                scope,
-                alloc,
-            )?),
-            "smith-waterman" => ScannerAny::SmithWaterman(SequenceScanner::new(
-                AlignmentCosts::default(),
+                sz::LevenshteinSymbol::Runes,
                 scope,
                 alloc,
             )?),
@@ -221,14 +206,11 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
             ScannerAny::Jaccard(_) => "jaccard",
             ScannerAny::Haversine(_) => "haversine",
             ScannerAny::Vincenty(_) => "vincenty",
-            ScannerAny::Rmsd(_) => "rmsd",
-            ScannerAny::Kabsch(_) => "kabsch",
-            ScannerAny::Umeyama(_) => "umeyama",
+            ScannerAny::Chamfer(_) => "chamfer",
+            ScannerAny::Hausdorff(_) => "hausdorff",
             ScannerAny::MaxSim(_) => "maxsim",
             ScannerAny::Levenshtein(_) => "levenshtein",
             ScannerAny::LevenshteinUtf8(_) => "levenshtein-utf8",
-            ScannerAny::NeedlemanWunsch(_) => "needleman-wunsch",
-            ScannerAny::SmithWaterman(_) => "smith-waterman",
         }
     }
 
@@ -239,7 +221,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
         &mut self,
         query_bytes: &[u8],
         query_offsets: Option<&[u64]>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -252,41 +234,26 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerAny<Allocator> {
             ScannerAny::Jaccard(any) => any.scan(query_bytes, table, matches, distances, counts),
             ScannerAny::Haversine(any) => any.scan(query_bytes, table, matches, distances, counts),
             ScannerAny::Vincenty(any) => any.scan(query_bytes, table, matches, distances, counts),
-            ScannerAny::Rmsd(any) => any.scan(query_bytes, table, matches, distances, counts),
-            ScannerAny::Kabsch(any) => any.scan(query_bytes, table, matches, distances, counts),
-            ScannerAny::Umeyama(any) => any.scan(query_bytes, table, matches, distances, counts),
+            ScannerAny::Chamfer(any) => {
+                let offsets = require_offsets(query_offsets)?;
+                any.scan(query_bytes, offsets, table, matches, distances, counts)
+            }
+            ScannerAny::Hausdorff(any) => {
+                let offsets = require_offsets(query_offsets)?;
+                any.scan(query_bytes, offsets, table, matches, distances, counts)
+            }
             ScannerAny::MaxSim(any) => {
                 let offsets = token_offsets(require_offsets(query_offsets)?)?;
                 any.scan(query_bytes, &offsets, table, matches, distances, counts)
             }
-            ScannerAny::Levenshtein(scanner) => scanner.scan(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
-            ScannerAny::LevenshteinUtf8(scanner) => scanner.scan(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
-            ScannerAny::NeedlemanWunsch(scanner) => scanner.scan(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
-            ScannerAny::SmithWaterman(scanner) => scanner.scan(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
+            ScannerAny::Levenshtein(scanner) | ScannerAny::LevenshteinUtf8(scanner) => scanner
+                .scan(
+                    sequence_strings(query_bytes, require_offsets(query_offsets)?)?,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                ),
         }
     }
 }
@@ -310,14 +277,11 @@ pub enum SearcherAny<Allocator: AllocatorLike = Global> {
     Jaccard(JaccardSearcherAny<Allocator>),
     Haversine(HaversineSearcherAny<Allocator>),
     Vincenty(VincentySearcherAny<Allocator>),
-    Rmsd(RigidMeshSearcherAny<Allocator>),
-    Kabsch(RotationalMeshSearcherAny<Allocator>),
-    Umeyama(SimilarityMeshSearcherAny<Allocator>),
+    Chamfer(ShapeSearcherAny<ChamferDistance, Allocator>),
+    Hausdorff(ShapeSearcherAny<HausdorffDistance, Allocator>),
     MaxSim(MaxSimSearcherAny<Allocator>),
-    Levenshtein(SequenceSearcher<szs::LevenshteinDistances, Allocator>),
-    LevenshteinUtf8(SequenceSearcher<szs::LevenshteinDistancesUtf8, Allocator>),
-    NeedlemanWunsch(SequenceSearcher<szs::NeedlemanWunschScores, Allocator>),
-    SmithWaterman(SequenceSearcher<szs::SmithWatermanScores, Allocator>),
+    Levenshtein(SequenceSearcher<Allocator>),
+    LevenshteinUtf8(SequenceSearcher<Allocator>),
 }
 
 impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
@@ -368,19 +332,13 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
                 scope,
                 alloc,
             )?),
-            "rmsd" => SearcherAny::Rmsd(RigidMeshSearcherAny::new(
+            "chamfer" => SearcherAny::Chamfer(ShapeSearcherAny::new(
                 dtype,
                 expansion_factor,
                 scope,
                 alloc,
             )?),
-            "kabsch" => SearcherAny::Kabsch(RotationalMeshSearcherAny::new(
-                dtype,
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
-            "umeyama" => SearcherAny::Umeyama(SimilarityMeshSearcherAny::new(
+            "hausdorff" => SearcherAny::Hausdorff(ShapeSearcherAny::new(
                 dtype,
                 expansion_factor,
                 scope,
@@ -393,25 +351,13 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
                 alloc,
             )?),
             "levenshtein" => SearcherAny::Levenshtein(SequenceSearcher::new(
-                LevenshteinCosts::default(),
+                sz::LevenshteinSymbol::Bytes,
                 expansion_factor,
                 scope,
                 alloc,
             )?),
             "levenshtein-utf8" => SearcherAny::LevenshteinUtf8(SequenceSearcher::new(
-                LevenshteinCosts::default(),
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
-            "needleman-wunsch" => SearcherAny::NeedlemanWunsch(SequenceSearcher::new(
-                AlignmentCosts::default(),
-                expansion_factor,
-                scope,
-                alloc,
-            )?),
-            "smith-waterman" => SearcherAny::SmithWaterman(SequenceSearcher::new(
-                AlignmentCosts::default(),
+                sz::LevenshteinSymbol::Runes,
                 expansion_factor,
                 scope,
                 alloc,
@@ -426,7 +372,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
         &mut self,
         query_bytes: &[u8],
         query_offsets: Option<&[u64]>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -445,41 +391,26 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> SearcherAny<Allocator> {
             SearcherAny::Vincenty(any) => {
                 any.search(query_bytes, table, matches, distances, counts)
             }
-            SearcherAny::Rmsd(any) => any.search(query_bytes, table, matches, distances, counts),
-            SearcherAny::Kabsch(any) => any.search(query_bytes, table, matches, distances, counts),
-            SearcherAny::Umeyama(any) => any.search(query_bytes, table, matches, distances, counts),
+            SearcherAny::Chamfer(any) => {
+                let offsets = require_offsets(query_offsets)?;
+                any.search(query_bytes, offsets, table, matches, distances, counts)
+            }
+            SearcherAny::Hausdorff(any) => {
+                let offsets = require_offsets(query_offsets)?;
+                any.search(query_bytes, offsets, table, matches, distances, counts)
+            }
             SearcherAny::MaxSim(any) => {
                 let offsets = token_offsets(require_offsets(query_offsets)?)?;
                 any.search(query_bytes, &offsets, table, matches, distances, counts)
             }
-            SearcherAny::Levenshtein(search) => search.search(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
-            SearcherAny::LevenshteinUtf8(search) => search.search(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
-            SearcherAny::NeedlemanWunsch(search) => search.search(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
-            SearcherAny::SmithWaterman(search) => search.search(
-                sequence_tape(query_bytes, require_offsets(query_offsets)?)?,
-                table,
-                matches,
-                distances,
-                counts,
-            ),
+            SearcherAny::Levenshtein(search) | SearcherAny::LevenshteinUtf8(search) => search
+                .search(
+                    sequence_strings(query_bytes, require_offsets(query_offsets)?)?,
+                    table,
+                    matches,
+                    distances,
+                    counts,
+                ),
         }
     }
 }
@@ -551,7 +482,7 @@ mod tests {
 
     #[test]
     fn ragged_metrics_are_flagged() {
-        assert!(is_ragged("levenshtein") && is_ragged("maxsim"));
+        assert!(is_ragged("levenshtein") && is_ragged("maxsim") && is_ragged("chamfer"));
         assert!(!is_ragged("dot") && !is_ragged("kabsch"));
     }
 }

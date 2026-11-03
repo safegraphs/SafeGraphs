@@ -1,503 +1,159 @@
 //! Sequence metrics over StringZilla. No NumKong type appears here.
 //!
 //! A node's value is a variable-length byte string — DNA, RNA, protein, or text —
-//! and a query batch is a tape of them rather than a matrix, so nothing in this
-//! family has a width. The edit distances rank smaller-first and the alignment
-//! scores larger-first, and the machinery absorbs both directions through the
-//! engine's own comparator and nothing else.
+//! and a query batch is a column of them rather than a matrix, so nothing in this
+//! family has a width. Both metrics are Levenshtein edit distances under unit
+//! costs, ranked smaller-first: one counts bytes, the other UTF-8 runes, where a
+//! multibyte character is one edit and each ill-formed subpart reads as one
+//! `U+FFFD`. A [`sz::LevenshteinSymbol`] value picks between them, so the family
+//! has no dtype axis and no per-metric type; the router in `dispatch` holds one
+//! arm per metric name.
 //!
-//! Each functor opens its [`ExecutionScope`] as a [`DeviceScope`], StringZilla's
-//! executor, and that conversion is the only place the backend's device type
-//! appears: `Serial` and `CPUs` run the very same engines on CPU threads, `GPU`
-//! on a GPU. The scope is also why this family builds no ForkUnion pool — a
-//! StringZilla engine already drives every worker the scope names from one batch
-//! call, so the cross-query fan-out is `batch_search_serial`, whole walks on a
-//! single traversal context, and the parallelism lives inside each scoring call.
-//!
-//! Each metric is its own scanner/searcher pair rather than an arm of a dtype
-//! dispatcher: every sequence value is `utf8` bytes, so there is no dtype axis
-//! to erase, and the four metrics — byte-level Levenshtein, its codepoint-level
-//! UTF-8 variant, and the Needleman-Wunsch and Smith-Waterman alignment scores —
-//! are simply different [`EngineLike`] instantiations of one generic body, the
-//! way `DotMetric<Value>` spans the dense scalars. The cross-family router in
-//! `dispatch` picks between them.
-//!
-//! [`DeviceScope`]: stringzilla::szs::DeviceScope
+//! A StringZilla engine prepares a batch of queries once and scores any number of
+//! candidate batches against it, on one CPU thread. So this family opens its
+//! [`ExecutionScope`] as a ForkUnion pool, like the NumKong families: the scan
+//! fans node chunks across it, each task preparing its own engine over the
+//! queries, and the walk fans whole queries, one walker per thread. A GPU scope is
+//! refused, since a device engine reads only memory its device reaches, and a
+//! mapped file is not that.
 
-use super::batch::{batch_scan, batch_search_serial, build_workers, Workers};
+use super::batch::{batch_scan, batch_search, build_workers, open_pool, Workers};
 use super::{
     walk, ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike,
     TraversalContext, WalkerLike,
 };
-use crate::{Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
-use allocator_api2::vec::Vec as AVec;
+use crate::{Error, GraphTable, GraphTableView, IndexLike, OffsetDType};
+use allocator_api2::alloc::Allocator as TableAllocatorLike;
+use core::alloc::Allocator as AllocatorLike;
 use core::cmp::Ordering;
-use stringtape::{BytesTapeView, CharsTapeView};
-use stringzilla::szs;
+use forkunion as fu;
+use std::alloc::Global;
+use std::sync::OnceLock;
+use stringzilla as sz;
 
-// region: Engine seam
+// region: Metric
 
-/// The seam between the shared sequence machinery and one StringZilla engine:
-/// its native score, its configuration, its ranking direction, and how to build
-/// it and score one byte-tape pair. Implemented for the `szs` engine types
-/// themselves, so [`SequenceScanner<Engine>`] and friends span every metric the way
-/// `DotMetric<Value>` spans the dense scalars — one generic body, no macro.
-pub trait EngineLike: Sized {
-    /// The engine's native score: `usize` for an edit distance, `isize` for an
-    /// alignment score, which may be negative.
-    type Score: Copy + Default + Ord + ScoreLike;
+/// The sequence metric's type vocabulary — the sequence twin of
+/// `DotMetric<Value>`, with nothing to be generic over.
+pub struct SequenceMetric;
 
-    /// The engine's configuration — costs, substitution classes — everything
-    /// its constructor needs beyond the device.
-    type Costs: Clone;
-
-    /// True when smaller ranks first: an edit distance. An alignment score
-    /// ranks the other way.
-    /// Which end of the score axis wins for this engine — [`Ranking::Nearest`]
-    /// for an edit distance, [`Ranking::Farthest`] for a similarity.
-    const RANKING: Ranking;
-
-    /// Build the engine on `device` with `costs`.
-    fn build(device: &szs::DeviceScope, costs: &Self::Costs) -> Result<Self, Error>;
-
-    /// Score every (query, candidate) pair into `matrix`, query-major. Both
-    /// tapes carry the same offset width; the callers guarantee it.
-    fn compute_into(
-        &self,
-        device: &szs::DeviceScope,
-        queries: szs::AnyBytesTape<'_>,
-        candidates: szs::AnyBytesTape<'_>,
-        matrix: &mut szs::UnifiedMat<Self::Score>,
-    ) -> Result<(), Error>;
-}
-
-/// Per-edit costs for the two Levenshtein engines. The default is unit cost —
-/// every edit one — and a caller scoring biological sequences, where a gap and
-/// a substitution are not worth the same, names its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LevenshteinCosts {
-    pub match_cost: i8,
-    pub mismatch_cost: i8,
-    pub open_cost: i8,
-    pub extend_cost: i8,
-}
-
-impl Default for LevenshteinCosts {
-    fn default() -> Self {
-        LevenshteinCosts {
-            match_cost: 0,
-            mismatch_cost: 1,
-            open_cost: 1,
-            extend_cost: 1,
-        }
-    }
-}
-
-/// Costs for the two alignment engines: a 256-entry map from byte to one of 32
-/// character classes, a 32×32 substitution-score matrix between classes, and
-/// affine gap penalties. The compact class form is StringZilla's own — DNA,
-/// RNA, and protein alphabets all fit 32 classes with room to spare.
-///
-/// The default maps each byte to its value modulo 32 and scores +2 for a class
-/// match, -1 for a mismatch, -2/-1 for gap open/extend. Bytes 32 apart share a
-/// class under it — an ASCII letter matches its other case — so it is a demo
-/// alphabet, not a substitution model; real work names its own.
-#[derive(Clone)]
-pub struct AlignmentCosts {
-    pub byte_to_class: [u8; 256],
-    pub class_substitution_costs: [[i8; 32]; 32],
-    pub open_cost: i8,
-    pub extend_cost: i8,
-}
-
-impl Default for AlignmentCosts {
-    fn default() -> Self {
-        let mut byte_to_class = [0u8; 256];
-        for (byte, class) in byte_to_class.iter_mut().enumerate() {
-            *class = (byte % 32) as u8;
-        }
-        let mut class_substitution_costs = [[-1i8; 32]; 32];
-        for (class, row) in class_substitution_costs.iter_mut().enumerate() {
-            row[class] = 2;
-        }
-        AlignmentCosts {
-            byte_to_class,
-            class_substitution_costs,
-            open_cost: -2,
-            extend_cost: -1,
-        }
-    }
-}
-
-impl EngineLike for szs::LevenshteinDistances {
+impl MetricLike for SequenceMetric {
+    type Query<'a> = &'a [u8];
+    type Queries<'a> = sz::StringsView<'a>;
     type Score = usize;
-    type Costs = LevenshteinCosts;
-    const RANKING: Ranking = Ranking::Nearest;
+}
 
-    fn build(device: &szs::DeviceScope, costs: &LevenshteinCosts) -> Result<Self, Error> {
-        szs::LevenshteinDistances::new(
-            device,
-            costs.match_cost,
-            costs.mismatch_cost,
-            costs.open_cost,
-            costs.extend_cost,
-        )
-        .map_err(|_| Error::Alloc)
+/// A StringZilla column as a [`QueryBatchLike`]: its string count is the query
+/// count, and each string is one query. The seam that lets the shared batch
+/// engine walk a column of strings exactly as it walks a dense matrix.
+impl QueryBatchLike<SequenceMetric> for sz::StringsView<'_> {
+    fn count(&self) -> usize {
+        self.len()
     }
 
-    fn compute_into(
-        &self,
-        device: &szs::DeviceScope,
-        queries: szs::AnyBytesTape<'_>,
-        candidates: szs::AnyBytesTape<'_>,
-        matrix: &mut szs::UnifiedMat<usize>,
-    ) -> Result<(), Error> {
-        self.compute_into(device, queries, Some(candidates), matrix)
-            .map_err(|_| Error::Inconsistent)
+    fn query(&self, index: usize) -> Option<&[u8]> {
+        self.get(index)
     }
 }
 
-impl EngineLike for szs::LevenshteinDistancesUtf8 {
-    type Score = usize;
-    type Costs = LevenshteinCosts;
-    const RANKING: Ranking = Ranking::Nearest;
-
-    fn build(device: &szs::DeviceScope, costs: &LevenshteinCosts) -> Result<Self, Error> {
-        szs::LevenshteinDistancesUtf8::new(
-            device,
-            costs.match_cost,
-            costs.mismatch_cost,
-            costs.open_cost,
-            costs.extend_cost,
-        )
-        .map_err(|_| Error::Alloc)
-    }
-
-    /// The one engine whose tapes are codepoints rather than bytes: both sides
-    /// are validated as UTF-8 and re-viewed as character tapes, offsets reused
-    /// as-is since they index bytes either way. Invalid UTF-8 anywhere is
-    /// [`Error::WrongType`] — the column claimed `utf8` and lied.
-    fn compute_into(
-        &self,
-        device: &szs::DeviceScope,
-        queries: szs::AnyBytesTape<'_>,
-        candidates: szs::AnyBytesTape<'_>,
-        matrix: &mut szs::UnifiedMat<usize>,
-    ) -> Result<(), Error> {
-        let queries = chars_tape(&queries)?;
-        let candidates = chars_tape(&candidates)?;
-        self.compute_into(device, queries, Some(candidates), matrix)
-            .map_err(|_| Error::Inconsistent)
-    }
-}
-
-impl EngineLike for szs::NeedlemanWunschScores {
-    type Score = isize;
-    type Costs = AlignmentCosts;
-    const RANKING: Ranking = Ranking::Farthest;
-
-    fn build(device: &szs::DeviceScope, costs: &AlignmentCosts) -> Result<Self, Error> {
-        szs::NeedlemanWunschScores::new(
-            device,
-            &costs.byte_to_class,
-            &costs.class_substitution_costs,
-            costs.open_cost,
-            costs.extend_cost,
-        )
-        .map_err(|_| Error::Alloc)
-    }
-
-    fn compute_into(
-        &self,
-        device: &szs::DeviceScope,
-        queries: szs::AnyBytesTape<'_>,
-        candidates: szs::AnyBytesTape<'_>,
-        matrix: &mut szs::UnifiedMat<isize>,
-    ) -> Result<(), Error> {
-        self.compute_into(device, queries, Some(candidates), matrix)
-            .map_err(|_| Error::Inconsistent)
-    }
-}
-
-impl EngineLike for szs::SmithWatermanScores {
-    type Score = isize;
-    type Costs = AlignmentCosts;
-    const RANKING: Ranking = Ranking::Farthest;
-
-    fn build(device: &szs::DeviceScope, costs: &AlignmentCosts) -> Result<Self, Error> {
-        szs::SmithWatermanScores::new(
-            device,
-            &costs.byte_to_class,
-            &costs.class_substitution_costs,
-            costs.open_cost,
-            costs.extend_cost,
-        )
-        .map_err(|_| Error::Alloc)
-    }
-
-    fn compute_into(
-        &self,
-        device: &szs::DeviceScope,
-        queries: szs::AnyBytesTape<'_>,
-        candidates: szs::AnyBytesTape<'_>,
-        matrix: &mut szs::UnifiedMat<isize>,
-    ) -> Result<(), Error> {
-        self.compute_into(device, queries, Some(candidates), matrix)
-            .map_err(|_| Error::Inconsistent)
-    }
-}
-
-// endregion: Engine seam
-
-// region: Tape plumbing
-
-/// Open an [`ExecutionScope`] as the [`szs::DeviceScope`] every StringZilla
-/// engine executes on — the sequence twin of the dense families' `open_pool`,
-/// and the one place the device type is named. `CPUs(0)` means every logical CPU, by
-/// StringZilla's own convention, matching the pool's.
-fn open_device(scope: ExecutionScope) -> Result<szs::DeviceScope, Error> {
-    match scope {
-        ExecutionScope::Serial => szs::DeviceScope::cpu_cores(1),
-        ExecutionScope::CPUs(cpus) => szs::DeviceScope::cpu_cores(cpus),
-        ExecutionScope::GPU(index) => szs::DeviceScope::gpu_device(index),
-    }
-    .map_err(|_| Error::Alloc)
-}
-
-/// Borrow a table's variable-length value column as a tape, with no copy: the
-/// prefix sums and the concatenated bytes are already exactly what StringZilla
-/// wants. Fails on a regular column, which has no offsets to borrow, and on any
-/// column that is not `utf8`, since a row start counts elements and a tape
-/// slices bytes — the two agree only at one byte per element.
-fn value_tape(table: GraphTableView<'_>) -> Result<szs::AnyBytesTape<'_>, Error> {
+/// Borrow nodes `[begin, end)` of a table's variable-length value column as a
+/// StringZilla column, with no copy: the prefix sums and the concatenated bytes
+/// are already an Arrow tape. Fails on a regular column, which has no offsets to
+/// borrow, and on any column that is not `utf8`, since a row start counts
+/// elements and a tape slices bytes — the two agree only at one byte per element.
+fn value_strings(
+    table: GraphTableView<'_>,
+    begin: usize,
+    end: usize,
+) -> Result<sz::StringsView<'_>, Error> {
     if table.value_dtype() != "utf8" {
         return Err(Error::WrongType);
     }
     let (offset_bytes, dtype) = table.value_offsets().ok_or(Error::WrongType)?;
     let values = table.value_buffer();
-    let expected = table.len() + 1;
-    // SAFETY, in both arms: the offsets are a validated prefix sum over the value
-    // buffer, and both are borrowed from the same table for `'_`.
-    Ok(match dtype {
+    match dtype {
         OffsetDType::U32 => {
             let offsets: &[u32] = crate::cast(offset_bytes).ok_or(Error::WrongType)?;
-            if offsets.len() != expected {
-                return Err(Error::Inconsistent);
-            }
-            szs::AnyBytesTape::View32(unsafe {
-                BytesTapeView::<u32>::from_raw_parts(values, offsets)
-            })
+            let offsets = offsets.get(begin..=end).ok_or(Error::Inconsistent)?;
+            sz::StringsView::from_u32_tape(values, offsets)
         }
         OffsetDType::U64 => {
             let offsets: &[u64] = crate::cast(offset_bytes).ok_or(Error::WrongType)?;
-            if offsets.len() != expected {
-                return Err(Error::Inconsistent);
-            }
-            szs::AnyBytesTape::View64(unsafe {
-                BytesTapeView::<u64>::from_raw_parts(values, offsets)
-            })
+            let offsets = offsets.get(begin..=end).ok_or(Error::Inconsistent)?;
+            sz::StringsView::from_u64_tape(values, offsets)
         }
-    })
-}
-
-/// How many strings a tape holds, whichever offset width it carries.
-fn tape_len(tape: &szs::AnyBytesTape<'_>) -> usize {
-    match tape {
-        szs::AnyBytesTape::View32(view) => view.len(),
-        szs::AnyBytesTape::View64(view) => view.len(),
-        szs::AnyBytesTape::Tape32(tape) => tape.len(),
-        szs::AnyBytesTape::Tape64(tape) => tape.len(),
     }
+    .map_err(|_| Error::Inconsistent)
 }
 
-/// A tape's borrowed raw parts, whichever offset width and ownership it carries,
-/// for rebuilding it at the other width or as a character tape.
-enum TapeParts<'t> {
-    Narrow { bytes: &'t [u8], offsets: &'t [u32] },
-    Wide { bytes: &'t [u8], offsets: &'t [u64] },
+/// Prepare `queries` and score them against `candidates` into the query-major
+/// `distances`, on the CPU thread that calls it.
+fn levenshtein_distances<Query: AsRef<[u8]>>(
+    queries: &[Query],
+    symbol: sz::LevenshteinSymbol,
+    candidates: sz::StringsView<'_>,
+    distances: &mut [usize],
+) -> Result<(), Error> {
+    let stream = sz::Stream::default(sz::Capabilities::cpu_enabled());
+    let mut engine =
+        sz::LevenshteinEngine::new(queries, symbol, &stream).map_err(|_| Error::Alloc)?;
+    let stride = candidates.len();
+    stream
+        .scope(|scope| engine.distances(scope, candidates, None, distances, stride))
+        .map_err(|_| Error::Inconsistent)
 }
 
-/// Borrow `tape`'s bytes and prefix sums. An empty offsets buffer is refused:
-/// even a zero-string tape carries the leading zero.
-fn tape_parts<'t>(tape: &'t szs::AnyBytesTape<'_>) -> Result<TapeParts<'t>, Error> {
-    fn slices<'t, Offset>(
-        parts: stringtape::RawParts<Offset>,
-    ) -> Result<(&'t [u8], &'t [Offset]), Error>
-    where
-        Offset: stringtape::OffsetType,
-    {
-        if parts.offsets_ptr.is_null() {
-            return Err(Error::Inconsistent);
-        }
-        // SAFETY: the parts came off a tape borrowed for `'t`, whose invariants
-        // promise `data_len` valid bytes and `items_count + 1` offsets.
-        Ok(unsafe {
-            (
-                if parts.data_ptr.is_null() {
-                    &[]
-                } else {
-                    core::slice::from_raw_parts(parts.data_ptr, parts.data_len)
-                },
-                core::slice::from_raw_parts(parts.offsets_ptr, parts.items_count + 1),
-            )
-        })
-    }
-    Ok(match tape {
-        szs::AnyBytesTape::View32(view) => {
-            let (bytes, offsets) = slices(view.as_raw_parts())?;
-            TapeParts::Narrow { bytes, offsets }
-        }
-        szs::AnyBytesTape::Tape32(tape) => {
-            let (bytes, offsets) = slices(tape.as_raw_parts())?;
-            TapeParts::Narrow { bytes, offsets }
-        }
-        szs::AnyBytesTape::View64(view) => {
-            let (bytes, offsets) = slices(view.as_raw_parts())?;
-            TapeParts::Wide { bytes, offsets }
-        }
-        szs::AnyBytesTape::Tape64(tape) => {
-            let (bytes, offsets) = slices(tape.as_raw_parts())?;
-            TapeParts::Wide { bytes, offsets }
-        }
-    })
-}
+// endregion: Metric
 
-/// Re-view a byte tape as a character tape for the UTF-8 engine, validating the
-/// bytes first — the offsets carry over untouched, since they index bytes in
-/// both views. Validation is per call and linear in the bytes, which the
-/// quadratic alignment behind it dwarfs.
-fn chars_tape<'t>(tape: &'t szs::AnyBytesTape<'_>) -> Result<szs::AnyCharsTape<'t>, Error> {
-    Ok(match tape_parts(tape)? {
-        TapeParts::Narrow { bytes, offsets } => {
-            core::str::from_utf8(bytes).map_err(|_| Error::WrongType)?;
-            // SAFETY: same buffer and prefix sum as the byte view, now proven UTF-8.
-            szs::AnyCharsTape::View32(unsafe {
-                CharsTapeView::<u32>::from_raw_parts(bytes, offsets)
-            })
-        }
-        TapeParts::Wide { bytes, offsets } => {
-            core::str::from_utf8(bytes).map_err(|_| Error::WrongType)?;
-            // SAFETY: as above.
-            szs::AnyCharsTape::View64(unsafe {
-                CharsTapeView::<u64>::from_raw_parts(bytes, offsets)
-            })
-        }
-    })
-}
+// region: Scanner
 
-/// A score matrix of exactly this shape, reusing `slot`'s allocation when the
-/// shape is unchanged — the engines reject any other size.
-fn matrix_for<Score>(
-    slot: &mut Option<szs::UnifiedMat<Score>>,
-    queries: usize,
-    nodes: usize,
-) -> Result<&mut szs::UnifiedMat<Score>, Error>
-where
-    Score: Copy + Default,
-{
-    let fits = matches!(&*slot, Some(matrix) if matrix.dimensions() == (queries, nodes));
-    if !fits {
-        *slot =
-            Some(szs::UnifiedMat::<Score>::try_allocate(queries, nodes).map_err(|_| Error::Alloc)?);
-    }
-    slot.as_mut().ok_or(Error::Alloc)
-}
-
-// endregion: Tape plumbing
-
-// region: Generic functors
-
-/// A sequence metric's type vocabulary, one marker per engine — the sequence
-/// twin of `DotMetric<Value>`.
-pub struct SequenceMetric<Engine>(core::marker::PhantomData<Engine>);
-
-impl<Engine: EngineLike> MetricLike for SequenceMetric<Engine> {
-    type Query<'a> = &'a [u8];
-    type Queries<'a> = szs::AnyBytesTape<'a>;
-    type Score = Engine::Score;
-}
-
-/// A byte tape as a [`QueryBatchLike`]: its string count is the query count, and
-/// each string is one query. The seam that lets the shared batch engine walk a
-/// sequence tape exactly as it walks a dense matrix.
-impl<Metric> QueryBatchLike<Metric> for szs::AnyBytesTape<'_>
-where
-    Metric: MetricLike + ?Sized,
-    for<'a> Metric::Query<'a>: From<&'a [u8]>,
-{
-    fn count(&self) -> usize {
-        tape_len(self)
-    }
-
-    fn query(&self, index: usize) -> Option<Metric::Query<'_>> {
-        let bytes = match self {
-            szs::AnyBytesTape::View32(view) => view.get(index),
-            szs::AnyBytesTape::View64(view) => view.get(index),
-            szs::AnyBytesTape::Tape32(tape) => tape.get(index),
-            szs::AnyBytesTape::Tape64(tape) => tape.get(index),
-        }?;
-        Some(bytes.into())
-    }
-}
-
-/// The batch half of any sequence metric, owning its device and engine. It holds
-/// two score buffers because the engine's is query-major and unified while the
-/// crate's tile is node-major, and offset scratch at both widths, since the
-/// engines refuse a mixed-width pair and only the prefix sums are restated.
-pub struct SequenceScanner<Engine: EngineLike, Allocator: AllocatorLike = Global> {
-    device: szs::DeviceScope,
-    engine: Engine,
-    matrix: Option<szs::UnifiedMat<Engine::Score>>,
-    tile: Matrix<Engine::Score, Allocator>,
-    offsets_narrow: AVec<u32, Allocator>,
-    offsets_wide: AVec<u64, Allocator>,
+/// The batch half of the sequence metric: owns a thread pool, one query-major
+/// distance block per pool thread, and the reusable node-major score tile.
+pub struct SequenceScanner<Allocator: AllocatorLike = Global> {
+    symbol: sz::LevenshteinSymbol,
+    pool: fu::ThreadPool,
+    workers: Vec<Vec<usize, Allocator>>,
+    tile: Matrix<usize, Allocator>,
     alloc: Allocator,
 }
 
-impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceScanner<Engine, Allocator> {
-    /// A scanner with `costs`, running on whatever `scope` names — the same
-    /// engine serves CPU cores and a GPU alike, which is why the device is
-    /// owned here rather than exposed. The tile and offset scratch live in
-    /// `alloc`; the engine's own score matrix stays in StringZilla's unified
-    /// memory, which is the device's and not an `allocator_api2` allocator.
+impl<Allocator: AllocatorLike + Clone + Send + Sync> SequenceScanner<Allocator> {
+    /// A scanner counting `symbol`s over the workers `scope` names, its scratch
+    /// in `alloc`, uniform with [`DotScanner::new`].
+    ///
+    /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
     pub fn new(
-        costs: Engine::Costs,
+        symbol: sz::LevenshteinSymbol,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        let device = open_device(scope)?;
-        let engine = Engine::build(&device, &costs)?;
         Ok(SequenceScanner {
-            device,
-            engine,
-            matrix: None,
+            symbol,
+            pool: open_pool(scope)?,
+            workers: Vec::new(),
             tile: Matrix::empty_in(alloc.clone()),
-            offsets_narrow: AVec::new_in(alloc.clone()),
-            offsets_wide: AVec::new_in(alloc.clone()),
             alloc,
         })
     }
 
-    /// Batch brute-force top-k, best-first in the engine's own direction —
-    /// nearest for an edit distance, highest for an alignment score.
-    /// `matches`/`distances` are `queries × k`; their shape carries both `k`
-    /// and the query count, uniform with every dense scanner.
+    /// Batch brute-force top-k, nearest-first — an edit distance is
+    /// smaller-is-better. `matches`/`distances` are `queries × k`; their shape
+    /// carries both `k` and the query count, uniform with every dense scanner.
     pub fn scan(
         &mut self,
-        queries: szs::AnyBytesTape<'_>,
-        table: &GraphTable<impl AllocatorLike>,
+        queries: sz::StringsView<'_>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
         let table = table.view();
         let mut tile = std::mem::replace(&mut self.tile, Matrix::empty_in(self.alloc.clone()));
-        let outcome = batch_scan::<SequenceMetric<Engine>, _>(
+        let outcome = batch_scan::<SequenceMetric, _>(
             self,
             queries,
             table,
-            Engine::RANKING,
+            Ranking::Nearest,
             &mut tile,
             matches,
             distances,
@@ -508,125 +164,141 @@ impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceScanner<Engin
     }
 }
 
-impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> ScannerLike<SequenceMetric<Engine>>
-    for SequenceScanner<Engine, Allocator>
+impl<Allocator: AllocatorLike + Clone + Send + Sync> ScannerLike<SequenceMetric>
+    for SequenceScanner<Allocator>
 {
     fn scan(
         &mut self,
-        queries: szs::AnyBytesTape<'_>,
+        queries: sz::StringsView<'_>,
         table: GraphTableView<'_>,
-        scores: &mut Matrix<Engine::Score, impl AllocatorLike + Clone>,
+        scores: &mut Matrix<usize, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
-        let candidates = value_tape(table)?;
-        let (query_count, node_count) = (tape_len(&queries), tape_len(&candidates));
+        let (query_count, node_count) = (queries.len(), table.len());
         if query_count != scores.cols() || node_count != scores.rows() {
             return Err(Error::Inconsistent);
         }
+        // Checked once up front, so a column that is no tape fails the same way
+        // whether or not any task runs.
+        value_strings(table, 0, node_count)?;
 
-        // The engines refuse a mixed-width pair, and the table's width is the
-        // file's to pick — so when the query tape disagrees, its prefix sums are
-        // restated at the table's width in owned scratch, the bytes untouched.
-        // A caller never has to know which width a file chose.
-        let table_wide = matches!(candidates, szs::AnyBytesTape::View64(_));
-        let query_wide = matches!(
-            queries,
-            szs::AnyBytesTape::View64(_) | szs::AnyBytesTape::Tape64(_)
-        );
-        let queries = if table_wide == query_wide {
-            queries
-        } else if table_wide {
-            let TapeParts::Narrow { bytes, offsets } = tape_parts(&queries)? else {
-                return Err(Error::Inconsistent);
-            };
-            self.offsets_wide.clear();
-            self.offsets_wide
-                .try_reserve_exact(offsets.len())
-                .map_err(|_| Error::Alloc)?;
-            self.offsets_wide
-                .extend(offsets.iter().map(|&offset| offset as u64));
-            // SAFETY: the widened offsets are the same validated prefix sum over
-            // the same bytes, and both outlive the compute call below.
-            szs::AnyBytesTape::View64(unsafe {
-                BytesTapeView::<u64>::from_raw_parts(bytes, &self.offsets_wide)
-            })
-        } else {
-            let TapeParts::Wide { bytes, offsets } = tape_parts(&queries)? else {
-                return Err(Error::Inconsistent);
-            };
-            self.offsets_narrow.clear();
-            self.offsets_narrow
-                .try_reserve_exact(offsets.len())
-                .map_err(|_| Error::Alloc)?;
-            for &offset in offsets {
-                self.offsets_narrow
-                    .push(u32::try_from(offset).map_err(|_| Error::TooLarge)?);
-            }
-            // SAFETY: as above — narrowing is checked, so the prefix sum survives.
-            szs::AnyBytesTape::View32(unsafe {
-                BytesTapeView::<u32>::from_raw_parts(bytes, &self.offsets_narrow)
-            })
-        };
+        let mut prepared: Vec<&[u8]> = Vec::new();
+        prepared
+            .try_reserve_exact(query_count)
+            .map_err(|_| Error::Alloc)?;
+        prepared.extend(queries.iter());
 
-        let matrix = matrix_for(&mut self.matrix, query_count, node_count)?;
-        self.engine
-            .compute_into(&self.device, queries, candidates, matrix)?;
-
-        // The engine's matrix is query-major and the tile is node-major, so this
-        // copy transposes. It is the one pass the crate-owned tile costs this
-        // family, and it is cheap beside the alignment work that produced it.
-        for query in 0..query_count {
-            for node in 0..node_count {
-                *scores.get_mut(node, query).ok_or(Error::Inconsistent)? = matrix[(query, node)];
-            }
+        let threads = self.pool.threads_count();
+        while self.workers.len() < threads {
+            self.workers.push(Vec::new_in(self.alloc.clone()));
         }
-        Ok(())
+
+        // Fan node CHUNKS across the pool, each task owning a contiguous block of
+        // tile rows. A task prepares its own engine, which is neither `Send` nor
+        // reusable across threads, so four chunks per worker keep that cost a
+        // rounding error while leaving the dynamic schedule slack to balance.
+        let chunk_nodes = node_count.div_ceil(threads.max(1) * 4).max(1);
+        let mut row_chunks: Vec<&mut [usize]> = Vec::new();
+        row_chunks
+            .try_reserve_exact(node_count.div_ceil(chunk_nodes))
+            .map_err(|_| Error::Alloc)?;
+        row_chunks.extend(
+            scores
+                .as_mut_slice()
+                .chunks_mut(chunk_nodes * query_count.max(1)),
+        );
+        let (symbol, prepared) = (self.symbol, prepared.as_slice());
+        let failure = OnceLock::new();
+
+        fu::fold_with_scratch(
+            &mut self.pool,
+            fu::ParallelSliceMut::new(&mut row_chunks),
+            fu::DynamicScheduler,
+            self.workers.as_mut_slice(),
+            |block, rows, task, _thread| {
+                let outcome =
+                    scan_node_chunk(block, prepared, symbol, table, task * chunk_nodes, rows);
+                if let Err(error) = outcome {
+                    let _ = failure.set(error);
+                }
+            },
+        )
+        .map_err(|_| Error::Alloc)?;
+
+        match failure.into_inner() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
-/// The traversal half of any sequence metric: one query at a fixed node width,
-/// gathering a staged expansion's values into a tape. It owns a device and
-/// engine, since StringZilla scores even one neighbor as a batch.
-pub struct SequenceWalker<Engine: EngineLike, Index = u32, Allocator: AllocatorLike = Global> {
-    device: szs::DeviceScope,
-    engine: Engine,
-    context: TraversalContext<Index, Engine::Score, Allocator>,
-    staged_bytes: AVec<u8, Allocator>,
-    staged_offsets: AVec<u32, Allocator>,
-    matrix: Option<szs::UnifiedMat<Engine::Score>>,
+/// One chunk of nodes against every query — the body of the scan's fan-out task,
+/// handed the chunk's contiguous tile rows by exclusive borrow. The engine writes
+/// query-major and the tile is node-major, so the block is transposed into place.
+fn scan_node_chunk(
+    block: &mut Vec<usize, impl AllocatorLike>,
+    queries: &[&[u8]],
+    symbol: sz::LevenshteinSymbol,
+    table: GraphTableView<'_>,
+    begin: usize,
+    rows: &mut [usize],
+) -> Result<(), Error> {
+    let query_count = queries.len();
+    let nodes = rows.len() / query_count;
+    let candidates = value_strings(table, begin, begin + nodes)?;
+    block.clear();
+    block
+        .try_reserve(query_count * nodes)
+        .map_err(|_| Error::Alloc)?;
+    block.resize(query_count * nodes, 0);
+    levenshtein_distances(queries, symbol, candidates, block)?;
+    for (node, row) in rows.chunks_mut(query_count).enumerate() {
+        for (query, cell) in row.iter_mut().enumerate() {
+            *cell = block[query * nodes + node];
+        }
+    }
+    Ok(())
 }
 
-impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
-    SequenceWalker<Engine, Index, Allocator>
-{
-    /// A searcher with `costs`, walking with breadth `expansion_factor` on
-    /// whatever `scope` names, its traversal scratch in `alloc`. It carries no
-    /// table: the scratch grows to fit each searched graph at walk time.
+// endregion: Scanner
+
+// region: Searcher
+
+/// The traversal half of the sequence metric: one query at a fixed node width,
+/// gathering a staged expansion's values into a tape, since StringZilla scores
+/// even one neighbor as a batch.
+pub struct SequenceWalker<Index = u32, Allocator: AllocatorLike = Global> {
+    symbol: sz::LevenshteinSymbol,
+    context: TraversalContext<Index, usize, Allocator>,
+    staged_bytes: Vec<u8, Allocator>,
+    staged_offsets: Vec<u32, Allocator>,
+}
+
+impl<Index: IndexLike, Allocator: AllocatorLike + Clone> SequenceWalker<Index, Allocator> {
+    /// A walker counting `symbol`s with breadth `expansion_factor`, its scratch
+    /// in `alloc`, uniform with [`DotWalker::new`].
+    ///
+    /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(
-        costs: Engine::Costs,
+        symbol: sz::LevenshteinSymbol,
         expansion_factor: usize,
-        scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
-        let device = open_device(scope)?;
-        let engine = Engine::build(&device, &costs)?;
         Ok(SequenceWalker {
-            device,
-            engine,
+            symbol,
             context: TraversalContext::new_in(expansion_factor, alloc.clone())?,
-            staged_bytes: AVec::new_in(alloc.clone()),
-            staged_offsets: AVec::new_in(alloc.clone()),
-            matrix: None,
+            staged_bytes: Vec::new_in(alloc.clone()),
+            staged_offsets: Vec::new_in(alloc),
         })
     }
 
     /// The traversal scratch, for draining results after a walk.
-    pub fn context(&mut self) -> &mut TraversalContext<Index, Engine::Score, Allocator> {
+    pub fn context(&mut self) -> &mut TraversalContext<Index, usize, Allocator> {
         &mut self.context
     }
 }
 
-impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
-    WalkerLike<SequenceMetric<Engine>> for SequenceWalker<Engine, Index, Allocator>
+impl<Index: IndexLike, Allocator: AllocatorLike + Clone> WalkerLike<SequenceMetric>
+    for SequenceWalker<Index, Allocator>
 {
     type Index = Index;
     type Alloc = Allocator;
@@ -636,7 +308,7 @@ impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
         query: &[u8],
         table: GraphTableView<'_>,
         nodes: &[Index],
-        out: &mut [Engine::Score],
+        out: &mut [usize],
     ) -> Result<(), Error> {
         if nodes.len() != out.len() {
             return Err(Error::Inconsistent);
@@ -657,181 +329,113 @@ impl<Engine: EngineLike, Index: IndexLike, Allocator: AllocatorLike + Clone>
             let end = u32::try_from(self.staged_bytes.len()).map_err(|_| Error::TooLarge)?;
             self.staged_offsets.push(end);
         }
-
-        let query_offsets: [u32; 2] = [0, u32::try_from(query.len()).map_err(|_| Error::TooLarge)?];
-        // SAFETY: each pair is a prefix sum over the buffer beside it, and both
-        // outlive the call below.
-        let query_tape = unsafe { BytesTapeView::<u32>::from_raw_parts(query, &query_offsets) };
-        let staged_tape = unsafe {
-            BytesTapeView::<u32>::from_raw_parts(&self.staged_bytes, &self.staged_offsets)
-        };
-
-        let matrix = matrix_for(&mut self.matrix, 1, nodes.len())?;
-        self.engine.compute_into(
-            &self.device,
-            szs::AnyBytesTape::View32(query_tape),
-            szs::AnyBytesTape::View32(staged_tape),
-            matrix,
-        )?;
-
-        for (node, slot) in out.iter_mut().enumerate() {
-            *slot = matrix[(0, node)];
-        }
-        Ok(())
+        let candidates = sz::StringsView::from_u32_tape(&self.staged_bytes, &self.staged_offsets)
+            .map_err(|_| Error::Inconsistent)?;
+        levenshtein_distances(&[query], self.symbol, candidates, out)
     }
 
-    fn context(&mut self) -> &mut TraversalContext<Index, Engine::Score, Allocator> {
+    fn context(&mut self) -> &mut TraversalContext<Index, usize, Allocator> {
         &mut self.context
     }
 
-    fn compare(a: Engine::Score, b: Engine::Score) -> Ordering {
-        if matches!(Engine::RANKING, Ranking::Nearest) {
-            b.cmp(&a)
-        } else {
-            a.cmp(&b)
-        }
+    fn compare(a: usize, b: usize) -> Ordering {
+        Ranking::Nearest.compare(a, b)
     }
 
     fn search(&mut self, query: &[u8], table: GraphTableView<'_>) -> Result<(), Error> {
-        walk::<SequenceMetric<Engine>, Self>(self, query, table)
+        walk::<SequenceMetric, Self>(self, query, table)
     }
 }
 
 /// Batched sequence walks, resolving the node width from the first table
-/// searched. It holds a single [`SequenceWalker`] rather than one per pool
-/// thread, since this family fans out inside each scoring call.
-pub struct SequenceSearcher<Engine: EngineLike, Allocator: AllocatorLike = Global> {
-    costs: Engine::Costs,
+/// searched and holding one [`SequenceWalker`] per pool thread.
+pub struct SequenceSearcher<Allocator: AllocatorLike = Global> {
+    symbol: sz::LevenshteinSymbol,
+    pool: fu::ThreadPool,
     expansion_factor: usize,
-    scope: ExecutionScope,
-    workers: Workers<
-        SequenceWalker<Engine, u32, Allocator>,
-        SequenceWalker<Engine, u64, Allocator>,
-        Allocator,
-    >,
+    workers: Workers<SequenceWalker<u32, Allocator>, SequenceWalker<u64, Allocator>, Allocator>,
     alloc: Allocator,
 }
 
-impl<Engine: EngineLike, Allocator: AllocatorLike + Clone> SequenceSearcher<Engine, Allocator> {
-    /// A searcher with `costs`, walking with breadth `expansion_factor` on
-    /// whatever `scope` names, its scratch in `alloc`. No table is seen here:
-    /// the neighbor-width lane settles on the first searched table.
+impl<Allocator: AllocatorLike + Clone + Send> SequenceSearcher<Allocator> {
+    /// A searcher counting `symbol`s, walking with breadth `expansion_factor`
+    /// across the workers `scope` names, uniform with [`DotSearcher::new`].
+    ///
+    /// [`DotSearcher::new`]: crate::search::dense::DotSearcher::new
     pub fn new(
-        costs: Engine::Costs,
+        symbol: sz::LevenshteinSymbol,
         expansion_factor: usize,
         scope: ExecutionScope,
         alloc: Allocator,
     ) -> Result<Self, Error> {
         Ok(SequenceSearcher {
-            costs,
+            symbol,
+            pool: open_pool(scope)?,
             expansion_factor,
-            scope,
             workers: Workers::Unresolved,
             alloc,
         })
     }
 
-    /// Batch top-k by walk, uniform with [`SequenceScanner::scan`].
+    /// Batch top-k by walk, fanned across the pool. Uniform with
+    /// [`SequenceScanner::scan`].
     pub fn search(
         &mut self,
-        queries: szs::AnyBytesTape<'_>,
-        table: &GraphTable<impl AllocatorLike>,
+        queries: sz::StringsView<'_>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
     ) -> Result<(), Error> {
         let table = table.view();
-        let (costs, expansion_factor, scope) = (&self.costs, self.expansion_factor, self.scope);
+        let threads = self.pool.threads_count();
+        let (symbol, expansion_factor) = (self.symbol, self.expansion_factor);
         match table.neighbors_dtype() {
             OffsetDType::U32 => {
                 if !matches!(self.workers, Workers::U32(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U32(build_workers(1, alloc.clone(), || {
-                        SequenceWalker::new(costs.clone(), expansion_factor, scope, alloc.clone())
+                    self.workers = Workers::U32(build_workers(threads, alloc.clone(), || {
+                        SequenceWalker::new(symbol, expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U32(workers) = &mut self.workers else {
                     return Err(Error::Inconsistent);
                 };
-                let worker = workers.first_mut().ok_or(Error::Inconsistent)?;
-                batch_search_serial::<SequenceMetric<Engine>, _>(
-                    worker, queries, table, matches, distances, counts,
+                batch_search::<SequenceMetric, _>(
+                    &mut self.pool,
+                    workers.as_mut_slice(),
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
                 )
             }
             OffsetDType::U64 => {
                 if !matches!(self.workers, Workers::U64(_)) {
                     let alloc = &self.alloc;
-                    self.workers = Workers::U64(build_workers(1, alloc.clone(), || {
-                        SequenceWalker::new(costs.clone(), expansion_factor, scope, alloc.clone())
+                    self.workers = Workers::U64(build_workers(threads, alloc.clone(), || {
+                        SequenceWalker::new(symbol, expansion_factor, alloc.clone())
                     })?);
                 }
                 let Workers::U64(workers) = &mut self.workers else {
                     return Err(Error::Inconsistent);
                 };
-                let worker = workers.first_mut().ok_or(Error::Inconsistent)?;
-                batch_search_serial::<SequenceMetric<Engine>, _>(
-                    worker, queries, table, matches, distances, counts,
+                batch_search::<SequenceMetric, _>(
+                    &mut self.pool,
+                    workers.as_mut_slice(),
+                    queries,
+                    table,
+                    matches,
+                    distances,
+                    counts,
                 )
             }
         }
     }
 }
 
-// endregion: Generic functors
-
-// region: Metric aliases
-
-/// Byte-level Levenshtein edit distance, smaller-is-better.
-pub type LevenshteinMetric = SequenceMetric<szs::LevenshteinDistances>;
-/// Exact brute force over byte-level Levenshtein.
-pub type LevenshteinScanner<Allocator = Global> =
-    SequenceScanner<szs::LevenshteinDistances, Allocator>;
-/// One query's greedy walk under byte-level Levenshtein.
-pub type LevenshteinWalker<Index = u32, Allocator = Global> =
-    SequenceWalker<szs::LevenshteinDistances, Index, Allocator>;
-/// Batched walks under byte-level Levenshtein.
-pub type LevenshteinSearcher<Allocator = Global> =
-    SequenceSearcher<szs::LevenshteinDistances, Allocator>;
-
-/// Codepoint-level Levenshtein over validated UTF-8, smaller-is-better: one
-/// multibyte character is one edit, not two.
-pub type LevenshteinUtf8Metric = SequenceMetric<szs::LevenshteinDistancesUtf8>;
-/// Exact brute force over codepoint-level Levenshtein.
-pub type LevenshteinUtf8Scanner<Allocator = Global> =
-    SequenceScanner<szs::LevenshteinDistancesUtf8, Allocator>;
-/// One query's greedy walk under codepoint-level Levenshtein.
-pub type LevenshteinUtf8Walker<Index = u32, Allocator = Global> =
-    SequenceWalker<szs::LevenshteinDistancesUtf8, Index, Allocator>;
-/// Batched walks under codepoint-level Levenshtein.
-pub type LevenshteinUtf8Searcher<Allocator = Global> =
-    SequenceSearcher<szs::LevenshteinDistancesUtf8, Allocator>;
-
-/// Needleman-Wunsch global alignment score, larger-is-better and possibly
-/// negative.
-pub type NeedlemanWunschMetric = SequenceMetric<szs::NeedlemanWunschScores>;
-/// Exact brute force over Needleman-Wunsch alignment.
-pub type NeedlemanWunschScanner<Allocator = Global> =
-    SequenceScanner<szs::NeedlemanWunschScores, Allocator>;
-/// One query's greedy walk under Needleman-Wunsch alignment.
-pub type NeedlemanWunschWalker<Index = u32, Allocator = Global> =
-    SequenceWalker<szs::NeedlemanWunschScores, Index, Allocator>;
-/// Batched walks under Needleman-Wunsch alignment.
-pub type NeedlemanWunschSearcher<Allocator = Global> =
-    SequenceSearcher<szs::NeedlemanWunschScores, Allocator>;
-
-/// Smith-Waterman local alignment score, larger-is-better and never negative.
-pub type SmithWatermanMetric = SequenceMetric<szs::SmithWatermanScores>;
-/// Exact brute force over Smith-Waterman alignment.
-pub type SmithWatermanScanner<Allocator = Global> =
-    SequenceScanner<szs::SmithWatermanScores, Allocator>;
-/// One query's greedy walk under Smith-Waterman alignment.
-pub type SmithWatermanWalker<Index = u32, Allocator = Global> =
-    SequenceWalker<szs::SmithWatermanScores, Index, Allocator>;
-/// Batched walks under Smith-Waterman alignment.
-pub type SmithWatermanSearcher<Allocator = Global> =
-    SequenceSearcher<szs::SmithWatermanScores, Allocator>;
-
-// endregion: Metric aliases
+// endregion: Searcher
 
 #[cfg(test)]
 mod tests {
@@ -883,25 +487,24 @@ mod tests {
         }
     }
 
-    /// One-query tape over `bytes`, deliberately at the narrow offset width:
-    /// `GraphTable::build` writes `u64` offsets, so every scan below also proves the
-    /// scanner restates the width itself rather than pushing it on the caller.
-    fn query_tape<'q>(bytes: &'q [u8], offsets: &'q mut [u32; 2]) -> szs::AnyBytesTape<'q> {
-        *offsets = [0, u32::try_from(bytes.len()).unwrap()];
-        szs::AnyBytesTape::View32(unsafe { BytesTapeView::<u32>::from_raw_parts(bytes, offsets) })
+    fn bytes_scanner() -> SequenceScanner {
+        SequenceScanner::new(sz::LevenshteinSymbol::Bytes, ExecutionScope::Serial, Global).unwrap()
     }
 
     #[test]
     fn scan_ranks_nearest_first() {
         let table = crate::GraphTable::build(&Words, None).unwrap();
-        let mut scanner =
-            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
-                .unwrap();
 
         // "kitten": distance 0 to itself, 3 to "sitting", 1 to "mitten" — and the
         // ranking must put the SMALLEST distance first, unlike every dot metric.
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(b"kitten", &mut offsets);
+        // Two threads split three nodes, so the chunked transpose is exercised too.
+        let mut scanner = SequenceScanner::new(
+            sz::LevenshteinSymbol::Bytes,
+            ExecutionScope::CPUs(2),
+            Global,
+        )
+        .unwrap();
+        let queries = sz::StringsView::from_slices(&["kitten"]);
         let (mut matches, mut distances, mut counts) = outputs(1, 3);
         scanner
             .scan(queries, &table, &mut matches, &mut distances, &mut counts)
@@ -916,16 +519,15 @@ mod tests {
         // The batched-frontier walk must reach the same ordering as a full scan,
         // with a metric whose scores run the opposite direction to the dense one.
         let table = crate::GraphTable::build(&Words, None).unwrap();
-        let mut searcher = LevenshteinSearcher::new(
-            LevenshteinCosts::default(),
+        let mut searcher = SequenceSearcher::new(
+            sz::LevenshteinSymbol::Bytes,
             3,
             ExecutionScope::Serial,
             Global,
         )
         .unwrap();
 
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(b"kitten", &mut offsets);
+        let queries = sz::StringsView::from_slices(&["kitten"]);
         let (mut matches, mut distances, mut counts) = outputs(1, 3);
         searcher
             .search(queries, &table, &mut matches, &mut distances, &mut counts)
@@ -937,23 +539,20 @@ mod tests {
 
     #[test]
     fn batch_walks_many_queries() {
-        // A two-query tape through one searcher: the tape carries the count, each
-        // query fills its own row, and the rows disagree — proof the loop indexes
-        // the tape rather than rescoring the first string.
+        // A two-query column through one searcher: the column carries the count,
+        // each query fills its own row, and the rows disagree — proof the loop
+        // indexes the column rather than rescoring the first string.
         let table = crate::GraphTable::build(&Words, None).unwrap();
-        let mut searcher = LevenshteinSearcher::new(
-            LevenshteinCosts::default(),
+        let mut searcher = SequenceSearcher::new(
+            sz::LevenshteinSymbol::Bytes,
             3,
             ExecutionScope::Serial,
             Global,
         )
         .unwrap();
 
-        let bytes = b"kittenmitten";
         let offsets: [u32; 3] = [0, 6, 12];
-        let queries = szs::AnyBytesTape::View32(unsafe {
-            BytesTapeView::<u32>::from_raw_parts(bytes, &offsets)
-        });
+        let queries = sz::StringsView::from_u32_tape(b"kittenmitten", &offsets).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(2, 2);
         searcher
             .search(queries, &table, &mut matches, &mut distances, &mut counts)
@@ -966,75 +565,8 @@ mod tests {
         assert_eq!(distances.row(1).unwrap(), &[0.0, 1.0]);
     }
 
-    #[test]
-    fn needleman_wunsch_ranks_highest_score_first() {
-        // The alignment scores flip the direction: the LARGEST score is the best
-        // match, exercised through the same generic body that ranks Levenshtein
-        // smallest-first. The self-alignment of "kitten" under the default costs
-        // is unambiguous — six class matches, no gaps — so its score is pinned.
-        let table = crate::GraphTable::build(&Words, None).unwrap();
-        let mut scanner =
-            NeedlemanWunschScanner::new(AlignmentCosts::default(), ExecutionScope::Serial, Global)
-                .unwrap();
-
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(b"kitten", &mut offsets);
-        let (mut matches, mut distances, mut counts) = outputs(1, 3);
-        scanner
-            .scan(queries, &table, &mut matches, &mut distances, &mut counts)
-            .unwrap();
-        assert_eq!(counts, [3]);
-        assert_eq!(matches.row(0).unwrap(), &[0, 2, 1]);
-        assert_scores_close(&distances.row(0).unwrap()[..1], &[12.0]);
-
-        // The walk agrees with the scan, ordering and scores both.
-        let mut searcher = NeedlemanWunschSearcher::new(
-            AlignmentCosts::default(),
-            3,
-            ExecutionScope::Serial,
-            Global,
-        )
-        .unwrap();
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(b"kitten", &mut offsets);
-        let (mut walked, mut walked_scores, mut walked_counts) = outputs(1, 3);
-        searcher
-            .search(
-                queries,
-                &table,
-                &mut walked,
-                &mut walked_scores,
-                &mut walked_counts,
-            )
-            .unwrap();
-        assert_eq!(walked.row(0).unwrap(), matches.row(0).unwrap());
-        assert_scores_close(walked_scores.row(0).unwrap(), distances.row(0).unwrap());
-    }
-
-    #[test]
-    fn smith_waterman_scores_local_alignment() {
-        // Local alignment: "kitt" scores its full length against "kitten" alone
-        // — eight, four class matches — while the other two words only contain
-        // the shorter run "itt", so node 0 outranks them and ties keep node
-        // order. A local score never goes negative.
-        let table = crate::GraphTable::build(&Words, None).unwrap();
-        let mut scanner =
-            SmithWatermanScanner::new(AlignmentCosts::default(), ExecutionScope::Serial, Global)
-                .unwrap();
-
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(b"kitt", &mut offsets);
-        let (mut matches, mut distances, mut counts) = outputs(1, 3);
-        scanner
-            .scan(queries, &table, &mut matches, &mut distances, &mut counts)
-            .unwrap();
-        assert_eq!(counts, [3]);
-        assert_eq!(matches.row(0).unwrap(), &[0, 1, 2]);
-        assert_scores_close(distances.row(0).unwrap(), &[8.0, 6.0, 6.0]);
-    }
-
-    /// Three greetings whose first two differ by one CODEPOINT but two bytes —
-    /// the case that splits the byte-level engine from the UTF-8 one.
+    /// Three greetings whose first two differ by one RUNE but two bytes — the
+    /// case that splits the byte-level metric from the UTF-8 one.
     struct Greetings;
 
     const GREETINGS: [&[u8]; 3] = ["héllo".as_bytes(), b"hello", b"world"];
@@ -1077,71 +609,82 @@ mod tests {
     }
 
     #[test]
-    fn utf8_levenshtein_counts_codepoints_not_bytes() {
+    fn utf8_levenshtein_counts_runes_not_bytes() {
         let table = crate::GraphTable::build(&Greetings, None).unwrap();
+        let queries = ["héllo".as_bytes()];
 
         // Byte-level: "é" is two bytes, so "héllo" sits two edits from "hello".
-        let mut byte_scanner =
-            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
-                .unwrap();
-        let mut offsets = [0u32; 2];
-        let queries = query_tape("héllo".as_bytes(), &mut offsets);
+        let mut byte_scanner = bytes_scanner();
         let (mut matches, mut distances, mut counts) = outputs(1, 2);
         byte_scanner
-            .scan(queries, &table, &mut matches, &mut distances, &mut counts)
+            .scan(
+                sz::StringsView::from_slices(&queries),
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[0, 1]);
         assert_scores_close(distances.row(0).unwrap(), &[0.0, 2.0]);
 
-        // Codepoint-level: the very same pair is ONE edit, and the walk agrees.
-        let mut utf8_scanner = LevenshteinUtf8Scanner::new(
-            LevenshteinCosts::default(),
-            ExecutionScope::Serial,
-            Global,
-        )
-        .unwrap();
-        let mut offsets = [0u32; 2];
-        let queries = query_tape("héllo".as_bytes(), &mut offsets);
-        utf8_scanner
-            .scan(queries, &table, &mut matches, &mut distances, &mut counts)
+        // Rune-level: the very same pair is ONE edit, and the walk agrees.
+        let mut rune_scanner =
+            SequenceScanner::new(sz::LevenshteinSymbol::Runes, ExecutionScope::Serial, Global)
+                .unwrap();
+        rune_scanner
+            .scan(
+                sz::StringsView::from_slices(&queries),
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[0, 1]);
         assert_scores_close(distances.row(0).unwrap(), &[0.0, 1.0]);
 
-        let mut searcher = LevenshteinUtf8Searcher::new(
-            LevenshteinCosts::default(),
+        let mut searcher = SequenceSearcher::new(
+            sz::LevenshteinSymbol::Runes,
             3,
             ExecutionScope::Serial,
             Global,
         )
         .unwrap();
-        let mut offsets = [0u32; 2];
-        let queries = query_tape("héllo".as_bytes(), &mut offsets);
         searcher
-            .search(queries, &table, &mut matches, &mut distances, &mut counts)
+            .search(
+                sz::StringsView::from_slices(&queries),
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
             .unwrap();
         assert_eq!(matches.row(0).unwrap(), &[0, 1]);
         assert_scores_close(distances.row(0).unwrap(), &[0.0, 1.0]);
     }
 
+    /// An ill-formed byte is one `U+FFFD` rune, not an error: "h\xFFllo" is one
+    /// substitution from "héllo" counted in runes, and two counted in bytes.
     #[test]
-    fn utf8_scan_refuses_invalid_bytes() {
-        // The column claimed `utf8`; a query that is not is a type error, not a
-        // garbage distance.
+    fn utf8_scan_reads_an_ill_formed_byte_as_one_rune() {
         let table = crate::GraphTable::build(&Greetings, None).unwrap();
-        let mut scanner = LevenshteinUtf8Scanner::new(
-            LevenshteinCosts::default(),
-            ExecutionScope::Serial,
-            Global,
-        )
-        .unwrap();
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(&[0xFF, 0xFE], &mut offsets);
-        let (mut matches, mut distances, mut counts) = outputs(1, 2);
-        assert!(matches!(
-            scanner.scan(queries, &table, &mut matches, &mut distances, &mut counts),
-            Err(Error::WrongType)
-        ));
+        let queries = [&b"h\xFFllo"[..]];
+        let mut scanner =
+            SequenceScanner::new(sz::LevenshteinSymbol::Runes, ExecutionScope::Serial, Global)
+                .unwrap();
+        let (mut matches, mut distances, mut counts) = outputs(1, 1);
+        scanner
+            .scan(
+                sz::StringsView::from_slices(&queries),
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts,
+            )
+            .unwrap();
+        assert_eq!(matches.row(0).unwrap(), &[0]);
+        assert_scores_close(distances.row(0).unwrap(), &[1.0]);
     }
 
     /// A one-node graph whose value column the caller shapes, for the two ways a
@@ -1182,14 +725,16 @@ mod tests {
     /// catches it.
     fn expect_wrong_type(graph: &OneNode) {
         let table = crate::GraphTable::build(graph, None).unwrap();
-        let mut scanner =
-            LevenshteinScanner::new(LevenshteinCosts::default(), ExecutionScope::Serial, Global)
-                .unwrap();
-        let mut offsets = [0u32; 2];
-        let queries = query_tape(b"a", &mut offsets);
+        let mut scanner = bytes_scanner();
         let (mut matches, mut distances, mut counts) = outputs(1, 1);
         assert!(matches!(
-            scanner.scan(queries, &table, &mut matches, &mut distances, &mut counts),
+            scanner.scan(
+                sz::StringsView::from_slices(&["a"]),
+                &table,
+                &mut matches,
+                &mut distances,
+                &mut counts
+            ),
             Err(Error::WrongType)
         ));
     }

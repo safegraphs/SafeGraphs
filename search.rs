@@ -15,9 +15,9 @@
 //! one query; there is one per worker thread, which is what makes its `&mut self`
 //! free. Nothing here is inherited: shared code is called, never derived.
 
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
-use allocator_api2::vec::Vec as AVec;
+use core::alloc::Allocator as AllocatorLike;
 use core::cmp::Ordering;
+use std::alloc::Global;
 
 use crate::{Error, IndexLike};
 
@@ -25,11 +25,10 @@ use crate::{Error, IndexLike};
 /// that crosses the API. Every functor's one constructor takes one of these;
 /// no pool, topology, scheduler, or device handle appears in any signature.
 ///
-/// Each family opens the scope into whatever its backend calls an executor: the
-/// NumKong families spawn a ForkUnion thread pool, the StringZilla ones a
-/// `DeviceScope`, and that conversion is the only place a backend type appears.
-/// A family whose kernels are CPU-only answers [`GPU`](ExecutionScope::GPU)
-/// with [`Error::WrongType`] at construction rather than pretending.
+/// Every family opens the scope as a ForkUnion thread pool, and that conversion
+/// is the only place an executor type appears. A family whose kernels are
+/// CPU-only answers [`GPU`](ExecutionScope::GPU) with [`Error::WrongType`] at
+/// construction rather than pretending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionScope {
     /// The caller's thread alone — the nil state. Nothing is spawned, and the
@@ -111,13 +110,13 @@ pub struct Candidate<Index, Score> {
 /// scores like `f64` that have no total order. `clear` keeps the allocation for
 /// the next query.
 pub struct MinQueue<Item, Allocator: AllocatorLike = Global> {
-    heap: AVec<Item, Allocator>,
+    heap: Vec<Item, Allocator>,
 }
 
 impl<Item, Allocator: AllocatorLike + Clone> MinQueue<Item, Allocator> {
     pub fn new_in(alloc: Allocator) -> Self {
         MinQueue {
-            heap: AVec::new_in(alloc),
+            heap: Vec::new_in(alloc),
         }
     }
 
@@ -189,7 +188,7 @@ impl<Item, Allocator: AllocatorLike + Clone> MinQueue<Item, Allocator> {
 /// is O(1): it bumps a generation counter instead of clearing the array.
 pub struct VisitedSet<Allocator: AllocatorLike = Global> {
     /// One stamp per node, compared against `generation` rather than cleared.
-    stamps: AVec<u32, Allocator>,
+    stamps: Vec<u32, Allocator>,
     /// The current query's stamp; bumping it empties the set in O(1).
     generation: u32,
     /// How many nodes are marked this generation. The stamped array cannot report
@@ -200,7 +199,7 @@ pub struct VisitedSet<Allocator: AllocatorLike = Global> {
 
 impl<Allocator: AllocatorLike + Clone> VisitedSet<Allocator> {
     pub fn new_in(capacity: usize, alloc: Allocator) -> Result<Self, Error> {
-        let mut stamps = AVec::new_in(alloc);
+        let mut stamps = Vec::new_in(alloc);
         stamps
             .try_reserve_exact(capacity)
             .map_err(|_| Error::Alloc)?;
@@ -317,9 +316,9 @@ pub struct TraversalContext<Index, Score, Allocator: AllocatorLike = Global> {
     visited: VisitedSet<Allocator>,
     /// Nodes staged for one batched expansion, lent out wholesale for the
     /// duration of a walk so the walker stays mutably borrowable.
-    neighbors: AVec<Index, Allocator>,
+    neighbors: Vec<Index, Allocator>,
     /// The scores those staged nodes come back with, lent out the same way.
-    scores: AVec<Score, Allocator>,
+    scores: Vec<Score, Allocator>,
     /// Search breadth, at least `k`. A per-searcher tuning knob rather than a
     /// per-query argument, since one searcher is one thread's worth of policy.
     expansion_factor: usize,
@@ -328,7 +327,7 @@ pub struct TraversalContext<Index, Score, Allocator: AllocatorLike = Global> {
     /// entry points, a stochastic multi-start rather than a fixed one.
     rng: SplitMix,
     /// Kept so a lent-out buffer can be replaced by an empty one of the same
-    /// allocator; `AVec<_, Allocator>` has no `Default` to `take` through.
+    /// allocator; `Vec<_, Allocator>` has no `Default` to `take` through.
     alloc: Allocator,
 }
 
@@ -349,8 +348,8 @@ impl<Index: IndexLike, Score: Copy + Default, Allocator: AllocatorLike + Clone>
             frontier: MinQueue::new_in(alloc.clone()),
             results: MinQueue::new_in(alloc.clone()),
             visited: VisitedSet::new_in(0, alloc.clone())?,
-            neighbors: AVec::new_in(alloc.clone()),
-            scores: AVec::new_in(alloc.clone()),
+            neighbors: Vec::new_in(alloc.clone()),
+            scores: Vec::new_in(alloc.clone()),
             expansion_factor,
             rng: SplitMix::new(0),
             alloc,
@@ -393,18 +392,14 @@ impl<Index: IndexLike, Score: Copy + Default, Allocator: AllocatorLike + Clone>
     /// borrow the searcher mutably while holding them. Always paired with
     /// [`restore_staging`](TraversalContext::restore_staging), including on the
     /// error path, or their capacity is lost.
-    fn lend_staging(&mut self) -> (AVec<Index, Allocator>, AVec<Score, Allocator>) {
+    fn lend_staging(&mut self) -> (Vec<Index, Allocator>, Vec<Score, Allocator>) {
         (
-            core::mem::replace(&mut self.neighbors, AVec::new_in(self.alloc.clone())),
-            core::mem::replace(&mut self.scores, AVec::new_in(self.alloc.clone())),
+            core::mem::replace(&mut self.neighbors, Vec::new_in(self.alloc.clone())),
+            core::mem::replace(&mut self.scores, Vec::new_in(self.alloc.clone())),
         )
     }
 
-    fn restore_staging(
-        &mut self,
-        neighbors: AVec<Index, Allocator>,
-        scores: AVec<Score, Allocator>,
-    ) {
+    fn restore_staging(&mut self, neighbors: Vec<Index, Allocator>, scores: Vec<Score, Allocator>) {
         self.neighbors = neighbors;
         self.scores = scores;
     }
@@ -468,7 +463,7 @@ impl<Index: IndexLike, Score: Copy + Default> TraversalContext<Index, Score, Glo
 /// the layout NumKong's cross-product writes natively, and those kernels reject a
 /// strided output, so a dense scan fills it with no transpose.
 pub struct Matrix<Cell, Allocator: AllocatorLike = Global> {
-    data: AVec<Cell, Allocator>,
+    data: Vec<Cell, Allocator>,
     rows: usize,
     cols: usize,
 }
@@ -484,7 +479,7 @@ impl<Cell, Allocator: AllocatorLike> Matrix<Cell, Allocator> {
     /// allocation-free, so a scanner can hold one as a field from construction.
     pub fn empty_in(alloc: Allocator) -> Self {
         Matrix {
-            data: AVec::new_in(alloc),
+            data: Vec::new_in(alloc),
             rows: 0,
             cols: 0,
         }
@@ -508,7 +503,7 @@ impl<Cell> Default for Matrix<Cell, Global> {
 impl<Cell: Copy + Default, Allocator: AllocatorLike + Clone> Matrix<Cell, Allocator> {
     pub fn new_in(rows: usize, cols: usize, alloc: Allocator) -> Result<Self, Error> {
         let mut matrix = Matrix {
-            data: AVec::new_in(alloc),
+            data: Vec::new_in(alloc),
             rows: 0,
             cols: 0,
         };
@@ -574,8 +569,8 @@ impl<Cell: Copy + Default, Allocator: AllocatorLike + Clone> Matrix<Cell, Alloca
 
 /// A batch of queries a walk consumes one at a time: it reports how many it holds
 /// and yields each as the metric's [`Query`](MetricLike::Query). A dense batch is a
-/// `nk::MatrixView` yielding rows; a sequence batch is a `StringTape` view yielding
-/// byte strings. This is the seam that lets one batch `search` walk either without
+/// `nk::MatrixView` yielding rows; a sequence batch is a StringZilla `StringsView`
+/// yielding byte strings. This is the seam that lets one batch `search` walk either without
 /// assuming a `&[T]`.
 pub trait QueryBatchLike<Metric: MetricLike + ?Sized> {
     /// How many queries the batch holds.
@@ -690,8 +685,8 @@ fn walk_staged<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
     table: crate::GraphTableView<'_>,
-    staged: &mut AVec<Score::Index, impl AllocatorLike>,
-    scores: &mut AVec<Metric::Score, impl AllocatorLike>,
+    staged: &mut Vec<Score::Index, impl AllocatorLike>,
+    scores: &mut Vec<Metric::Score, impl AllocatorLike>,
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
@@ -790,7 +785,7 @@ fn sample_landmarks<Metric, Score>(
     searcher: &mut Score,
     nodes: usize,
     count: usize,
-    staged: &mut AVec<Score::Index, impl AllocatorLike>,
+    staged: &mut Vec<Score::Index, impl AllocatorLike>,
 ) -> bool
 where
     Metric: MetricLike + ?Sized,
@@ -834,7 +829,7 @@ fn stage_unvisited<Metric, Score>(
     searcher: &mut Score,
     candidates: impl Iterator<Item = Score::Index>,
     nodes: usize,
-    staged: &mut AVec<Score::Index, impl AllocatorLike>,
+    staged: &mut Vec<Score::Index, impl AllocatorLike>,
 ) -> Result<(), Error>
 where
     Metric: MetricLike + ?Sized,
@@ -865,8 +860,8 @@ fn admit<Metric, Score>(
     searcher: &mut Score,
     query: Metric::Query<'_>,
     table: crate::GraphTableView<'_>,
-    staged: &AVec<Score::Index, impl AllocatorLike>,
-    scores: &mut AVec<Metric::Score, impl AllocatorLike>,
+    staged: &[Score::Index],
+    scores: &mut Vec<Metric::Score, impl AllocatorLike>,
     expansion_factor: usize,
     toward_best: &impl Fn(
         &Candidate<Score::Index, Metric::Score>,
@@ -988,9 +983,9 @@ pub mod geospatial;
 #[cfg(feature = "search")]
 pub mod maxsim;
 #[cfg(feature = "search")]
-pub mod mesh;
-#[cfg(feature = "search")]
 pub mod sequence;
+#[cfg(feature = "search")]
+pub mod shapes;
 
 // Runtime dtype dispatch: pick a concrete scorer from a file's header string,
 // the counterpart to the compile-time descriptors in `dense`.
@@ -1190,39 +1185,23 @@ mod tests {
         );
     }
 
-    /// The three backend surfaces the two metric families are built on must all
-    /// resolve, and — the part that silently breaks — the `stringtape` types we
-    /// hand StringZilla must come from the same crate StringZilla itself was
-    /// compiled against. If the dependency graph ever splits again, this stops
-    /// compiling rather than failing much later at the zero-copy handoff.
+    /// The backend surfaces the metric families are built on must all resolve,
+    /// and the Arrow-shaped handoff must borrow our offsets and bytes with no copy.
     #[cfg(feature = "search")]
     #[test]
     fn backend_surfaces_resolve() {
         use forkunion as fu;
-        use stringzilla::szs;
+        use stringzilla as sz;
 
         // NumKong's pool-taking kernels exist only under its `parallel` feature.
         let topology = fu::Topology::new().expect("probe machine topology");
-        let pool = fu::ThreadPool::try_spawn(&topology, 2).expect("spawn workers");
+        let pool = fu::ThreadPool::spawn(&topology, 2).expect("spawn workers");
         assert!(pool.threads_count() >= 1);
 
-        // StringZilla's batch engines exist only under its `cpus` feature.
-        let device = szs::DeviceScope::cpu_cores(1).expect("cpu device");
-        assert!(!device.is_gpu());
-
-        // A score matrix we allocate ourselves, which needs `try_allocate` to be
-        // public — otherwise `compute_into` can only reuse a matrix `compute`
-        // returned, and no buffer can be sized ahead of time.
-        let scores = szs::UnifiedMat::<usize>::try_allocate(1, 3).expect("unified matrix");
-        assert_eq!(scores.dimensions(), (1, 3));
-
-        // The Arrow-shaped handoff: our mmap'd offsets and bytes, borrowed with
-        // no copy, in the exact type `AnyBytesTape` carries.
         let bytes = b"alphabetagamma";
         let offsets: [u32; 4] = [0, 5, 9, 14];
-        let tape = unsafe { stringtape::BytesTapeView::<u32>::from_raw_parts(bytes, &offsets) };
-        assert_eq!(tape.len(), 3);
-        assert_eq!(tape.get(1), Some(&b"beta"[..]));
-        let _: szs::AnyBytesTape = szs::AnyBytesTape::View32(tape);
+        let strings = sz::StringsView::from_u32_tape(bytes, &offsets).expect("tape");
+        assert_eq!(strings.len(), 3);
+        assert_eq!(strings.get(1), Some(&b"beta"[..]));
     }
 }

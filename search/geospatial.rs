@@ -2,19 +2,19 @@
 //!
 //! A node's value is a two-wide `[latitude, longitude]` pair in `f32` or `f64`,
 //! stored in __radians__ — the kernels' own convention, adopted rather than
-//! converted — and every score is a distance in __meters__, so the family ranks
-//! nearest-first like Euclidean. Two metrics share one generic body through the
-//! [`KernelLike`] seam: [`HaversineKernel`], the spherical great-circle
-//! distance, and [`VincentyKernel`], the WGS84 geodesic, ~20× more accurate at
-//! long range.
+//! converted — and every score is a distance in __meters__, `f64` for either
+//! dtype, so the family ranks nearest-first like Euclidean. Two metrics share
+//! one generic body through the [`KernelLike`] seam: [`HaversineKernel`], the
+//! spherical great-circle distance, and [`VincentyKernel`], the WGS84 geodesic,
+//! ~20× more accurate at long range.
 //!
-//! The kernels are element-wise over parallel coordinate slices — there is no
-//! packed cross-product analogue of `DotsPackedMatrix` — so the scan builds the
-//! product itself: the node column is deinterleaved once per call into
-//! latitude/longitude slices, and each query is broadcast against them in one
-//! kernel call, filling that query's tile column. Queries fan across the owned
-//! pool with per-worker broadcast scratch, the same schedule the batch walk
-//! uses.
+//! The kernels are many-to-many over packed points, `f64` only: a pack holds
+//! each point's trigonometry once, and a call scores every row point against
+//! every column point. So the scan deinterleaves and widens the node column once
+//! per call, packs the queries once as the columns, and fans node chunks across
+//! the owned pool, each task packing its chunk as the rows and writing its block
+//! of the node-major tile directly. A walk packs its query and each hop's
+//! neighbors, a handful of points.
 
 use super::batch::{batch_scan, batch_search, build_workers, open_pool, ShareRead, Workers};
 use super::{
@@ -22,73 +22,88 @@ use super::{
     TraversalContext, WalkerLike,
 };
 use crate::search::dense::view_from_bytes;
-use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
-use allocator_api2::vec::Vec as AVec;
+use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType};
+use allocator_api2::alloc::Allocator as TableAllocatorLike;
+use core::alloc::Allocator as AllocatorLike;
 use core::cmp::Ordering;
 use forkunion as fu;
-use numkong as nk;
+use numkong::{self as nk};
+use std::alloc::Global;
 use std::sync::OnceLock;
 
 // region: Kernel seam
 
-/// The seam between the shared geospatial machinery and one NumKong kernel: a
-/// batch of pairwise distances over parallel coordinate slices, radians in,
-/// meters out. Implemented by unit marker types, so [`GeospatialScanner`] and
-/// friends span both metrics the way `DotMetric<Value>` spans the dense scalars.
+/// The seam between the shared geospatial machinery and one NumKong kernel:
+/// pack points once, radians in, then score every row point against every
+/// column point, meters out. Implemented by unit marker types, so
+/// [`GeospatialScanner`] and friends span both metrics the way
+/// `DotMetric<Value>` spans the dense scalars.
 ///
 /// [`DotMetric<Value>`]: crate::search::dense::DotMetric
-pub trait KernelLike<Coordinate>: 'static {
-    /// One distance per element, all five slices the same length. `None` is a
-    /// length mismatch, which the callers turn into [`Error::Inconsistent`].
-    fn distances(
-        first_latitudes: &[Coordinate],
-        first_longitudes: &[Coordinate],
-        second_latitudes: &[Coordinate],
-        second_longitudes: &[Coordinate],
-        out: &mut [Coordinate],
-    ) -> Option<()>;
+pub trait KernelLike: 'static {
+    /// The kernel's packed points.
+    type Packed<Allocator: AllocatorLike>;
+
+    /// Pack parallel coordinate slices of equal length.
+    fn pack<Allocator: AllocatorLike>(
+        latitudes: &[f64],
+        longitudes: &[f64],
+        alloc: Allocator,
+    ) -> Result<Self::Packed<Allocator>, Error>;
+
+    /// Fill `results` with `rows × columns` distances, row-major.
+    fn distances<RowsAllocator: AllocatorLike, ColumnsAllocator: AllocatorLike>(
+        rows: &Self::Packed<RowsAllocator>,
+        columns: &Self::Packed<ColumnsAllocator>,
+        results: &mut [f64],
+    ) -> Result<(), Error>;
 }
 
 /// Spherical great-circle distance — fast, within ~0.5% on Earth.
 pub struct HaversineKernel;
 
-impl<Coordinate: nk::Haversine> KernelLike<Coordinate> for HaversineKernel {
-    fn distances(
-        first_latitudes: &[Coordinate],
-        first_longitudes: &[Coordinate],
-        second_latitudes: &[Coordinate],
-        second_longitudes: &[Coordinate],
-        out: &mut [Coordinate],
-    ) -> Option<()> {
-        Coordinate::haversine(
-            first_latitudes,
-            first_longitudes,
-            second_latitudes,
-            second_longitudes,
-            out,
-        )
+impl KernelLike for HaversineKernel {
+    type Packed<Allocator: AllocatorLike> = nk::HaversinesPackedMatrix<Allocator>;
+
+    fn pack<Allocator: AllocatorLike>(
+        latitudes: &[f64],
+        longitudes: &[f64],
+        alloc: Allocator,
+    ) -> Result<Self::Packed<Allocator>, Error> {
+        nk::HaversinesPackedMatrix::new_in(latitudes, longitudes, alloc).map_err(|_| Error::Alloc)
+    }
+
+    fn distances<RowsAllocator: AllocatorLike, ColumnsAllocator: AllocatorLike>(
+        rows: &Self::Packed<RowsAllocator>,
+        columns: &Self::Packed<ColumnsAllocator>,
+        results: &mut [f64],
+    ) -> Result<(), Error> {
+        rows.haversines(columns, results)
+            .map_err(|_| Error::Inconsistent)
     }
 }
 
 /// WGS84 ellipsoid geodesic by Vincenty's iteration — slower, survey-grade.
 pub struct VincentyKernel;
 
-impl<Coordinate: nk::Vincenty> KernelLike<Coordinate> for VincentyKernel {
-    fn distances(
-        first_latitudes: &[Coordinate],
-        first_longitudes: &[Coordinate],
-        second_latitudes: &[Coordinate],
-        second_longitudes: &[Coordinate],
-        out: &mut [Coordinate],
-    ) -> Option<()> {
-        Coordinate::vincenty(
-            first_latitudes,
-            first_longitudes,
-            second_latitudes,
-            second_longitudes,
-            out,
-        )
+impl KernelLike for VincentyKernel {
+    type Packed<Allocator: AllocatorLike> = nk::VincentysPackedMatrix<Allocator>;
+
+    fn pack<Allocator: AllocatorLike>(
+        latitudes: &[f64],
+        longitudes: &[f64],
+        alloc: Allocator,
+    ) -> Result<Self::Packed<Allocator>, Error> {
+        nk::VincentysPackedMatrix::new_in(latitudes, longitudes, alloc).map_err(|_| Error::Alloc)
+    }
+
+    fn distances<RowsAllocator: AllocatorLike, ColumnsAllocator: AllocatorLike>(
+        rows: &Self::Packed<RowsAllocator>,
+        columns: &Self::Packed<ColumnsAllocator>,
+        results: &mut [f64],
+    ) -> Result<(), Error> {
+        rows.vincentys(columns, results)
+            .map_err(|_| Error::Inconsistent)
     }
 }
 
@@ -101,21 +116,42 @@ pub struct GeospatialMetric<Kernel, Coordinate>(
     core::marker::PhantomData<(fn() -> Kernel, Coordinate)>,
 );
 
-impl<Kernel: KernelLike<Coordinate>, Coordinate: Copy + Default + 'static> MetricLike
+impl<Kernel: KernelLike, Coordinate: Copy + Default + 'static> MetricLike
     for GeospatialMetric<Kernel, Coordinate>
 {
     type Query<'a> = &'a [Coordinate];
     type Queries<'a> = nk::MatrixView<'a, Coordinate>;
-    type Score = Coordinate;
+    type Score = f64;
 }
 
-/// Deinterleave the node column into two coordinate slices, with the shape
-/// checks every entry point repeats: the value column must be exactly two
-/// scalars wide, or the table is not geospatial at all. Returns the node count.
-fn coordinate_columns<Coordinate: nk::StorageElement + Copy>(
+/// Deinterleave `pairs` into two coordinate slices, widened to the kernels' `f64`.
+fn deinterleave<Coordinate: Copy + Into<f64>>(
+    pairs: &[Coordinate],
+    latitudes: &mut Vec<f64, impl AllocatorLike>,
+    longitudes: &mut Vec<f64, impl AllocatorLike>,
+) -> Result<(), Error> {
+    latitudes.clear();
+    longitudes.clear();
+    latitudes
+        .try_reserve(pairs.len() / 2)
+        .map_err(|_| Error::Alloc)?;
+    longitudes
+        .try_reserve(pairs.len() / 2)
+        .map_err(|_| Error::Alloc)?;
+    for &[latitude, longitude] in pairs.as_chunks::<2>().0 {
+        latitudes.push(latitude.into());
+        longitudes.push(longitude.into());
+    }
+    Ok(())
+}
+
+/// Deinterleave the node column, with the shape checks every entry point
+/// repeats: the value column must be exactly two scalars wide, or the table is
+/// not geospatial at all. Returns the node count.
+fn coordinate_columns<Coordinate: nk::StorageElement + Copy + Into<f64>>(
     table: GraphTableView<'_>,
-    node_latitudes: &mut AVec<Coordinate, impl AllocatorLike>,
-    node_longitudes: &mut AVec<Coordinate, impl AllocatorLike>,
+    node_latitudes: &mut Vec<f64, impl AllocatorLike>,
+    node_longitudes: &mut Vec<f64, impl AllocatorLike>,
 ) -> Result<usize, Error> {
     if table.value_width() != Some(2) {
         return Err(Error::WrongType);
@@ -125,84 +161,25 @@ fn coordinate_columns<Coordinate: nk::StorageElement + Copy>(
     if scalars.len() != node_count * 2 {
         return Err(Error::Inconsistent);
     }
-    node_latitudes.clear();
-    node_longitudes.clear();
-    node_latitudes
-        .try_reserve(node_count)
-        .map_err(|_| Error::Alloc)?;
-    node_longitudes
-        .try_reserve(node_count)
-        .map_err(|_| Error::Alloc)?;
-    for pair in scalars.chunks_exact(2) {
-        node_latitudes.push(pair[0]);
-        node_longitudes.push(pair[1]);
-    }
+    deinterleave(scalars, node_latitudes, node_longitudes)?;
     Ok(node_count)
 }
 
-/// One worker's broadcast scratch: a query's coordinate repeated across the
-/// node count, and the kernel's output row.
-struct BroadcastScratch<Coordinate, Allocator: AllocatorLike> {
-    query_latitudes: AVec<Coordinate, Allocator>,
-    query_longitudes: AVec<Coordinate, Allocator>,
-    distances: AVec<Coordinate, Allocator>,
-}
-
-impl<Coordinate: Copy + Default, Allocator: AllocatorLike + Clone>
-    BroadcastScratch<Coordinate, Allocator>
-{
-    fn new_in(alloc: Allocator) -> Self {
-        BroadcastScratch {
-            query_latitudes: AVec::new_in(alloc.clone()),
-            query_longitudes: AVec::new_in(alloc.clone()),
-            distances: AVec::new_in(alloc),
-        }
-    }
-
-    /// Fill the broadcast slices with one query's coordinate, `count` wide.
-    fn broadcast(
-        &mut self,
-        latitude: Coordinate,
-        longitude: Coordinate,
-        count: usize,
-    ) -> Result<(), Error> {
-        self.query_latitudes.clear();
-        self.query_longitudes.clear();
-        self.distances.clear();
-        self.query_latitudes
-            .try_reserve(count)
-            .map_err(|_| Error::Alloc)?;
-        self.query_longitudes
-            .try_reserve(count)
-            .map_err(|_| Error::Alloc)?;
-        self.distances
-            .try_reserve(count)
-            .map_err(|_| Error::Alloc)?;
-        self.query_latitudes.resize(count, latitude);
-        self.query_longitudes.resize(count, longitude);
-        self.distances.resize(count, Coordinate::default());
-        Ok(())
-    }
-}
-
-/// The batch half of any geospatial metric: owns a thread pool, the
-/// deinterleaved node columns, and one broadcast scratch per worker. There is
-/// no packed form to reuse, so every scan deinterleaves the mapped column
-/// afresh — one linear pass, dwarfed by the trigonometry behind it.
+/// The batch half of any geospatial metric: owns a thread pool, the widened
+/// node columns, and the reusable score tile. Every scan deinterleaves the
+/// mapped column afresh — one linear pass, dwarfed by the trigonometry behind it.
 pub struct GeospatialScanner<Kernel, Coordinate, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
-    node_latitudes: AVec<Coordinate, Allocator>,
-    node_longitudes: AVec<Coordinate, Allocator>,
-    workers: AVec<BroadcastScratch<Coordinate, Allocator>, Allocator>,
-    tile: Matrix<Coordinate, Allocator>,
+    node_latitudes: Vec<f64, Allocator>,
+    node_longitudes: Vec<f64, Allocator>,
+    tile: Matrix<f64, Allocator>,
     alloc: Allocator,
-    kernel: core::marker::PhantomData<fn() -> Kernel>,
+    marker: core::marker::PhantomData<fn() -> (Kernel, Coordinate)>,
 }
 
 impl<Kernel, Coordinate, Allocator> GeospatialScanner<Kernel, Coordinate, Allocator>
 where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate: Copy + Default,
+    Kernel: KernelLike,
     Allocator: AllocatorLike + Clone,
 {
     /// A scanner over the workers `scope` names, its scratch in `alloc`,
@@ -213,21 +190,19 @@ where
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         Ok(GeospatialScanner {
             pool: open_pool(scope)?,
-            node_latitudes: AVec::new_in(alloc.clone()),
-            node_longitudes: AVec::new_in(alloc.clone()),
-            workers: AVec::new_in(alloc.clone()),
+            node_latitudes: Vec::new_in(alloc.clone()),
+            node_longitudes: Vec::new_in(alloc.clone()),
             tile: Matrix::empty_in(alloc.clone()),
             alloc,
-            kernel: core::marker::PhantomData,
+            marker: core::marker::PhantomData,
         })
     }
 }
 
 impl<Kernel, Coordinate, Allocator> GeospatialScanner<Kernel, Coordinate, Allocator>
 where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate:
-        nk::StorageElement + Copy + Default + PartialOrd + ScoreLike + Send + Sync + 'static,
+    Kernel: KernelLike,
+    Coordinate: nk::StorageElement + Copy + Default + Into<f64> + Send + Sync + 'static,
     Allocator: AllocatorLike + Clone + Send + Sync,
 {
     /// Batch brute-force top-k, nearest-first — a great-circle distance is
@@ -236,7 +211,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -261,18 +236,21 @@ where
 impl<Kernel, Coordinate, Allocator> ScannerLike<GeospatialMetric<Kernel, Coordinate>>
     for GeospatialScanner<Kernel, Coordinate, Allocator>
 where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate: nk::StorageElement + Copy + Default + Send + Sync + 'static,
+    Kernel: KernelLike,
+    Coordinate: nk::StorageElement + Copy + Default + Into<f64> + Send + Sync + 'static,
     Allocator: AllocatorLike + Clone + Send + Sync,
 {
     fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
         table: GraphTableView<'_>,
-        scores: &mut Matrix<Coordinate, impl AllocatorLike + Clone>,
+        scores: &mut Matrix<f64, impl AllocatorLike + Clone>,
     ) -> Result<(), Error> {
-        let node_count =
-            coordinate_columns(table, &mut self.node_latitudes, &mut self.node_longitudes)?;
+        let node_count = coordinate_columns::<Coordinate>(
+            table,
+            &mut self.node_latitudes,
+            &mut self.node_longitudes,
+        )?;
         let query_count = queries.shape().first().copied().unwrap_or(0);
         if queries.shape().get(1) != Some(&2)
             || query_count != scores.cols()
@@ -281,51 +259,59 @@ where
             return Err(Error::Inconsistent);
         }
 
-        // One broadcast scratch per pool thread, grown on demand and reused.
-        let threads = self.pool.threads_count();
-        while self.workers.len() < threads {
-            self.workers
-                .push(BroadcastScratch::new_in(self.alloc.clone()));
+        let mut query_pairs: Vec<Coordinate> = Vec::new();
+        query_pairs
+            .try_reserve_exact(query_count * 2)
+            .map_err(|_| Error::Alloc)?;
+        for query_index in 0..query_count {
+            let query = <nk::MatrixView<'_, Coordinate> as QueryBatchLike<
+                GeospatialMetric<Kernel, Coordinate>,
+            >>::query(&queries, query_index)
+            .ok_or(Error::Inconsistent)?;
+            query_pairs.extend_from_slice(query);
         }
+        let (mut query_latitudes, mut query_longitudes) = (Vec::new(), Vec::new());
+        deinterleave(&query_pairs, &mut query_latitudes, &mut query_longitudes)?;
+        let packed_queries = Kernel::pack(&query_latitudes, &query_longitudes, self.alloc.clone())?;
 
         // Fan node CHUNKS across the pool: each task owns a contiguous block of
-        // tile rows by exclusive borrow — the borrow checker proves the
-        // disjointness, so the fan-out carries no raw tile pointer. Per query
-        // the task runs one kernel call over its whole node sub-range, so the
-        // batch length stays a chunk, not a query count: a single-query scan
-        // still feeds the SIMD lanes full spans. Four chunks per worker give
-        // the dynamic schedule slack to balance.
+        // tile rows by exclusive borrow, packs its nodes as the rows, and fills
+        // the block in one many-to-many call, so a single-query scan still runs
+        // on every worker. Four chunks per worker give the dynamic schedule
+        // slack to balance.
+        let threads = self.pool.threads_count();
         let chunk_nodes = node_count.div_ceil(threads.max(1) * 4).max(1);
-        let mut row_chunks: Vec<&mut [Coordinate]> = Vec::new();
+        let mut row_chunks: Vec<&mut [f64]> = Vec::new();
         row_chunks
             .try_reserve_exact(node_count.div_ceil(chunk_nodes))
             .map_err(|_| Error::Alloc)?;
-        row_chunks.extend(scores.as_mut_slice().chunks_mut(chunk_nodes * query_count));
+        row_chunks.extend(
+            scores
+                .as_mut_slice()
+                .chunks_mut(chunk_nodes * query_count.max(1)),
+        );
         let (node_latitudes, node_longitudes) = (&self.node_latitudes, &self.node_longitudes);
-        let queries_shared = ShareRead(&queries);
+        let packed_queries = ShareRead(&packed_queries);
+        let alloc = &self.alloc;
         let failure = OnceLock::new();
 
-        fu::fold_with_scratch(
-            &mut self.pool,
-            fu::ParallelSliceMut::new(&mut row_chunks),
-            fu::DynamicScheduler,
-            self.workers.as_mut_slice(),
-            |worker, chunk, prong| {
-                let queries = queries_shared.read();
-                let start = prong.task_index * chunk_nodes;
-                let outcome = scan_node_chunk::<Kernel, Coordinate>(
-                    worker,
-                    queries,
-                    &node_latitudes[start..],
-                    &node_longitudes[start..],
-                    chunk,
-                    query_count,
-                );
+        fu::ParallelSliceMut::new(&mut row_chunks)
+            .for_each_dynamic(&mut self.pool, |chunk, task, _thread| {
+                let start = task * chunk_nodes;
+                let end = start + chunk.len() / query_count.max(1);
+                let outcome = Kernel::pack(
+                    &node_latitudes[start..end],
+                    &node_longitudes[start..end],
+                    alloc.clone(),
+                )
+                .and_then(|packed_nodes| {
+                    Kernel::distances(&packed_nodes, packed_queries.read(), chunk)
+                });
                 if let Err(error) = outcome {
                     let _ = failure.set(error);
                 }
-            },
-        );
+            })
+            .map_err(|_| Error::Alloc)?;
 
         match failure.into_inner() {
             Some(error) => Err(error),
@@ -334,60 +320,19 @@ where
     }
 }
 
-/// One node chunk's whole block of tile rows — the body of the scan's fan-out
-/// task. Per query: broadcast the query across the chunk, one kernel call over
-/// the chunk's node sub-range, then write that query's column of the owned
-/// block — strided, but exclusively borrowed, so every write is safe.
-fn scan_node_chunk<Kernel, Coordinate>(
-    worker: &mut BroadcastScratch<Coordinate, impl AllocatorLike + Clone>,
-    queries: &nk::MatrixView<'_, Coordinate>,
-    node_latitudes: &[Coordinate],
-    node_longitudes: &[Coordinate],
-    chunk: &mut [Coordinate],
-    query_count: usize,
-) -> Result<(), Error>
-where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate: nk::StorageElement + Copy + Default + 'static,
-{
-    let chunk_nodes = chunk.len() / query_count.max(1);
-    let node_latitudes = &node_latitudes[..chunk_nodes];
-    let node_longitudes = &node_longitudes[..chunk_nodes];
-    for query_index in 0..query_count {
-        let query = <nk::MatrixView<'_, Coordinate> as QueryBatchLike<
-            GeospatialMetric<Kernel, Coordinate>,
-        >>::query(queries, query_index)
-        .ok_or(Error::Inconsistent)?;
-        worker.broadcast(query[0], query[1], chunk_nodes)?;
-        Kernel::distances(
-            &worker.query_latitudes,
-            &worker.query_longitudes,
-            node_latitudes,
-            node_longitudes,
-            &mut worker.distances,
-        )
-        .ok_or(Error::Inconsistent)?;
-        for (node, &distance) in worker.distances.iter().enumerate() {
-            chunk[node * query_count + query_index] = distance;
-        }
-    }
-    Ok(())
-}
-
 /// The traversal half of the geospatial metric: one query at a fixed node width,
-/// gathering a staged expansion's scattered coordinate pairs into one kernel call.
+/// gathering a staged expansion's scattered coordinate pairs into one pack.
 pub struct GeospatialWalker<Kernel, Coordinate, Index = u32, Allocator: AllocatorLike = Global> {
-    context: TraversalContext<Index, Coordinate, Allocator>,
-    staged_latitudes: AVec<Coordinate, Allocator>,
-    staged_longitudes: AVec<Coordinate, Allocator>,
-    broadcast: BroadcastScratch<Coordinate, Allocator>,
-    kernel: core::marker::PhantomData<fn() -> Kernel>,
+    context: TraversalContext<Index, f64, Allocator>,
+    staged_latitudes: Vec<f64, Allocator>,
+    staged_longitudes: Vec<f64, Allocator>,
+    alloc: Allocator,
+    marker: core::marker::PhantomData<fn() -> (Kernel, Coordinate)>,
 }
 
 impl<Kernel, Coordinate, Index, Allocator> GeospatialWalker<Kernel, Coordinate, Index, Allocator>
 where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate: Copy + Default,
+    Kernel: KernelLike,
     Index: IndexLike,
     Allocator: AllocatorLike + Clone,
 {
@@ -398,15 +343,15 @@ where
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
         Ok(GeospatialWalker {
             context: TraversalContext::new_in(expansion_factor, alloc.clone())?,
-            staged_latitudes: AVec::new_in(alloc.clone()),
-            staged_longitudes: AVec::new_in(alloc.clone()),
-            broadcast: BroadcastScratch::new_in(alloc),
-            kernel: core::marker::PhantomData,
+            staged_latitudes: Vec::new_in(alloc.clone()),
+            staged_longitudes: Vec::new_in(alloc.clone()),
+            alloc,
+            marker: core::marker::PhantomData,
         })
     }
 
     /// The traversal scratch, for draining results after a walk.
-    pub fn context(&mut self) -> &mut TraversalContext<Index, Coordinate, Allocator> {
+    pub fn context(&mut self) -> &mut TraversalContext<Index, f64, Allocator> {
         &mut self.context
     }
 }
@@ -414,8 +359,8 @@ where
 impl<Kernel, Coordinate, Index, Allocator> WalkerLike<GeospatialMetric<Kernel, Coordinate>>
     for GeospatialWalker<Kernel, Coordinate, Index, Allocator>
 where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate: nk::StorageElement + Copy + Default + PartialOrd + 'static,
+    Kernel: KernelLike,
+    Coordinate: nk::StorageElement + Copy + Default + Into<f64> + 'static,
     Index: IndexLike,
     Allocator: AllocatorLike + Clone,
 {
@@ -427,7 +372,7 @@ where
         query: &[Coordinate],
         table: GraphTableView<'_>,
         nodes: &[Index],
-        out: &mut [Coordinate],
+        out: &mut [f64],
     ) -> Result<(), Error> {
         if nodes.len() != out.len() || query.len() != 2 {
             return Err(Error::Inconsistent);
@@ -450,28 +395,25 @@ where
             if pair.len() != 2 {
                 return Err(Error::Inconsistent);
             }
-            self.staged_latitudes.push(pair[0]);
-            self.staged_longitudes.push(pair[1]);
+            self.staged_latitudes.push(pair[0].into());
+            self.staged_longitudes.push(pair[1].into());
         }
 
-        self.broadcast.broadcast(query[0], query[1], nodes.len())?;
-        Kernel::distances(
-            &self.broadcast.query_latitudes,
-            &self.broadcast.query_longitudes,
+        let packed_nodes = Kernel::pack(
             &self.staged_latitudes,
             &self.staged_longitudes,
-            &mut self.broadcast.distances,
-        )
-        .ok_or(Error::Inconsistent)?;
-        out.copy_from_slice(&self.broadcast.distances);
-        Ok(())
+            self.alloc.clone(),
+        )?;
+        let packed_query =
+            Kernel::pack(&[query[0].into()], &[query[1].into()], self.alloc.clone())?;
+        Kernel::distances(&packed_nodes, &packed_query, out)
     }
 
-    fn context(&mut self) -> &mut TraversalContext<Index, Coordinate, Allocator> {
+    fn context(&mut self) -> &mut TraversalContext<Index, f64, Allocator> {
         &mut self.context
     }
 
-    fn compare(a: Coordinate, b: Coordinate) -> Ordering {
+    fn compare(a: f64, b: f64) -> Ordering {
         Ranking::Nearest.compare(a, b)
     }
 
@@ -495,9 +437,8 @@ pub struct GeospatialSearcher<Kernel, Coordinate, Allocator: AllocatorLike = Glo
 
 impl<Kernel, Coordinate, Allocator> GeospatialSearcher<Kernel, Coordinate, Allocator>
 where
-    Kernel: KernelLike<Coordinate>,
-    Coordinate:
-        nk::StorageElement + Copy + Default + PartialOrd + ScoreLike + Send + Sync + 'static,
+    Kernel: KernelLike,
+    Coordinate: nk::StorageElement + Copy + Default + Into<f64> + Send + Sync + 'static,
     Allocator: AllocatorLike + Clone + Send,
 {
     /// A searcher walking with breadth `expansion_factor` across the workers
@@ -522,7 +463,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Coordinate>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -633,7 +574,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> HaversineScannerAny<Allocat
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -691,7 +632,7 @@ impl<Allocator: AllocatorLike + Clone + Send> HaversineSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -740,7 +681,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> VincentyScannerAny<Allocato
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -798,7 +739,7 @@ impl<Allocator: AllocatorLike + Clone + Send> VincentySearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -900,8 +841,7 @@ mod tests {
 
         let query = berlin();
         let queries =
-            nk::Matrix::<f64>::try_from_scalars(&[query[0] as f32, query[1] as f32], &[1, 2])
-                .unwrap();
+            nk::Matrix::<f64>::from_scalars(&[query[0] as f32, query[1] as f32], &[1, 2]).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(1, 3);
         scanner
             .scan(
@@ -929,8 +869,7 @@ mod tests {
 
         let query = berlin();
         let queries =
-            nk::Matrix::<f64>::try_from_scalars(&[query[0] as f32, query[1] as f32], &[1, 2])
-                .unwrap();
+            nk::Matrix::<f64>::from_scalars(&[query[0] as f32, query[1] as f32], &[1, 2]).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(1, 3);
         searcher
             .search(
@@ -955,8 +894,7 @@ mod tests {
 
         let query = berlin();
         let queries =
-            nk::Matrix::<f64>::try_from_scalars(&[query[0] as f32, query[1] as f32], &[1, 2])
-                .unwrap();
+            nk::Matrix::<f64>::from_scalars(&[query[0] as f32, query[1] as f32], &[1, 2]).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(1, 3);
         scanner
             .scan(
@@ -991,7 +929,7 @@ mod tests {
             coordinates.push((city.0 as f64).to_radians() as f32);
             coordinates.push((city.1 as f64).to_radians() as f32);
         }
-        let queries = nk::Matrix::<f64>::try_from_scalars(&coordinates, &[8, 2]).unwrap();
+        let queries = nk::Matrix::<f64>::from_scalars(&coordinates, &[8, 2]).unwrap();
 
         let run = |scope: ExecutionScope| {
             let mut scanner = HaversineScanner::<f64>::new(scope, Global).unwrap();
@@ -1089,7 +1027,7 @@ mod tests {
 
         let table = crate::GraphTable::build(&Triples, None).unwrap();
         let mut scanner = HaversineScanner::<f64>::new(ExecutionScope::Serial, Global).unwrap();
-        let queries = nk::Matrix::<f64>::try_from_scalars(&[0.0f32, 0.0], &[1, 2]).unwrap();
+        let queries = nk::Matrix::<f64>::from_scalars(&[0.0f32, 0.0], &[1, 2]).unwrap();
         let (mut matches, mut distances, mut counts) = outputs(1, 1);
         assert!(matches!(
             scanner.scan(

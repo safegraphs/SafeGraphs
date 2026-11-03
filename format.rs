@@ -207,14 +207,6 @@ impl ScoreLike for usize {
     }
 }
 
-/// An alignment score is bounded by the longer input's length times the largest
-/// `i8` cost, so like [`usize`] it sits far inside the mantissa.
-impl ScoreLike for isize {
-    fn widen(self) -> f64 {
-        self as f64
-    }
-}
-
 /// The offsets buffer of an irregular column, holding its prefix sums.
 #[derive(Clone, Copy)]
 pub struct IrregularOffsets {
@@ -247,7 +239,7 @@ pub enum Shape {
     /// `rows × cols` per node. `rows == 0` is the ragged case: the row count
     /// varies per node (maxsim `[*, dim]`), so the byte layout is `Irregular`
     /// and the reader recovers the count from the row's byte extent ÷ `cols`.
-    /// A fixed `rows > 0` (mesh `[points, 3]`) is `Regular { width: rows*cols }`.
+    /// A fixed `rows > 0` (a cloud `[points, 3]`) is `Regular { width: rows*cols }`.
     Matrix(usize, usize),
 }
 
@@ -280,7 +272,7 @@ impl Shape {
         }
     }
 
-    /// The inner (fixed) axis of a `Matrix` — `3` for a mesh cloud, `dim` for a
+    /// The inner (fixed) axis of a `Matrix` — `3` for a point cloud, `dim` for a
     /// maxsim multi-vector. `None` for the vector-shaped families.
     pub const fn inner(self) -> Option<usize> {
         match self {
@@ -582,8 +574,8 @@ impl<Element: ElementLike> Column<Element> {
                 // never carry is a __fixed__ shape: `Vector(n)` or
                 // `Matrix(rows > 0, _)` claims a constant row width this layout
                 // contradicts, and a metric trusting the shape alone would
-                // mis-stride the buffer — `mesh` reads `value_buffer()` at
-                // `points * 3` strides on exactly that strength.
+                // mis-stride the buffer — `geospatial` reads `value_buffer()` at
+                // two-scalar strides on exactly that strength.
                 if !matches!(shape, Shape::Scalar | Shape::Matrix(0, _)) {
                     return Err(Error::Inconsistent);
                 }
@@ -1291,7 +1283,7 @@ pub trait GraphLike {
     }
 
     /// The value column's logical [`Shape`], or None if the producer declares
-    /// none. Rank-2 families (mesh, maxsim) read the second axis from it; the
+    /// none. Rank-2 families (shapes, maxsim) read the second axis from it; the
     /// vector-shaped families call [`value_width`](GraphLike::value_width).
     fn value_shape(&self) -> Option<Shape>;
 
@@ -1900,6 +1892,41 @@ mod tests {
         let header = core::str::from_utf8(&bytes[16..16 + header_len]).unwrap();
         assert!(header.contains("\"data\":["));
         assert!(header.contains("\"offsets\":["));
+    }
+
+    /// A monolith exactly as USearch writes one: string-valued metadata, UUID keys
+    /// holding the row number big-endian in their last 8 bytes, and a ragged `f16`
+    /// point-cloud column whose `u64` offsets count scalars, three per point.
+    #[test]
+    fn a_usearch_monolith_opens() {
+        let header = br#"{"__metadata__":{"alignment":4096,"metric":"chamfer","created_by":"usearch","connectivity":"32","points":"0"},"key":{"dtype":"uuid","data":[0,32]},"value":{"dtype":"f16","shape":[0,3],"offsets_dtype":"u64","offsets":[4096,4120],"data":[8192,8210]},"neighbors":{"dtype":"u32","offsets_dtype":"u64","offsets":[12288,12312],"data":[16384,16392]}}"#;
+        // USearch pads the header with spaces so the data segment starts aligned.
+        let segment = 4096;
+        let mut file = MAGIC.to_vec();
+        file.extend_from_slice(&(segment as u64 - 16).to_le_bytes());
+        file.extend_from_slice(header);
+        file.resize(segment, b' ');
+        file.resize(segment + 16392, 0);
+        let mut write = |at: usize, bytes: &[u8]| {
+            file[segment + at..segment + at + bytes.len()].copy_from_slice(bytes)
+        };
+        write(24, &1u64.to_be_bytes());
+        for (slot, offset) in [0u64, 3, 9].iter().enumerate() {
+            write(4096 + slot * 8, &offset.to_le_bytes());
+        }
+        for (slot, offset) in [0u64, 1, 2].iter().enumerate() {
+            write(12288 + slot * 8, &offset.to_le_bytes());
+        }
+        write(16384, &[1, 0, 0, 0, 0, 0, 0, 0]);
+
+        let table = GraphTable::from_bytes(&file).unwrap();
+        assert_eq!(table.metric(), Some("chamfer"));
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.value_shape(), Some(Shape::Matrix(0, 3)));
+        assert_eq!(table.value(0).len(), 3 * 2);
+        assert_eq!(table.value(1).len(), 6 * 2);
+        assert_eq!(table.key(1)[8..], 1u64.to_be_bytes());
+        assert_eq!(table.neighbors(0).as_slice::<u32>(), Some(&[1u32][..]));
     }
 
     /// An alignment that is not a power of two is refused, whether it is above

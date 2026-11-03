@@ -3,6 +3,7 @@
 SafeGraphs is the SafeTensors of graphs — a simple format to exchange graph-shaped search indexes between CPUs, GPUs, and machines.
 It's designed as an interoperability layer between NSW, Cagra, and similar algorithms, often used in vector databases for approximate nearest neighbor search, or ANNS.
 It aims to be simple, efficient, and easy to implement across different programming languages and platforms.
+Exchanging a graph requires only its keys, values, and neighbor lists, with no knowledge of how it was built or how it will be searched.
 
 ## Design Philosophy
 
@@ -17,7 +18,7 @@ This immediately cuts out compression schemes like [Snappy](https://github.com/g
 
 __Extensibility__.
 Modern ML leans on mixed-precision arithmetic — `f16`, `bf16`, `i8`, and custom floating-point formats like `e4m3` and `e5m2` — over payloads that range from dense vectors to variable-length and sparse arrays.
-SafeGraphs should absorb new element types, metrics, and traversal mechanisms without breaking file readability.
+SafeGraphs should absorb new element types without breaking file readability, while applications choose their own scoring and traversal methods.
 
 __Easy Distribution__.
 Two file layouts are supported: a single-file ["Monolith"](#monolith), or a `.safegraphs.json` manifest over a ["Distributed"](#distributed) array of `.safegraphs` shards.
@@ -27,8 +28,8 @@ The second is optimal for distributing billion-scale indexes.
 __Easy to Traverse & Evaluate__.
 Optimal search indexes are asymptotically hard to build.
 But it doesn't mean analyzing or evaluating them should be equally hard.
-This repository comes with built-in extensions for greedy graph traversals using some common metrics.
-The walk is best-first over the metric itself — the degenerate A* whose path cost is zero — restarting from fresh landmarks whenever a frontier drains before the result pool fills.
+This repository includes an optional [search extension](search/README.md) for scoring values and traversing graphs.
+Its algorithms and supported operations are independent of the file format.
 
 __Least Machinery__.
 A format cannot know a consumer's page size, its storage device, or whether it will scan or walk, and the layer above knows all three.
@@ -50,7 +51,7 @@ __Do__:
 - Write every integer little-endian.
 - Keep every file memory-mappable, so a reader takes typed slices straight out of the data segment.
 - Keep every shard of a Distributed index a complete Monolith whose edges stay inside it.
-- Let the manifest route and size shards, and leave the schema and the metric to each shard's own header.
+- Let the manifest route and size shards, and leave the schema and optional metadata to each shard's own header.
 
 __Don't__:
 
@@ -110,13 +111,14 @@ A producer targeting Apple Silicon can raise `alignment` to 16384, or to 2 MB fo
 
 A flat graph has three graph columns — `key`, `value`, and `neighbors` — and every one of them is required.
 Any other top-level key except `__metadata__` is a column in the same grammar with the same node count, which a producer writes for its own use and a graph reader ignores.
-One such column is standard, [`norms`](#norms), so producers that write it agree on what it holds.
+For example, an application can carry cached vector norms alongside the values as an extra column, with a name and meaning it defines.
+[Metric metadata](#metrics) and extra columns are optional; neither is needed to read, write, or exchange the graph.
 
 ```json
 {
   "__metadata__": {
-    "metric": "dot",                # optional; the registered name the graph was built for, see Metrics
-    "expansion": 128,               # optional; the breadth the graph was built with, `ef_construction` by its usual name
+    "metric": "dot",                # optional scoring metadata; interpreted by the application
+    "expansion": 128,               # optional construction metadata; interpreted by the application
     "alignment": 4096,              # buffer alignment in bytes; a power of two, default 4096, floor 64
     "created_by": "usearch 3.x",    # free-form provenance, and anything else a producer wants to record
     "built_at": "2026-07-19"
@@ -170,7 +172,7 @@ Arrow's offsets are signed but never negative, so an Arrow `List` or `LargeList`
 
 `dtype` names one element, and every storage width has a neutral spelling `b128`, `b64`, `b32`, `b16`, `b8` naming that many opaque bits.
 Every other spelling is an alias that adds a reading to the same width: the floats `f64`, `f32`, `bf16`, `f16`, `e5m2`, `e4m3`, `e3m2`, `e2m3`; the signed integers `i64`, `i32`, `i16`, `i8`, `i4x2`; the unsigned `u64`, `u32`, `u16`, `u8`, `u4x2`, `u1x8`; `uuid` for a 16-byte identity; and `utf8` for bytes a reader may assume are valid UTF-8.
-A column of opaque bytes that are not text uses `b8`, which a sequence metric refuses where `utf8` it accepts.
+A column of opaque bytes that are not text uses `b8`.
 The `x2` and `x8` suffixes name packed sub-byte elements, two nibbles or eight bits to the byte, so `shape` counts logical elements and a row of `shape` such elements occupies `shape × bits / 8` bytes rounded up.
 
 A concrete variable-degree `neighbors` column, with 3 nodes of degree 2, 3, and 1:
@@ -203,34 +205,13 @@ All text is UTF-8, so any language or emoji round-trips without a codepage, and 
 
 ### Metrics
 
-`__metadata__.metric` names the metric the graph was built for, since a walk is only meaningful under that one.
-A name is spelled as the kernel library that defines it spells it: NumKong's kernels keep their underscores, and the sequence metrics keep the hyphens of the algorithms they name.
+`__metadata__.metric` is __optional__ metadata describing how an application scores values.
+The producer and consumer agree on its meaning; the format prescribes no metric registry, kernel library, or naming convention.
+A file reader can preserve it without interpreting it, and an absent or unfamiliar metric does not prevent graph exchange.
+Construction parameters and traversal choices likewise belong to the application.
 
-- __Dense__: `dot`, `vdot`, `angular`, `euclidean`, `sqeuclidean`, `bilinear`, `mahalanobis`, `kld`, `jsd`.
-- __Binary and sparse sets__: `hamming`, `jaccard`, `sparse_dot`, `sparse_intersect`.
-- __Geospatial__: `haversine`, `vincenty`.
-- __Meshes__: `rmsd`, `kabsch`, `umeyama`.
-- __Late interaction__: `maxsim`.
-- __Sequences__: `levenshtein`, `levenshtein-utf8`, `needleman-wunsch`, `smith-waterman`.
-
-A reader refuses a name it does not recognize, and refuses by name a registered one it cannot score, rather than walking under a substitute.
-`sqeuclidean` orders nodes exactly as `euclidean` does, so a reader may serve either with the other's kernel; the reference reader scores both as `euclidean`.
-It has no kernel yet for `vdot`, `bilinear`, `mahalanobis`, `kld`, `jsd`, `sparse_dot`, or `sparse_intersect`.
-
-### Norms
-
-A `norms` column holds two numbers per node: the sum of its `value` elements, then the sum of their squares.
-It is a regular column of `shape` 2, in the dtype the value's dot products accumulate in, such as `i32` for `i8` values or `f32` for `f16` ones.
-With it a reader finishes an angular or Euclidean score from a dot product alone, or compensates a quantized one, without a second pass over the values.
-It is optional, and a reader that does not use it ignores it like any other extra column.
-
-```json
-"norms": {
-  "dtype": "f32",
-  "shape": 2,               # sum, then sum of squares
-  "data": [64320000000, 64480000000]   # 20M nodes × 2 × f32
-}
-```
+The optional search extension has its own supported metric names and rejects unsupported ones when asked to score values.
+That is a search capability limit, not a file validity rule.
 
 ### Distributed
 
@@ -248,7 +229,7 @@ dataset.safegraphs.json                  manifest: path, keys, bytes, nodes, sha
 `safetensors` has no cross-file convention of its own, since it is single-file.
 Hugging Face's sharded layout adds one on top, an index binding each tensor to its shard, which splits by column where this manifest splits by row.
 It carries routing in `path` and `keys`, sizing in `bytes` and `nodes`, and integrity in `sha256`.
-It carries no column schema, no metric, and no provenance, all of which live in each shard's own `__metadata__`, so a shard lifted out of the set still describes itself completely.
+Each shard's header carries its own column schema and any optional metric or provenance metadata, so a shard lifted out of the set still describes itself completely.
 
 ```json
 {
@@ -300,28 +281,45 @@ FAISS `IndexShards`, independent sub-indexes with their own row spaces merged at
 ### BERT-like Dense Document Embeddings
 
 Points are stored as fixed-size `value` arrays representing high-dimensional vectors, and the graph links spatial neighbors.
-The reference reader ranks them with NumKong's `Dot` and `Spatial` metrics, and their pairwise batch forms for bulk scans.
+Applications can rank them by dot product, cosine similarity, or Euclidean distance.
+
+> See `numkong::Dot`, `numkong::Angular`, `numkong::Euclidean`, `numkong::Dots`, `numkong::Angulars`, and `numkong::Euclideans`.
 
 ### DNA, RNA, and Protein Strings
 
 Biological sequences are stored as `utf8` values, one strand per node, over a graph whose edges link similar sequences.
-The reference reader scores those edges with StringZilla's sequence metrics: Levenshtein for edit distance, and Needleman-Wunsch and Smith-Waterman for global and local alignment.
+Applications choose the edit distance or alignment score appropriate to their sequences.
+
+> See `stringzilla::LevenshteinEngine`, `stringzilla::LevenshteinSymbol::Bytes`, and `stringzilla::LevenshteinSymbol::Runes`.
 
 ### Haversine & Vincenty Search
 
 Points are stored as 2D `value` vectors of `f32` or `f64` coordinates, and the graph links geospatial neighbors.
-The reference reader ranks them with NumKong's geospatial metrics, so haversine and Vincenty distances drive the traversal.
+Applications can compare locations using haversine or Vincenty distances.
+
+> See `numkong::HaversinesPackedMatrix` and `numkong::VincentysPackedMatrix`.
 
 ### Binary and Weighted Sparse Feature Sets
 
 Sparse, high-dimensional features are stored per node as a variable-length `value` column of index and weight pairs, rather than a dense vector.
-Scoring is NumKong's sparse dot product, so only the handful of non-zero dimensions each node carries drive the traversal.
+Applications can compare the non-zero dimensions directly using sparse dot products or set overlap.
 This fits bag-of-words retrieval, learned-sparse models like SPLADE, and one-hot categorical signals from recommender and ranking systems.
+
+> See `numkong::Hamming`, `numkong::Jaccard`, `numkong::SparseDot`, and `numkong::SparseIntersect`.
+
+### Molecular Conformers and 3D Shapes
+
+Each entry is a point cloud of any size, stored as a `[0, 3]` `value` column of interleaved coordinates whose `offsets` count scalars, three per point.
+Applications choose how to align and compare the clouds, with or without point correspondence.
+
+> See `numkong::ShapesPackedMatrix::chamfers` and `numkong::ShapesPackedMatrix::hausdorffs`.
 
 ### ColBERT Late-Interaction Multi-Vector Entries
 
 Each entry is a bag of per-token embeddings, a multi-vector, stored as a `[0, dim]` `value` column, one small matrix per node with as many rows as tokens.
-The reference reader scores late interaction with NumKong's MaxSim: every query token is matched to its most similar entry token, and those best matches are summed into the entry's score.
+Applications can score late interaction by matching every query token to its most similar entry token and summing those best matches.
+
+> See `numkong::MaxSim` and `numkong::MaxSimPackedMatrix`.
 
 ## Where It Fits
 

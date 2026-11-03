@@ -1,6 +1,7 @@
 [package]
 name = "safegraphs"
 version = "0.1.0"
+rust-version = "1.100"
 edition = "2021"
 license = "Apache-2.0"
 description = "The SafeTensors of graphs: a memory-mappable interchange format for flat search graphs"
@@ -24,39 +25,25 @@ memmap2 = "0.9"
 allocator-api2 = "0.4"
 
 # Allocator-aware JSON parser for the header, keeping strings as zero-copy spans.
-jsontape = { path = "../JsonTape" }
-
-# Variable-length string and list tapes: offsets + concatenated bytes, matching
-# the on-disk offsets_* / values_* layout of utf8 and variable-degree columns.
-# Declared from the registry, not from git, because StringZilla declares it that
-# way too: a git source here would resolve to a second, distinct crate, and our
-# `BytesTapeView` would then not be the type StringZilla's `AnyBytesTape` holds.
-stringtape = "2.4"
+jsontape = "0.1"
 
 # Pulled in only by the `search` feature.
 
 # NumKong scoring kernels: Dot, Spatial, Cosine, Hamming, Jaccard, geospatial,
-# MaxSim for late interaction, and Kabsch/Umeyama for point meshes. `parallel`
-# gates the whole `DotsPackedParallelOps` surface — without it the pool-taking
-# kernels a dense scanner drives are compiled out entirely.
-numkong = { git = "https://github.com/ashvardanian/NumKong", branch = "main-v8", features = [
-    "parallel",
-], optional = true }
+# MaxSim for late interaction, and Chamfer and Hausdorff for point clouds.
+# `parallel` gates the whole `DotsPackedParallelOps` surface — without it the
+# pool-taking kernels a dense scanner drives are compiled out entirely.
+numkong = { version = "8.0.0-rc.1", features = ["parallel"], optional = true }
 
-# StringZilla sequence scoring: Levenshtein, Needleman-Wunsch, Smith-Waterman,
-# plus sha256 for manifest integrity. `cpus` gates the `szs` module, which is
-# where every batch engine, `DeviceScope`, and `UnifiedMat` lives; add `cuda`
-# alongside it to move the same engines onto a GPU.
-stringzilla = { git = "https://github.com/ashvardanian/StringZilla", features = [
-    "cpus",
-], optional = true }
+# StringZilla sequence scoring: Levenshtein over bytes and over UTF-8 runes,
+# through its `LevenshteinEngine`. The default `std` feature is all the CPU needs.
+stringzilla = { version = "6.0.0-rc.1", optional = true }
 
 # ForkUnion structured parallelism, fanning scans across queries and shards.
-# Declared from the registry for the same reason as `stringtape`, and with sharper
-# consequences: NumKong and StringZilla both declare `forkunion = "3.0"` there, and
-# the crate carries `links = "forkunion"`. A git source here is a second, distinct
-# package claiming the same native library, which Cargo refuses to resolve at all.
-forkunion = { version = "3.0", optional = true }
+# Declared from the registry, not from git: NumKong declares `forkunion` there
+# too, and the crate carries `links = "forkunion"`. A git source here is a second,
+# distinct package claiming the same native library, which Cargo refuses to resolve.
+forkunion = { version = "4.0.0-rc.1", optional = true }
 
 # Argument parsing and glob expansion for the `sg` binary alone — the library
 # stays free of both. `clap`'s derive is an attribute macro on our types, not a

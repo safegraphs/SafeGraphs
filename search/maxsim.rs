@@ -10,10 +10,10 @@
 //! The score is NumKong's late interaction — `Σᵢ minⱼ angular(qᵢ, dⱼ)`, an
 //! __angular distance sum__ (`maxsim/serial.h` accumulates `1 - cosine`, clamped
 //! at zero), so smaller is better and the family ranks nearest-first like
-//! Euclidean, Geospatial, and Mesh. The Rust wrapper's "max cosine" wording
+//! Euclidean, Geospatial, and Shapes. The Rust wrapper's "max cosine" wording
 //! describes the same argmin, not the returned value's direction.
 //!
-//! Scoring is a __whole-multi-vector reduction__ per cell, like Mesh: the scan
+//! Scoring is a __whole-multi-vector reduction__ per cell, like Shapes: the scan
 //! packs every node once per call, then fans queries across the pool with one
 //! packed-query scratch per worker, exactly the schedule Geospatial uses.
 
@@ -24,10 +24,12 @@ use super::{
 };
 use crate::search::dense::matrix_view;
 use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, Shape};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
+use allocator_api2::alloc::Allocator as TableAllocatorLike;
+use core::alloc::Allocator as AllocatorLike;
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
+use std::alloc::Global;
 use std::sync::OnceLock;
 
 // region: Metric
@@ -130,7 +132,7 @@ where
         return Err(Error::Inconsistent);
     }
     let view = matrix_view(scalars, depth)?;
-    packed.try_pack_into(&view).map_err(|_| Error::Alloc)
+    packed.pack_into(&view).map_err(|_| Error::Alloc)
 }
 
 // endregion: Metric
@@ -159,7 +161,7 @@ where
     ///
     /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(MaxSimScanner {
             pool: open_pool(scope)?,
             packed_queries: Vec::new(),
@@ -182,7 +184,7 @@ where
     pub fn scan(
         &mut self,
         queries: MaxSimBatch<'_, Scalar>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -235,7 +237,7 @@ where
             )
             .ok_or(Error::Inconsistent)?;
             let view = matrix_view(query, depth)?;
-            packed.try_pack_into(&view).map_err(|_| Error::Alloc)?;
+            packed.pack_into(&view).map_err(|_| Error::Alloc)?;
         }
 
         // One packed-node scratch per pool thread — the node side is streamed,
@@ -262,11 +264,11 @@ where
             fu::ParallelSliceMut::new(&mut rows),
             fu::DynamicScheduler,
             self.workers.as_mut_slice(),
-            |packed_node, row, prong| {
+            |packed_node, row, task, _thread| {
                 let outcome = scan_one_node::<Scalar, Allocator>(
                     packed_node,
                     *table_shared.read(),
-                    prong.task_index,
+                    task,
                     depth,
                     packed_queries,
                     row,
@@ -275,7 +277,8 @@ where
                     let _ = failure.set(error);
                 }
             },
-        );
+        )
+        .map_err(|_| Error::Alloc)?;
 
         match failure.into_inner() {
             Some(error) => Err(error),
@@ -286,7 +289,7 @@ where
 
 /// Grow `packed` to hold `count` reusable packed matrices, never shrinking the
 /// buffers already there — the decode-loop reuse contract NumKong's own
-/// `try_reserve`/`try_pack_into` pair is built for. Fallible throughout, so an
+/// `try_reserve`/`pack_into` pair is built for. Fallible throughout, so an
 /// out-of-memory scan returns [`Error::Alloc`] instead of aborting on a
 /// `Vec::push`.
 fn grow_packed<Scalar, Allocator>(
@@ -332,7 +335,7 @@ where
     pack_multi_vector(table.value(node), depth, packed_node)?;
     for (cell, packed_query) in row.iter_mut().zip(packed_queries) {
         *cell = packed_query
-            .try_score(packed_node)
+            .score(packed_node)
             .map_err(|_| Error::Inconsistent)?
             .into();
     }
@@ -362,7 +365,7 @@ where
     ///
     /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(MaxSimWalker {
             context: TraversalContext::new_in(expansion_factor, alloc.clone())?,
             packed_query: nk::MaxSimPackedMatrix::empty_in(alloc.clone()),
@@ -403,7 +406,7 @@ where
         }
         let view = matrix_view(query, depth)?;
         self.packed_query
-            .try_pack_into(&view)
+            .pack_into(&view)
             .map_err(|_| Error::Alloc)?;
 
         for (slot, &node) in out.iter_mut().zip(nodes) {
@@ -411,7 +414,7 @@ where
             pack_multi_vector(table.value(index), depth, &mut self.packed_node)?;
             *slot = self
                 .packed_query
-                .try_score(&self.packed_node)
+                .score(&self.packed_node)
                 .map_err(|_| Error::Inconsistent)?
                 .into();
         }
@@ -472,7 +475,7 @@ where
     pub fn search(
         &mut self,
         queries: MaxSimBatch<'_, Scalar>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -553,7 +556,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimScannerAny<Allocator>
         &mut self,
         query_bytes: &[u8],
         token_offsets: &[usize],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -624,7 +627,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> MaxSimSearcherAny<Allocator
         &mut self,
         query_bytes: &[u8],
         token_offsets: &[usize],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],

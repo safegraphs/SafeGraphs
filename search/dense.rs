@@ -41,10 +41,12 @@ use super::{
     TraversalContext, WalkerLike,
 };
 use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
+use allocator_api2::alloc::Allocator as TableAllocatorLike;
+use core::alloc::Allocator as AllocatorLike;
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
+use std::alloc::Global;
 
 /// A zero-copy `rows × width` view over caller-owned scalars, where `width` is a
 /// count of logical elements. For a sub-byte scalar like `i4x2` or `u1x8` that is
@@ -73,13 +75,14 @@ where
     // `[count, width]` with byte strides describes exactly that extent — the
     // innermost stride is one storage element, the row stride its packed width —
     // and the view borrows `rows` for `'_`.
-    Ok(unsafe {
+    unsafe {
         nk::MatrixView::<Value>::from_raw_parts(
             rows.as_ptr(),
             &[count, width],
             &[storage_per_row as isize * size, size],
         )
-    })
+    }
+    .map_err(|_| Error::Inconsistent)
 }
 
 /// The table's value column as a zero-copy `nodes × width` matrix, `width` in
@@ -107,14 +110,14 @@ pub struct DotScanner<Value: nk::Dots + nk::Dot, Allocator: AllocatorLike = Glob
 
 impl<Value: nk::Dots + nk::Dot, Allocator: AllocatorLike + Clone> DotScanner<Value, Allocator> {
     /// A scanner over the workers `scope` names, the caller included, on a pool
-    /// it builds and owns, its packed query in `alloc` — NumKong bridges every
-    /// `allocator_api2` allocator into its own trait, so no adapter appears
-    /// here. NumKong is CPU-only, so a GPU scope is refused.
+    /// it builds and owns, its packed query in `alloc` — NumKong takes the
+    /// standard `Allocator` this module does, so no adapter appears here.
+    /// NumKong is CPU-only, so a GPU scope is refused.
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
         // NumKong's own workers claim AMX tile state themselves, but the calling
         // thread also participates in a dispatch, so it must claim it too — the
         // packed integer kernels trap without it.
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(DotScanner {
             pool: open_pool(scope)?,
             packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
@@ -158,7 +161,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -198,7 +201,7 @@ where
     /// graph at walk time — and no scope: a leaf never executes a batch, its
     /// per-expansion scoring runs inline on whichever thread walks it.
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(DotWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
@@ -261,7 +264,7 @@ where
         }
 
         self.packed
-            .try_pack_parallel_into(&query_view, &mut self.pool)
+            .pack_parallel_into(&query_view, &mut self.pool)
             .map_err(|_| Error::Inconsistent)?;
 
         // NumKong computes `values × queriesᵀ`, which is exactly the tile's own
@@ -275,8 +278,9 @@ where
                 &[node_count, query_count],
                 &[query_count as isize * element, element],
             )
-        };
-        nk::DotsPackedParallelOps::try_dots_packed_parallel_into(
+        }
+        .map_err(|_| Error::Inconsistent)?;
+        nk::DotsPackedParallelOps::dots_packed_parallel_into(
             &values,
             &self.packed,
             &mut tile,
@@ -312,7 +316,7 @@ where
         for (slot, &node) in out.iter_mut().zip(nodes) {
             let index: usize = node.try_into().map_err(|_| Error::TooLarge)?;
             let value: &[Value] = cast(table.value(index)).ok_or(Error::WrongType)?;
-            *slot = <Value as nk::Dot>::dot(query, value).ok_or(Error::Inconsistent)?;
+            *slot = <Value as nk::Dot>::dot(query, value).map_err(|_| Error::Inconsistent)?;
         }
         Ok(())
     }
@@ -366,7 +370,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -440,7 +444,7 @@ impl<Value: nk::Dots + nk::Euclidean, Allocator: AllocatorLike + Clone>
     /// A scanner over the workers `scope` names, its packed query in `alloc`,
     /// uniform with [`DotScanner::new`].
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(EuclideanScanner {
             pool: open_pool(scope)?,
             packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
@@ -461,7 +465,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -499,7 +503,7 @@ where
     /// A searcher walking with breadth `expansion_factor`, its scratch in
     /// `alloc`, uniform with [`DotWalker::new`].
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(EuclideanWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
@@ -555,7 +559,7 @@ where
         }
 
         self.packed
-            .try_pack_parallel_into(&query_view, &mut self.pool)
+            .pack_parallel_into(&query_view, &mut self.pool)
             .map_err(|_| Error::Inconsistent)?;
 
         // Node-major, contiguous rows — exactly as the dot scan, since the output
@@ -567,8 +571,9 @@ where
                 &[node_count, query_count],
                 &[query_count as isize * element, element],
             )
-        };
-        nk::EuclideansPackedParallelOps::try_euclideans_packed_parallel_into(
+        }
+        .map_err(|_| Error::Inconsistent)?;
+        nk::EuclideansPackedParallelOps::euclideans_packed_parallel_into(
             &values,
             &self.packed,
             &mut tile,
@@ -607,7 +612,8 @@ where
             let value: &[Value] = cast(table.value(index)).ok_or(Error::WrongType)?;
             // The true distance, not the squared one, so its type and value match
             // the batch `Euclideans` kernel the scan uses — scan and walk agree.
-            *slot = <Value as nk::Euclidean>::euclidean(query, value).ok_or(Error::Inconsistent)?;
+            *slot = <Value as nk::Euclidean>::euclidean(query, value)
+                .map_err(|_| Error::Inconsistent)?;
         }
         Ok(())
     }
@@ -664,7 +670,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -740,7 +746,7 @@ impl<Value: nk::Dots + nk::Angular, Allocator: AllocatorLike + Clone>
     /// A scanner over the workers `scope` names, its packed query in `alloc`,
     /// uniform with [`DotScanner::new`].
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(AngularScanner {
             pool: open_pool(scope)?,
             packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
@@ -761,7 +767,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -799,7 +805,7 @@ where
     /// A searcher walking with breadth `expansion_factor`, its scratch in
     /// `alloc`, uniform with [`DotWalker::new`].
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(AngularWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
@@ -855,7 +861,7 @@ where
         }
 
         self.packed
-            .try_pack_parallel_into(&query_view, &mut self.pool)
+            .pack_parallel_into(&query_view, &mut self.pool)
             .map_err(|_| Error::Inconsistent)?;
 
         // Node-major, contiguous rows, as every dense scan; only the kernel differs.
@@ -866,8 +872,9 @@ where
                 &[node_count, query_count],
                 &[query_count as isize * element, element],
             )
-        };
-        nk::AngularsPackedParallelOps::try_angulars_packed_parallel_into(
+        }
+        .map_err(|_| Error::Inconsistent)?;
+        nk::AngularsPackedParallelOps::angulars_packed_parallel_into(
             &values,
             &self.packed,
             &mut tile,
@@ -903,7 +910,8 @@ where
         for (slot, &node) in out.iter_mut().zip(nodes) {
             let index: usize = node.try_into().map_err(|_| Error::TooLarge)?;
             let value: &[Value] = cast(table.value(index)).ok_or(Error::WrongType)?;
-            *slot = <Value as nk::Angular>::angular(query, value).ok_or(Error::Inconsistent)?;
+            *slot =
+                <Value as nk::Angular>::angular(query, value).map_err(|_| Error::Inconsistent)?;
         }
         Ok(())
     }
@@ -960,7 +968,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1099,7 +1107,7 @@ impl<Allocator: AllocatorLike + Clone> DotScannerAny<Allocator> {
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1289,7 +1297,7 @@ impl<Allocator: AllocatorLike + Clone + Send> DotSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1446,7 +1454,7 @@ impl<Allocator: AllocatorLike + Clone> EuclideanScannerAny<Allocator> {
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1649,7 +1657,7 @@ impl<Allocator: AllocatorLike + Clone + Send> EuclideanSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1799,7 +1807,7 @@ impl<Allocator: AllocatorLike + Clone> AngularScannerAny<Allocator> {
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -2002,7 +2010,7 @@ impl<Allocator: AllocatorLike + Clone + Send> AngularSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -2104,13 +2112,13 @@ mod tests {
 
     /// Three nodes whose values are held in dtype `T` in a NumKong matrix, so one
     /// fixture serves every scalar — float, minifloat, integer, nibble, or packed
-    /// bit. [`try_from_scalars`] packs the logical `f32` rows into `T` in whatever
+    /// bit. [`from_scalars`] packs the logical `f32` rows into `T` in whatever
     /// layout the scalar demands, so a sub-byte `i4x2` or `u1x8` builds the same way
     /// a byte type does, and the matrix carries its own logical width. Fully
     /// connected at degree two, so a walk from any landmark reaches all three; degree
     /// zero gives an edgeless graph.
     ///
-    /// [`try_from_scalars`]: nk::Matrix::try_from_scalars
+    /// [`from_scalars`]: nk::Matrix::from_scalars
     struct Ring<Value: nk::FloatConvertible> {
         dtype: &'static str,
         values: nk::Matrix<Value>,
@@ -2141,7 +2149,7 @@ mod tests {
         let node_count = rows.len() / width;
         Ring {
             dtype,
-            values: nk::Matrix::try_from_scalars(rows, &[node_count, width]).unwrap(),
+            values: nk::Matrix::from_scalars(rows, &[node_count, width]).unwrap(),
             degree,
         }
     }
@@ -2222,7 +2230,7 @@ mod tests {
     ) -> (GraphTable, nk::Matrix<Value>) {
         let width = query.len();
         let node_count = rows.len() / width;
-        let values = nk::Matrix::<Value>::try_from_scalars(rows, &[node_count, width]).unwrap();
+        let values = nk::Matrix::<Value>::from_scalars(rows, &[node_count, width]).unwrap();
         let table = GraphTable::build(
             &Ring {
                 dtype,
@@ -2234,7 +2242,7 @@ mod tests {
         .unwrap();
         (
             table,
-            nk::Matrix::<Value>::try_from_scalars(query, &[1, width]).unwrap(),
+            nk::Matrix::<Value>::from_scalars(query, &[1, width]).unwrap(),
         )
     }
 
@@ -2457,7 +2465,7 @@ mod tests {
 
     /// A one-row `i8` query batch as a shaped matrix, for the behavior tests.
     fn i8_query(elems: &[f32]) -> nk::Matrix<i8> {
-        nk::Matrix::<i8>::try_from_scalars(elems, &[1, elems.len()]).unwrap()
+        nk::Matrix::<i8>::from_scalars(elems, &[1, elems.len()]).unwrap()
     }
 
     #[test]
@@ -2518,7 +2526,7 @@ mod tests {
         // count, and `matches`/`distances` come back `queries × k`, one row each.
         let table = GraphTable::build(&ring_i8(), None).unwrap();
         let queries =
-            nk::Matrix::<i8>::try_from_scalars(&[3.0, 4.0, 5.0, 6.0, 1.0, 2.0], &[3, 2]).unwrap();
+            nk::Matrix::<i8>::from_scalars(&[3.0, 4.0, 5.0, 6.0, 1.0, 2.0], &[3, 2]).unwrap();
         let mut searcher = DotSearcher::<i8>::new(3, ExecutionScope::Serial, Global).unwrap();
         let mut matches = Matrix::<u64>::new(3, 2).unwrap();
         let mut distances = Matrix::<f64>::new(3, 2).unwrap();
@@ -2551,7 +2559,7 @@ mod tests {
         let scalars: [f32; 16] = [
             3.0, 5.0, 1.0, 4.0, 5.0, 2.0, 2.0, 6.0, 4.0, 3.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
         ];
-        let queries = nk::Matrix::<i8>::try_from_scalars(&scalars, &[8, 2]).unwrap();
+        let queries = nk::Matrix::<i8>::from_scalars(&scalars, &[8, 2]).unwrap();
 
         let run = |scope: ExecutionScope| {
             let mut searcher = DotSearcher::<i8>::new(3, scope, Global).unwrap();
@@ -2709,7 +2717,7 @@ mod tests {
         // graph; the tile lands exactly in the `f64` accumulator.
         let table = GraphTable::build(&ring::<f32>("f32", &RING_ROWS, 2, 0), None).unwrap();
         let mut scanner = DotScanner::<f32>::new(ExecutionScope::CPUs(2), Global).unwrap();
-        let query = nk::Matrix::<f32>::try_from_scalars(&[3.0, 4.0], &[1, 2]).unwrap();
+        let query = nk::Matrix::<f32>::from_scalars(&[3.0, 4.0], &[1, 2]).unwrap();
         let mut matches = Matrix::<u64>::new(1, 3).unwrap();
         let mut distances = Matrix::<f64>::new(1, 3).unwrap();
         let mut counts = [0u64; 1];

@@ -22,10 +22,12 @@ use super::{
 };
 use crate::search::dense::{value_view, view_from_bytes};
 use crate::{cast, Error, GraphTable, GraphTableView, IndexLike, OffsetDType, ScoreLike};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
+use allocator_api2::alloc::Allocator as TableAllocatorLike;
+use core::alloc::Allocator as AllocatorLike;
 use core::cmp::Ordering;
 use forkunion as fu;
 use numkong as nk;
+use std::alloc::Global;
 
 // region: Hamming
 
@@ -46,7 +48,7 @@ impl<Value: nk::Hammings + nk::Hamming, Allocator: AllocatorLike + Clone>
     ///
     /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(HammingScanner {
             pool: open_pool(scope)?,
             packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
@@ -68,7 +70,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -108,7 +110,7 @@ where
     ///
     /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(HammingWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
@@ -162,7 +164,7 @@ where
         }
 
         self.packed
-            .try_pack_parallel_into(&query_view, &mut self.pool)
+            .pack_parallel_into(&query_view, &mut self.pool)
             .map_err(|_| Error::Inconsistent)?;
 
         // Node-major, contiguous rows, as every dense scan; only the kernel differs.
@@ -173,8 +175,9 @@ where
                 &[node_count, query_count],
                 &[query_count as isize * element, element],
             )
-        };
-        nk::HammingsPackedParallelOps::try_hammings_packed_parallel_into(
+        }
+        .map_err(|_| Error::Inconsistent)?;
+        nk::HammingsPackedParallelOps::hammings_packed_parallel_into(
             &values,
             &self.packed,
             &mut tile,
@@ -210,7 +213,8 @@ where
         for (slot, &node) in out.iter_mut().zip(nodes) {
             let index: usize = node.try_into().map_err(|_| Error::TooLarge)?;
             let value: &[Value] = cast(table.value(index)).ok_or(Error::WrongType)?;
-            *slot = <Value as nk::Hamming>::hamming(query, value).ok_or(Error::Inconsistent)?;
+            *slot =
+                <Value as nk::Hamming>::hamming(query, value).map_err(|_| Error::Inconsistent)?;
         }
         Ok(())
     }
@@ -268,7 +272,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -355,7 +359,7 @@ where
     type Output = <Value as nk::Hamming>::Output;
 
     fn distance(query: &[Value], node: &[Value]) -> Option<Self::Output> {
-        <Value as nk::Hamming>::hamming(query, node)
+        <Value as nk::Hamming>::hamming(query, node).ok()
     }
 }
 
@@ -369,13 +373,13 @@ where
     type Output = <Value as nk::Jaccard>::Output;
 
     fn distance(query: &[Value], node: &[Value]) -> Option<Self::Output> {
-        <Value as nk::Jaccard>::jaccard(query, node)
+        <Value as nk::Jaccard>::jaccard(query, node).ok()
     }
 }
 
 /// The batch half for the pairwise set dtypes: no packed form exists, so the
 /// scan fans __nodes__ across the owned pool, each task exclusively borrowing
-/// its node's contiguous tile row — the same safe shape as the mesh scan — and
+/// its node's contiguous tile row — the same safe shape as the MaxSim scan — and
 /// scoring every query with the walk's own single-pair kernel.
 pub struct SetPairScanner<Kernel: SetKernelLike<Value>, Value, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
@@ -439,24 +443,26 @@ where
     let queries_shared = ShareRead(&queries);
     let failure = OnceLock::new();
 
-    fu::ParallelSliceMut::new(&mut rows).for_each_dynamic(pool, |row, prong| {
-        let queries = queries_shared.read();
-        let node = &node_values[prong.task_index * width..prong.task_index * width + width];
-        for (query_index, cell) in row.iter_mut().enumerate() {
-            let Some(storage) = queries.as_packed_slice() else {
-                let _ = failure.set(Error::Inconsistent);
-                return;
-            };
-            let query = &storage[query_index * width..query_index * width + width];
-            match Kernel::distance(query, node) {
-                Some(distance) => *cell = distance,
-                None => {
+    fu::ParallelSliceMut::new(&mut rows)
+        .for_each_dynamic(pool, |row, task, _thread| {
+            let queries = queries_shared.read();
+            let node = &node_values[task * width..task * width + width];
+            for (query_index, cell) in row.iter_mut().enumerate() {
+                let Some(storage) = queries.as_packed_slice() else {
                     let _ = failure.set(Error::Inconsistent);
                     return;
+                };
+                let query = &storage[query_index * width..query_index * width + width];
+                match Kernel::distance(query, node) {
+                    Some(distance) => *cell = distance,
+                    None => {
+                        let _ = failure.set(Error::Inconsistent);
+                        return;
+                    }
                 }
             }
-        }
-    });
+        })
+        .map_err(|_| Error::Alloc)?;
 
     match failure.into_inner() {
         Some(error) => Err(error),
@@ -513,7 +519,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -546,7 +552,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -607,7 +613,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> HammingScannerAny<Allocator
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -665,7 +671,7 @@ impl<Allocator: AllocatorLike + Clone + Send> HammingSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -710,7 +716,7 @@ impl<Value: nk::Jaccards + nk::Jaccard, Allocator: AllocatorLike + Clone>
     ///
     /// [`DotScanner::new`]: crate::search::dense::DotScanner::new
     pub fn new(scope: ExecutionScope, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(JaccardScanner {
             pool: open_pool(scope)?,
             packed: nk::DotsPackedMatrix::empty_in(alloc.clone()),
@@ -732,7 +738,7 @@ where
     pub fn scan(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -772,7 +778,7 @@ where
     ///
     /// [`DotWalker::new`]: crate::search::dense::DotWalker::new
     pub fn new(expansion_factor: usize, alloc: Allocator) -> Result<Self, Error> {
-        nk::capabilities::configure_thread();
+        let _ = nk::Capabilities::cpu_enabled().configure_thread();
         Ok(JaccardWalker {
             context: TraversalContext::new_in(expansion_factor, alloc)?,
         })
@@ -827,7 +833,7 @@ where
         }
 
         self.packed
-            .try_pack_parallel_into(&query_view, &mut self.pool)
+            .pack_parallel_into(&query_view, &mut self.pool)
             .map_err(|_| Error::Inconsistent)?;
 
         let element = core::mem::size_of::<Metric::Score>() as isize;
@@ -837,8 +843,9 @@ where
                 &[node_count, query_count],
                 &[query_count as isize * element, element],
             )
-        };
-        nk::JaccardsPackedParallelOps::try_jaccards_packed_parallel_into(
+        }
+        .map_err(|_| Error::Inconsistent)?;
+        nk::JaccardsPackedParallelOps::jaccards_packed_parallel_into(
             &values,
             &self.packed,
             &mut tile,
@@ -874,7 +881,8 @@ where
         for (slot, &node) in out.iter_mut().zip(nodes) {
             let index: usize = node.try_into().map_err(|_| Error::TooLarge)?;
             let value: &[Value] = cast(table.value(index)).ok_or(Error::WrongType)?;
-            *slot = <Value as nk::Jaccard>::jaccard(query, value).ok_or(Error::Inconsistent)?;
+            *slot =
+                <Value as nk::Jaccard>::jaccard(query, value).map_err(|_| Error::Inconsistent)?;
         }
         Ok(())
     }
@@ -932,7 +940,7 @@ where
     pub fn search(
         &mut self,
         queries: nk::MatrixView<'_, Value>,
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1019,7 +1027,7 @@ impl<Allocator: AllocatorLike + Clone + Send + Sync> JaccardScannerAny<Allocator
     pub fn scan(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1085,7 +1093,7 @@ impl<Allocator: AllocatorLike + Clone + Send> JaccardSearcherAny<Allocator> {
     pub fn search(
         &mut self,
         queries: &[u8],
-        table: &GraphTable<impl AllocatorLike>,
+        table: &GraphTable<impl TableAllocatorLike>,
         matches: &mut Matrix<u64>,
         distances: &mut Matrix<f64>,
         counts: &mut [u64],
@@ -1141,7 +1149,7 @@ mod tests {
 
     fn binary_ring(degree: usize) -> BinaryRing {
         BinaryRing {
-            values: nk::Matrix::try_from_scalars(&BINARY_ROWS, &[3, 8]).unwrap(),
+            values: nk::Matrix::from_scalars(&BINARY_ROWS, &[3, 8]).unwrap(),
             degree,
         }
     }
@@ -1196,7 +1204,7 @@ mod tests {
 
     /// The binary query as its one-row `u1x8` batch: `11111110`, seven bits set.
     fn binary_query() -> nk::Matrix<nk::u1x8> {
-        nk::Matrix::<nk::u1x8>::try_from_scalars(&BINARY_QUERY, &[1, 8]).unwrap()
+        nk::Matrix::<nk::u1x8>::from_scalars(&BINARY_QUERY, &[1, 8]).unwrap()
     }
 
     #[test]

@@ -7,17 +7,14 @@
 //! The vocabulary here is the uniform call shape: `matches`/`distances` are
 //! `queries × k` [`Matrix`] outputs carrying both counts, `counts[q]` reports
 //! how many results query `q` found, and an unfilled `matches` slot holds a
-//! `u64::MAX` sentinel. [`batch_scan`] ranks a scanner's full tile;
-//! [`batch_search`] fans whole walks across a pool, one query per task; and
-//! [`batch_search_serial`] runs the same walks on a single worker, for a
-//! family whose parallelism lives inside the kernel rather than across
-//! queries.
+//! `u64::MAX` sentinel. [`batch_scan`] ranks a scanner's full tile, and
+//! [`batch_search`] fans whole walks across a pool, one query per task.
 
 use super::{ExecutionScope, Matrix, MetricLike, QueryBatchLike, Ranking, ScannerLike, WalkerLike};
 use crate::{Error, GraphTableView, ScoreLike};
-use allocator_api2::alloc::{Allocator as AllocatorLike, Global};
-use allocator_api2::vec::Vec as AVec;
+use core::alloc::Allocator as AllocatorLike;
 use forkunion as fu;
+use std::alloc::Global;
 use std::sync::OnceLock;
 
 /// Rank one query's column of a score tile top-k, writing node IDs widened to
@@ -147,11 +144,14 @@ pub(crate) fn open_pool(scope: ExecutionScope) -> Result<fu::ThreadPool, Error> 
     let topology = fu::Topology::new().map_err(|_| Error::Alloc)?;
     let threads = match scope {
         ExecutionScope::Serial => 1,
-        ExecutionScope::CPUs(0) => topology.logical_cores_count().max(1),
+        ExecutionScope::CPUs(0) => topology
+            .logical_cores_count()
+            .map_err(|_| Error::Alloc)?
+            .max(1),
         ExecutionScope::CPUs(cpus) => cpus,
         ExecutionScope::GPU(_) => return Err(Error::WrongType),
     };
-    fu::ThreadPool::try_spawn(&topology, threads).map_err(|_| Error::Alloc)
+    fu::ThreadPool::spawn(&topology, threads).map_err(|_| Error::Alloc)
 }
 
 /// Build `count` searchers from a fallible constructor, reserving up front so the
@@ -160,8 +160,8 @@ pub(crate) fn build_workers<Searcher, Allocator: AllocatorLike>(
     count: usize,
     alloc: Allocator,
     mut make: impl FnMut() -> Result<Searcher, Error>,
-) -> Result<AVec<Searcher, Allocator>, Error> {
-    let mut workers = AVec::new_in(alloc);
+) -> Result<Vec<Searcher, Allocator>, Error> {
+    let mut workers = Vec::new_in(alloc);
     workers.try_reserve_exact(count).map_err(|_| Error::Alloc)?;
     for _ in 0..count {
         workers.push(make()?);
@@ -170,15 +170,14 @@ pub(crate) fn build_workers<Searcher, Allocator: AllocatorLike>(
 }
 
 /// A width resolver's worker lanes: traversal-scratch leaves at the neighbor
-/// width of the tables being searched — one per pool thread for a fanned-out
-/// family, a single leaf for a kernel-parallel one. Construction sees no table,
+/// width of the tables being searched, one per pool thread. Construction sees no table,
 /// so the lane starts [`Unresolved`](Workers::Unresolved); the first searched
 /// table settles it, and a table of the other width rebuilds it — cheap, since
 /// a leaf's scratch is empty until its first walk.
 pub(crate) enum Workers<Narrow, Wide, Allocator: AllocatorLike = Global> {
     Unresolved,
-    U32(AVec<Narrow, Allocator>),
-    U64(AVec<Wide, Allocator>),
+    U32(Vec<Narrow, Allocator>),
+    U64(Vec<Wide, Allocator>),
 }
 
 /// A read-only reference shareable across a fold's threads.
@@ -200,21 +199,21 @@ impl<'a, Referent: ?Sized> ShareRead<'a, Referent> {
     }
 }
 
-/// The three caller-owned output buffers, held as raw `SafePtr`s so many threads can
+/// The three caller-owned output buffers, held as raw `SyncMutPtr`s so many threads can
 /// fill disjoint query rows at once. `k` is the row width; row `query_index` and slot
 /// `query_index` of `counts` belong to one walk alone.
 struct Sink {
-    matches: fu::SafePtr<u64>,
-    distances: fu::SafePtr<f64>,
-    counts: fu::SafePtr<u64>,
+    matches: fu::SyncMutPtr<u64>,
+    distances: fu::SyncMutPtr<f64>,
+    counts: fu::SyncMutPtr<u64>,
     k: usize,
 }
 
 /// One query's walk and drain, called on a worker's own context and writing that
-/// query's row of the outputs — the shared body of every fan-out task, parallel or
-/// serial. `matches` and `distances` are written through `SafePtr`, disjoint by
-/// `query_index` and so safe to touch from many threads at once; a walk short of `k`
-/// leaves a `u64::MAX` sentinel and reports its true count.
+/// query's row of the outputs — the body of every fan-out task. `matches` and
+/// `distances` are written through `SyncMutPtr`, disjoint by `query_index` and so
+/// safe to touch from many threads at once; a walk short of `k` leaves a
+/// `u64::MAX` sentinel and reports its true count.
 fn walk_one<Metric, Searcher>(
     worker: &mut Searcher,
     queries: &Metric::Queries<'_>,
@@ -231,25 +230,27 @@ where
     let query = queries.query(query_index).ok_or(Error::Inconsistent)?;
     worker.search(query, table)?;
     let base = query_index * sink.k;
+    // SAFETY: every index below is in row `query_index` of a `queries × k` output, or
+    // slot `query_index` of `counts`, which this walk alone writes.
     let found = worker
         .context()
-        .drain(Searcher::compare, sink.k, |slot, node, score| {
-            *sink.matches.get_mut_at(base + slot) = node.into();
-            *sink.distances.get_mut_at(base + slot) = score.widen();
+        .drain(Searcher::compare, sink.k, |slot, node, score| unsafe {
+            *sink.matches.get(base + slot) = node.into();
+            *sink.distances.get(base + slot) = score.widen();
         });
     for slot in found..sink.k {
-        *sink.matches.get_mut_at(base + slot) = u64::MAX;
+        unsafe { *sink.matches.get(base + slot) = u64::MAX };
     }
-    *sink.counts.get_mut_at(query_index) = found as u64;
+    unsafe { *sink.counts.get(query_index) = found as u64 };
     Ok(())
 }
 
 /// Wrap the three output buffers as a [`Sink`], the form [`walk_one`] writes through.
 fn sink_over(matches: &mut Matrix<u64>, distances: &mut Matrix<f64>, counts: &mut [u64]) -> Sink {
     Sink {
-        matches: fu::SafePtr::new(matches.as_mut_slice().as_mut_ptr()),
-        distances: fu::SafePtr::new(distances.as_mut_slice().as_mut_ptr()),
-        counts: fu::SafePtr::new(counts.as_mut_ptr()),
+        matches: fu::SyncMutPtr::new(matches.as_mut_slice().as_mut_ptr()),
+        distances: fu::SyncMutPtr::new(distances.as_mut_slice().as_mut_ptr()),
+        counts: fu::SyncMutPtr::new(counts.as_mut_ptr()),
         k: matches.cols(),
     }
 }
@@ -294,7 +295,7 @@ where
         fu::ParallelRange::new(0..query_count),
         fu::DynamicScheduler,
         workers,
-        |worker, query_index, _prong| {
+        |worker, query_index, _task, _thread| {
             if let Err(error) = walk_one::<Metric, Searcher>(
                 worker,
                 queries_shared.read(),
@@ -305,39 +306,11 @@ where
                 let _ = failure.set(error);
             }
         },
-    );
+    )
+    .map_err(|_| Error::Alloc)?;
 
     match failure.into_inner() {
         Some(error) => Err(error),
         None => Ok(()),
     }
-}
-
-/// Batch top-k by walk on a single worker, for a family whose parallelism lives
-/// inside the kernel rather than across queries — a StringZilla engine already
-/// drives every CPU core, or a GPU, from one call, so a thread-per-query fan-out
-/// on top would only oversubscribe. Same body as [`batch_search`]'s task, minus
-/// the fan-out — both go through [`walk_one`], so the two paths cannot drift in
-/// how they rank, sentinel, or count.
-pub(crate) fn batch_search_serial<Metric, Searcher>(
-    worker: &mut Searcher,
-    queries: Metric::Queries<'_>,
-    table: GraphTableView<'_>,
-    matches: &mut Matrix<u64>,
-    distances: &mut Matrix<f64>,
-    counts: &mut [u64],
-) -> Result<(), Error>
-where
-    Metric: MetricLike,
-    Metric::Score: ScoreLike,
-    for<'a> Metric::Queries<'a>: QueryBatchLike<Metric>,
-    Searcher: WalkerLike<Metric>,
-{
-    let query_count = queries.count();
-    batch_shape(query_count, matches, distances, counts)?;
-    let sink = sink_over(matches, distances, counts);
-    for query_index in 0..query_count {
-        walk_one::<Metric, Searcher>(worker, &queries, query_index, table, &sink)?;
-    }
-    Ok(())
 }

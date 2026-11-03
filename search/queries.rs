@@ -6,7 +6,7 @@
 //! binary, or any embedder accepting user input — does not reimplement it.
 //!
 //! The element type follows the metric, not the caller's preference: strings for
-//! a sequence metric, nested arrays for mesh clouds and maxsim multi-vectors,
+//! a sequence metric, nested arrays for point clouds and maxsim multi-vectors,
 //! flat arrays otherwise.
 //! Numbers always convert to the column's dtype, since the target type is known
 //! from the file — there is no match-exactly case to fail on.
@@ -95,8 +95,8 @@ impl From<QueryError> for Error {
 /// A query batch in the router's input shape.
 ///
 /// A fixed-width metric reads `bytes` through the table's shape; a ragged one
-/// (sequence, maxsim) reads `offsets` beside it — byte offsets for a sequence
-/// tape, token counts for a multi-vector.
+/// (sequence, maxsim, shapes) reads `offsets` beside it — byte offsets for a
+/// sequence tape, token counts for a multi-vector, scalar counts for a cloud.
 #[derive(Debug)]
 pub struct Queries {
     bytes: Vec<u8>,
@@ -127,10 +127,7 @@ impl Queries {
 
 /// True when the metric's queries are strings rather than numbers.
 fn is_textual(metric: &str) -> bool {
-    matches!(
-        metric,
-        "levenshtein" | "levenshtein-utf8" | "needleman-wunsch" | "smith-waterman"
-    )
+    matches!(metric, "levenshtein" | "levenshtein-utf8")
 }
 
 /// Encode one scalar into `dtype`'s storage width, appending to `out`.
@@ -169,7 +166,7 @@ fn push_bits(row: &[f64], out: &mut Vec<u8>) {
 }
 
 /// Every number under `value`, flattened depth-first.
-/// A dense query is one level deep and a mesh cloud two, and both end as the
+/// A dense query is one level deep and a point cloud two, and both end as the
 /// same flat row — the column's shape, not the nesting, decides what is legal.
 fn flatten(
     value: &jsontape::Json<std::alloc::System>,
@@ -216,11 +213,13 @@ pub fn parse(text: &[u8], metric: &str, dtype: &str, shape: Shape) -> Result<Que
         });
     }
 
-    // Every other metric is numeric. MaxSim's rows are ragged, so its prefix sum
-    // counts tokens; every other shape must match the column's width exactly.
+    // Every other metric is numeric. MaxSim's and the shapes' rows are ragged, so
+    // their prefix sums count tokens and scalars, the units each column's own
+    // offsets count; every other shape must match the column's width exactly.
+    let ragged = matches!(metric, "maxsim" | "chamfer" | "hausdorff");
     let mut bytes = Vec::new();
     let mut offsets = vec![0u64];
-    let mut tokens = 0u64;
+    let mut elements = 0u64;
     let expected = shape.regular_width();
 
     for (index, item) in items.iter().enumerate() {
@@ -235,13 +234,16 @@ pub fn parse(text: &[u8], metric: &str, dtype: &str, shape: Shape) -> Result<Que
                 });
             }
         }
-        if metric == "maxsim" {
+        if ragged {
             let depth = shape.inner().unwrap_or(0);
             if depth == 0 || !row.len().is_multiple_of(depth) {
                 return Err(QueryError::RaggedRemainder { index, depth });
             }
-            tokens += (row.len() / depth) as u64;
-            offsets.push(tokens);
+            elements += match metric {
+                "maxsim" => row.len() / depth,
+                _ => row.len(),
+            } as u64;
+            offsets.push(elements);
         }
         if dtype == "u1x8" {
             push_bits(&row, &mut bytes);
@@ -254,7 +256,7 @@ pub fn parse(text: &[u8], metric: &str, dtype: &str, shape: Shape) -> Result<Que
 
     Ok(Queries {
         bytes,
-        offsets: (metric == "maxsim").then_some(offsets),
+        offsets: ragged.then_some(offsets),
         count: items.len(),
     })
 }
@@ -283,19 +285,19 @@ mod tests {
         );
     }
 
-    /// A mesh cloud nests, and the flat total is what the column checks — the
-    /// nesting is a convenience for the writer, not a second constraint.
+    /// A fixed-size cloud nests, and the flat total is what the column checks —
+    /// the nesting is a convenience for the writer, not a second constraint.
     #[test]
-    fn mesh_clouds_may_nest() {
+    fn fixed_clouds_may_nest() {
         let flat = parse(
             b"[[0,0,0,1,0,0,0,1,0]]",
-            "kabsch",
+            "chamfer",
             "f32",
             Shape::Matrix(3, 3),
         );
         let nested = parse(
             b"[[[0,0,0],[1,0,0],[0,1,0]]]",
-            "kabsch",
+            "chamfer",
             "f32",
             Shape::Matrix(3, 3),
         );
@@ -329,6 +331,21 @@ mod tests {
             ragged.unwrap_err(),
             QueryError::RaggedRemainder { index: 0, depth: 2 }
         );
+    }
+
+    /// A cloud's prefix sum counts scalars, three per point, as USearch's own
+    /// offsets do, and clouds in one batch may differ in size.
+    #[test]
+    fn cloud_queries_count_scalars() {
+        let parsed = parse(
+            b"[[[0,0,0],[1,0,0]],[[0,1,0]]]",
+            "chamfer",
+            "f16",
+            Shape::Matrix(0, 3),
+        )
+        .unwrap();
+        assert_eq!(parsed.offsets(), Some(&[0u64, 6, 9][..]));
+        assert_eq!(parsed.bytes().len(), 9 * 2);
     }
 
     /// `1e400` names a magnitude no `f64` holds. JsonTape keeps it as an exact
