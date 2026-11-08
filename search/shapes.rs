@@ -83,7 +83,7 @@ impl ShapeDistanceLike for ChamferDistance {
         RowsAllocator: AllocatorLike,
         ColumnsAllocator: AllocatorLike,
     {
-        rows.chamfers(columns, results, None)
+        rows.chamfers(columns, results, None, Scalar::UNBOUNDED)
             .map_err(|_| Error::Inconsistent)
     }
 
@@ -98,7 +98,7 @@ impl ShapeDistanceLike for ChamferDistance {
         RowsAllocator: AllocatorLike,
         ColumnsAllocator: AllocatorLike,
     {
-        rows.chamfers_parallel(columns, results, None, pool)
+        rows.chamfers_parallel(columns, results, None, Scalar::UNBOUNDED, pool)
             .map_err(|_| Error::Inconsistent)
     }
 }
@@ -114,7 +114,7 @@ impl ShapeDistanceLike for HausdorffDistance {
         RowsAllocator: AllocatorLike,
         ColumnsAllocator: AllocatorLike,
     {
-        rows.hausdorffs(columns, results, None)
+        rows.hausdorffs(columns, results, None, Scalar::UNBOUNDED)
             .map_err(|_| Error::Inconsistent)
     }
 
@@ -129,7 +129,7 @@ impl ShapeDistanceLike for HausdorffDistance {
         RowsAllocator: AllocatorLike,
         ColumnsAllocator: AllocatorLike,
     {
-        rows.hausdorffs_parallel(columns, results, None, pool)
+        rows.hausdorffs_parallel(columns, results, None, Scalar::UNBOUNDED, pool)
             .map_err(|_| Error::Inconsistent)
     }
 }

@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+title: "SafeGraphs: A Portable, Memory-Mappable Format for Exchanging Proximity Graphs"
+message: "If you use this software, please cite it as below."
+type: software
+license: Apache-2.0
+repository-code: https://github.com/safegraphs/SafeGraphs
+abstract: >-
+  SafeGraphs is a simple format for exchanging graph-shaped search indexes between CPUs, GPUs and
+  machines, serving as an interoperability layer between NSW, CAGRA and similar nearest-neighbor
+  algorithms. A graph is exchanged through its keys, values and neighbor lists alone, with no
+  knowledge of how it was built or how it will be searched, and files stay memory-mappable so that
+  indexes built on large GPU machines remain usable on consumer hardware. It absorbs new element
+  types, from mixed-precision floats to variable-length and sparse payloads, without breaking
+  readability, while each application chooses its own scoring and traversal.
+keywords:
+  - proximity graph
+  - nearest-neighbor search
+  - file format
+  - interoperability
+  - memory mapping
+  - vector search
+  - gpu
+
+authors:
+  - family-names: Vardanian
+    given-names: Ash
+    alias: ashvardanian
+    orcid: https://orcid.org/0000-0002-4882-1815
