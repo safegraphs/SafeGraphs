@@ -1,5 +1,7 @@
 # SafeGraphs
 
+![SafeGraphs banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/SafeGraphs.jpg?raw=true)
+
 SafeGraphs is the SafeTensors of graphs — a simple format to exchange graph-shaped search indexes between CPUs, GPUs, and machines.
 It's designed as an interoperability layer between NSW, Cagra, and similar algorithms, often used in vector databases for approximate nearest neighbor search, or ANNS.
 It aims to be simple, efficient, and easy to implement across different programming languages and platforms.

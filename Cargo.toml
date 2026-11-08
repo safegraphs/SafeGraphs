@@ -33,17 +33,17 @@ jsontape = "0.1"
 # MaxSim for late interaction, and Chamfer and Hausdorff for point clouds.
 # `parallel` gates the whole `DotsPackedParallelOps` surface — without it the
 # pool-taking kernels a dense scanner drives are compiled out entirely.
-numkong = { version = "8.0.0-rc.1", features = ["parallel"], optional = true }
+numkong = { version = "8.0.0-rc.1", git = "https://github.com/ashvardanian/NumKong", features = ["parallel"], optional = true }
 
 # StringZilla sequence scoring: Levenshtein over bytes and over UTF-8 runes,
 # through its `LevenshteinEngine`. The default `std` feature is all the CPU needs.
-stringzilla = { version = "6.0.0-rc.1", optional = true }
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", optional = true }
 
 # ForkUnion structured parallelism, fanning scans across queries and shards.
 # Declared from the registry, not from git: NumKong declares `forkunion` there
 # too, and the crate carries `links = "forkunion"`. A git source here is a second,
 # distinct package claiming the same native library, which Cargo refuses to resolve.
-forkunion = { version = "4.0.0-rc.1", optional = true }
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", optional = true }
 
 # Argument parsing and glob expansion for the `sg` binary alone — the library
 # stays free of both. `clap`'s derive is an attribute macro on our types, not a
