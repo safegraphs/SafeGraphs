@@ -433,16 +433,19 @@ where
     }
 }
 
+/// One [`ShapeWalker`] per pool thread, at whichever node width the first table names.
+type ShapeWorkers<Scalar, Kind, Allocator> = Workers<
+    ShapeWalker<Scalar, Kind, u32, Allocator>,
+    ShapeWalker<Scalar, Kind, u64, Allocator>,
+    Allocator,
+>;
+
 /// Batched shape walks, resolving the node width from the first table searched and
 /// holding one [`ShapeWalker`] per pool thread.
 pub struct ShapeSearcher<Scalar: nk::Shapes, Kind, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
-    workers: Workers<
-        ShapeWalker<Scalar, Kind, u32, Allocator>,
-        ShapeWalker<Scalar, Kind, u64, Allocator>,
-        Allocator,
-    >,
+    workers: ShapeWorkers<Scalar, Kind, Allocator>,
     alloc: Allocator,
 }
 

@@ -422,16 +422,19 @@ where
     }
 }
 
+/// One [`GeospatialWalker`] per pool thread, at whichever node width the first table names.
+type GeospatialWorkers<Kernel, Coordinate, Allocator> = Workers<
+    GeospatialWalker<Kernel, Coordinate, u32, Allocator>,
+    GeospatialWalker<Kernel, Coordinate, u64, Allocator>,
+    Allocator,
+>;
+
 /// Batched geospatial walks, resolving the node width from the first table
 /// searched and holding one [`GeospatialWalker`] per pool thread.
 pub struct GeospatialSearcher<Kernel, Coordinate, Allocator: AllocatorLike = Global> {
     pool: fu::ThreadPool,
     expansion_factor: usize,
-    workers: Workers<
-        GeospatialWalker<Kernel, Coordinate, u32, Allocator>,
-        GeospatialWalker<Kernel, Coordinate, u64, Allocator>,
-        Allocator,
-    >,
+    workers: GeospatialWorkers<Kernel, Coordinate, Allocator>,
     alloc: Allocator,
 }
 
@@ -917,7 +920,7 @@ mod tests {
         let table = crate::GraphTable::build(&cities(), None).unwrap();
         let mut coordinates = Vec::new();
         for city in [
-            (52.5200, 13.4050),
+            (52.5200f64, 13.4050f64),
             (41.9028, 12.4964),
             (55.7558, 37.6173),
             (35.6762, 139.6503),
@@ -926,8 +929,8 @@ mod tests {
             (59.3293, 18.0686),
             (40.4168, -3.7038),
         ] {
-            coordinates.push((city.0 as f64).to_radians() as f32);
-            coordinates.push((city.1 as f64).to_radians() as f32);
+            coordinates.push(city.0.to_radians() as f32);
+            coordinates.push(city.1.to_radians() as f32);
         }
         let queries = nk::Matrix::<f64>::from_scalars(&coordinates, &[8, 2]).unwrap();
 

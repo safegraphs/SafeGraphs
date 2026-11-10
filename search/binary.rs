@@ -330,11 +330,6 @@ where
     }
 }
 
-/// The Hamming twin of [`DotScannerAny`]: runtime dtype dispatch, `u1x8` the one arm
-/// with a packed Hamming kernel. The typed scanner owns its tile, so unlike the dot
-/// dispatcher this needs no scratch of its own.
-///
-/// [`DotScannerAny`]: crate::search::dense::DotScannerAny
 // region: Pairwise set scanner
 
 /// The seam for the set dtypes NumKong ships __no packed kernel__ for — `u8`
@@ -584,7 +579,10 @@ pub type JaccardPairScanner<Value, Allocator = Global> =
 // endregion: Pairwise set scanner
 
 /// A Hamming scanner chosen at runtime from a file's value dtype: `u1x8` through
-/// the packed kernel, the wider set dtypes pairwise.
+/// the packed kernel, the wider set dtypes pairwise. The typed scanner owns its
+/// tile, so unlike [`DotScannerAny`] this needs no scratch of its own.
+///
+/// [`DotScannerAny`]: crate::search::dense::DotScannerAny
 pub enum HammingScannerAny<Allocator: AllocatorLike = Global> {
     U1x8(HammingScanner<nk::u1x8, Allocator>),
     /// `u8` ships no packed kernel, so its arm scans pairwise — exact, just

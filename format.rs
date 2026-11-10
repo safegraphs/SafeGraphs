@@ -615,6 +615,104 @@ fn column_field<Element: ElementLike, Allocator: AllocatorLike>(
     Column::<Element>::from_json(obj)
 }
 
+/// One past the last byte any buffer of `column` touches, relative to the data segment.
+fn column_end<Element>(column: &Column<Element>) -> Result<usize, Error> {
+    let data_end = column
+        .data
+        .start
+        .checked_add(column.data.len)
+        .ok_or(Error::TooLarge)?;
+    match column.layout {
+        ColumnLayout::Regular { .. } => Ok(data_end),
+        ColumnLayout::Irregular { offsets } => {
+            let offsets_end = offsets
+                .range
+                .start
+                .checked_add(offsets.range.len)
+                .ok_or(Error::TooLarge)?;
+            Ok(data_end.max(offsets_end))
+        }
+    }
+}
+
+/// The parsed header of a SafeGraphs file, read from its first bytes alone: enough to name the
+/// graph and its extent without touching the data segment, as a probe of a raw drive slot needs.
+pub struct GraphHeader<Allocator: AllocatorLike = Global> {
+    /// Byte offset of the data segment: the first byte past the padded header.
+    pub segment_start: usize,
+
+    /// The parsed header document, owned in `A`.
+    pub header: Json<Allocator>,
+
+    pub key: Column<StorageDType>,
+    pub value: Column<StorageDType>,
+    pub neighbors: Column<OffsetDType>,
+
+    /// Bytes of the data segment up to the furthest buffer of any column, producer columns included.
+    pub data_bytes: usize,
+}
+
+impl GraphHeader {
+    /// Where the data segment starts, from the magic and header length in the first 16 bytes, so a
+    /// reader holding only a first page knows how much more to read before [`GraphHeader::read_in`].
+    pub fn segment_start_of(prefix: &[u8]) -> Result<usize, Error> {
+        if prefix.get(..8) != Some(&MAGIC[..]) {
+            return Err(Error::BadMagic);
+        }
+        let mut length_bytes = [0u8; 8];
+        length_bytes.copy_from_slice(prefix.get(8..16).ok_or(Error::Truncated)?);
+        let header_len = to_usize(u64::from_le_bytes(length_bytes))?;
+        16usize.checked_add(header_len).ok_or(Error::Truncated)
+    }
+}
+
+impl<Allocator: AllocatorLike + Clone> GraphHeader<Allocator> {
+    /// Parses the header from `prefix`, which must reach the segment start; the data segment is
+    /// never read, so nothing here proves the buffers exist.
+    pub fn read_in(prefix: &[u8], alloc: Allocator) -> Result<Self, Error> {
+        let segment_start = GraphHeader::segment_start_of(prefix)?;
+        let header = parse_in(
+            prefix.get(16..segment_start).ok_or(Error::Truncated)?,
+            alloc,
+        )?;
+        let key = column_field::<StorageDType, Allocator>(&header, "key")?;
+        let value = column_field::<StorageDType, Allocator>(&header, "value")?;
+        let neighbors = column_field::<OffsetDType, Allocator>(&header, "neighbors")?;
+
+        // Producer columns, such as cached norms, are any other object beside `__metadata__`;
+        // this reader keeps none of them, but each still bounds the file.
+        let mut data_bytes = column_end(&key)?
+            .max(column_end(&value)?)
+            .max(column_end(&neighbors)?);
+        for (name, object) in header.as_object().ok_or(Error::WrongType)? {
+            let name: &str = name;
+            if object.as_object().is_none()
+                || matches!(name, "__metadata__" | "key" | "value" | "neighbors")
+            {
+                continue;
+            }
+            data_bytes = data_bytes.max(column_end(&Column::<StorageDType>::from_json(object)?)?);
+        }
+        segment_start
+            .checked_add(data_bytes)
+            .ok_or(Error::TooLarge)?;
+
+        Ok(GraphHeader {
+            segment_start,
+            header,
+            key,
+            value,
+            neighbors,
+            data_bytes,
+        })
+    }
+
+    /// The whole file's length: the segment start plus the furthest column buffer.
+    pub fn file_bytes(&self) -> usize {
+        self.segment_start + self.data_bytes
+    }
+}
+
 impl GraphTable<Global> {
     /// Memory-map a file read-only; pages fault in lazily. Metadata allocates in
     /// the global heap.
@@ -670,31 +768,17 @@ impl<Allocator: AllocatorLike + Clone> GraphTable<Allocator> {
         Self::from_backing(Backing::Owned(blob), alloc)
     }
 
-    /// Shared parse over any backing: frame it, parse the header, extract the
-    /// columns and metadata, then validate.
+    /// Shared parse over any backing: read the header, then validate every
+    /// column against the whole file.
     fn from_backing(backing: Backing<Allocator>, alloc: Allocator) -> Result<Self, Error> {
-        let (segment_start, header, key, value, neighbors) = {
-            let bytes = backing.as_bytes();
-            if bytes.get(..8) != Some(&MAGIC[..]) {
-                return Err(Error::BadMagic);
-            }
-            let len_bytes = bytes.get(8..16).ok_or(Error::Truncated)?;
-            let mut length_bytes = [0u8; 8];
-            length_bytes.copy_from_slice(len_bytes);
-            let header_len = to_usize(u64::from_le_bytes(length_bytes))?;
-            let segment_start = 16usize.checked_add(header_len).ok_or(Error::Truncated)?;
-            if bytes.len() < segment_start {
-                return Err(Error::Truncated);
-            }
-
-            // Parse the header into an owned document.
-            let header = &bytes[16..segment_start];
-            let doc = parse_in(header, alloc)?;
-            let key = column_field::<StorageDType, Allocator>(&doc, "key")?;
-            let value = column_field::<StorageDType, Allocator>(&doc, "value")?;
-            let neighbors = column_field::<OffsetDType, Allocator>(&doc, "neighbors")?;
-            (segment_start, doc, key, value, neighbors)
-        };
+        let GraphHeader {
+            segment_start,
+            header,
+            key,
+            value,
+            neighbors,
+            ..
+        } = GraphHeader::read_in(backing.as_bytes(), alloc)?;
 
         let file = GraphTable {
             backing,
@@ -1760,6 +1844,32 @@ mod tests {
         let reopened = GraphTable::from_bytes(&bytes).unwrap();
         assert_eq!(reopened.len(), 3);
         assert_eq!(reopened.key(2), &30u64.to_le_bytes()[..]);
+    }
+
+    #[test]
+    fn header_reads_from_its_prefix_alone() {
+        let bytes = GraphTable::build(&toy(), None).unwrap().bytes().to_vec();
+        let segment_start = GraphHeader::segment_start_of(&bytes[..16]).unwrap();
+        assert!(matches!(
+            GraphHeader::read_in(&bytes[..segment_start - 1], Global),
+            Err(Error::Truncated)
+        ));
+        let header = GraphHeader::read_in(&bytes[..segment_start], Global).unwrap();
+        assert_eq!(header.file_bytes(), bytes.len());
+
+        // A producer column past every reader column still bounds the file, as the C++ reader counts it.
+        let json = core::str::from_utf8(&bytes[16..segment_start])
+            .unwrap()
+            .trim_end_matches(' ');
+        let widened = format!(
+            "{},\"norms\":{{\"dtype\":\"f32\",\"data\":[65536,65548]}}}}",
+            json.strip_suffix('}').unwrap()
+        );
+        let mut prefix = MAGIC.to_vec();
+        prefix.extend_from_slice(&(widened.len() as u64).to_le_bytes());
+        prefix.extend_from_slice(widened.as_bytes());
+        let header = GraphHeader::read_in(&prefix, Global).unwrap();
+        assert_eq!(header.file_bytes(), prefix.len() + 65548);
     }
 
     #[test]
